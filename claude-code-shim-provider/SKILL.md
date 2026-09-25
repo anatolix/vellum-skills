@@ -174,8 +174,10 @@ End-to-end: open a **new** Vellum chat on profile *Claude Code (Opus)*, ask for
   (usually missing `VELLUM_WORKSPACE_DIR` in the systemd env).
 - With tools present the reply is not streamed token-by-token — whole answer at once.
   Vellum system prompts are large; first reply on Opus takes 15–30 s.
-- Prompt-contract calling is not schema-enforced. Opus/Sonnet follow it reliably; a
-  malformed `TOOL_CALL` line is left as text (visible in chat) rather than crashing.
+- Prompt-contract calling is not schema-enforced. The shim guards against the worst
+  case — the model writing a fake `<tool_result>` and continuing as if the tool ran —
+  by truncating output at the first self-written `<tool_result` and after the first
+  parsed TOOL_CALL. Still: spot-check paths/numbers the model cites.
 - Keep `tools: [], allowedTools: []` in the SDK options. Enabling Claude Code's native
   tools would let the model touch the filesystem outside Vellum's trust rules.
 - Bun `idleTimeout` default (10 s) → Vellum shows "Could not connect to the AI provider".

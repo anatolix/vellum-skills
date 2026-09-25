@@ -28,3 +28,9 @@ Expected — the redirect goes to a loopback listener. Copy the full redirect UR
 
 ## No token streaming when tools are present
 **Expected.** The reply is buffered to detect TOOL_CALL lines. Plain requests (no tools) still stream.
+
+## Model fabricates tool results and "continues" (DANGEROUS)
+**Symptom:** reply contains `<tool_result name="...">` blocks written by the model itself, followed by a confident analysis. Files/tables it "read" may not exist.
+**Cause:** with `maxTurns: 1` and a text contract, nothing physically stops the model from writing a fake result and going on. Triggered when a TOOL_CALL line failed to parse (e.g. glued to previous text on the same line) — the model then invented what the tool "returned".
+**Fix (in server.js):** output is truncated at the first model-written `<tool_result`; everything after the first parsed TOOL_CALL is discarded; regex no longer anchored at line start; contract says "STOP after TOOL_CALL, never write <tool_result>". If the whole output was fabricated, the shim returns a visible `[shim] ...` notice instead of an empty reply.
+**Rule for the human:** any Claude-Code-profile answer citing file paths or numbers should be spot-checked (`ls`, `sqlite3`) before acting on it.

@@ -16,7 +16,9 @@ Rules:
 - Each TOOL_CALL must be a single line of valid JSON after the prefix.
 - Do not wrap TOOL_CALL lines in markdown fences and do not add commentary around them.
 - Call functions only when they are needed; otherwise answer normally in plain text.
-- Results of your calls arrive in <tool_result> blocks. Use them to continue the task.`;
+- After your TOOL_CALL line(s), STOP. Do not write anything after them.
+- Results of your calls arrive in <tool_result> blocks in the NEXT message, from the system.
+  NEVER write <tool_result> blocks yourself and never guess what a call would return.`;
 
 function contentToText(content) {
   if (content == null) return "";
@@ -79,25 +81,43 @@ function messagesToPrompt(messages, tools) {
 }
 
 // Extract TOOL_CALL lines; return { calls, restText }.
+// Guards against fabrication: output is cut at the first parsable TOOL_CALL
+// (the model must stop there — anything after is imagined continuation), and
+// any <tool_result> block the model wrote itself is discarded.
+const TOOL_CALL_RE = /TOOL_CALL:\s*(\{.*\})\s*$/;
 function parseToolCalls(text) {
+  // Drop self-written tool results (model pretending a tool ran).
+  // Everything from the first one on is imagined continuation — truncate there.
+  const fab = text.search(/<tool_result\b/);
+  const cleaned = fab >= 0 ? text.slice(0, fab) : text;
+  if (fab >= 0) console.log("[warn] model fabricated <tool_result>; output truncated at", fab);
+
   const calls = [];
   const rest = [];
-  for (const raw of text.split("\n")) {
+  let sawCall = false;
+  for (const raw of cleaned.split("\n")) {
     const line = raw.trim().replace(/^`+|`+$/g, "");
-    const m = line.match(/^TOOL_CALL:\s*(\{.*\})\s*$/);
+    const m = line.match(TOOL_CALL_RE); // not anchored at start: tolerates junk before prefix
     if (m) {
       try {
         const obj = JSON.parse(m[1]);
         if (obj && typeof obj.name === "string") {
           calls.push({ name: obj.name, arguments: obj.arguments ?? {} });
+          sawCall = true;
           continue;
         }
-      } catch { /* fall through: keep as text */ }
+      } catch { /* fall through */ }
+      console.log("[warn] unparsable TOOL_CALL line:", line.slice(0, 200));
     }
-    if (line === "```" && calls.length) continue; // stray fence around calls
+    if (sawCall) continue; // everything after the first call is discarded
+    if (line === "```") continue;
     rest.push(raw);
   }
-  return { calls, restText: rest.join("\n").trim() };
+  let restText = rest.join("\n").trim();
+  if (fab >= 0 && !calls.length && !restText) {
+    restText = "[shim] Ответ модели отброшен: она написала <tool_result> сама вместо вызова инструмента. Повтори запрос.";
+  }
+  return { calls, restText };
 }
 
 function sseChunk(id, model, delta, finish = null) {
