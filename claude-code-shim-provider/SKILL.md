@@ -80,7 +80,8 @@ Verify: `assistant credentials list | grep acp` shows `acp:claude_oauth_token`.
 mkdir -p ~/claude-shim && cd ~/claude-shim
 bun init -y
 bun add @anthropic-ai/claude-agent-sdk
-cp {baseDir}/scripts/server.js ~/claude-shim/server.js
+cp {baseDir}/scripts/{server.js,run.sh,package.json,bun.lock,tsconfig.json} ~/claude-shim/ && (cd ~/claude-shim && bun install)
+cp {baseDir}/scripts/claude-shim.service ~/.config/systemd/user/   # fix paths/assistant name in run.sh + unit first
 ```
 
 `server.js` (full source in `{baseDir}/scripts/server.js`):

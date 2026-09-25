@@ -1,0 +1,11 @@
+[Unit]
+Description=Claude Code OpenAI-compatible shim
+After=vellum-juno.service
+
+[Service]
+ExecStart=/home/vellum/claude-shim/run.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
