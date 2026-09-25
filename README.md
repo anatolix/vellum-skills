@@ -26,6 +26,16 @@ Why bother:
 
 Verified on Ubuntu 24.04, 4 vCPU / 16 GB, Vellum 0.12.4–0.12.5, TEI cpu-1.9.4. Covers: dockerless image extraction from ghcr, the glibc-mixing segfault, MKL instruction flags, qdrant collection wipe, and a full re-embed from scratch.
 
+### [claude-code-shim-provider](claude-code-shim-provider/SKILL.md)
+
+Use **Claude Opus/Sonnet on a Claude subscription** (no API key) as a Vellum chat model — with working tools.
+
+A small Bun server (`127.0.0.1:8317`) speaks OpenAI `chat/completions` and proxies to Claude Code via `@anthropic-ai/claude-agent-sdk`. Since the SDK does not accept OpenAI tool definitions, the shim renders Vellum's `tools` into the prompt as a strict text contract (`TOOL_CALL: {...}` lines), parses the model output, and returns real OpenAI `tool_calls` deltas. Tool **execution** stays on the Vellum side (trust rules, guardian approval); Claude Code's own Bash/Read tools are kept disabled so the model cannot bypass them.
+
+Covers: installing Claude Code CLI on a headless VM, getting the OAuth token with the loopback-callback trick (phone → paste redirect URL → curl into VM), storing it in the Vellum vault, systemd user unit, provider/profile registration, a 3-stage curl test script, and the failure modes we hit (`token_len=0`, Bun `idleTimeout`, "profile has no tools").
+
+Verified Ubuntu 24.04, Vellum 0.12.5, Claude Code 2.1.282, Agent SDK 0.3.x.
+
 ## License
 
 MIT. Use, adapt, republish.
