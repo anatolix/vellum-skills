@@ -24,7 +24,7 @@ Why bother:
 - **8192-token context instead of 512.** multilingual-e5-large silently truncates Vellum's 1800-char memory segments. bge-m3 does not, and beats e5-large on Russian retrieval (MIRACL).
 - **2.4 GB RSS total** after int8 quantization + `--max-batch-tokens 2048` (naive TEI startup allocates a ~10.8 GB attention arena at warmup).
 
-Verified on Ubuntu 24.04, 4 vCPU / 16 GB, Vellum 0.12.4–0.12.5, TEI cpu-1.9.4. Covers: dockerless image extraction from ghcr, the glibc-mixing segfault, MKL instruction flags, qdrant collection wipe, and a full re-embed from scratch.
+Verified on Ubuntu 24.04, 4 vCPU / 16 GB, Vellum 0.12.4–0.12.5, TEI cpu-1.9.4, memory v3 live. Covers the **full lifecycle**: dockerless image extraction from ghcr, the glibc-mixing segfault, MKL/OMP thread capping, RAM capping via `--max-batch-tokens`, int8 model from a local dir — **and the post-switch re-index**: the `database is locked` fatal misclassification (patch included), the `content_hash` skip trap, why `embed_segment` jobs are no-ops under memory v3, the per-collection fill paths, and the SQL recipe to rebuild `messages_lexical` for old messages (no backfill does this).
 
 ### [claude-code-shim-provider](claude-code-shim-provider/SKILL.md)
 
