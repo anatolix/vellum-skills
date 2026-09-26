@@ -42,3 +42,7 @@ Expected — the redirect goes to a loopback listener. Copy the full redirect UR
 ## `claude setup-token` ignores Enter after pasting the code
 **Cause:** the Ink TUI switches the terminal to kitty keyboard protocol; tmux's `Enter` (`\r`) is sometimes not accepted.
 **Fix:** `tmux send-keys -t st -l $'\e[13u'` (kitty-encoded Enter). Token then prints to the pane/pipe-pane log.
+
+## Valid TOOL_CALL lands in chat as text; log says `fabricated <tool_result>; output truncated`
+**Cause:** (fixed Sep 26) the fabrication guard was global and cut a TOOL_CALL whose JSON *mentioned* `<tool_result`.
+**Fix:** current server.js checks per line, only on non-TOOL_CALL lines. If you see this with the current code, check `[warn] unparsable TOOL_CALL line: <reason>` in the log — the JSON itself was broken.

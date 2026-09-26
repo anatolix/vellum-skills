@@ -81,21 +81,17 @@ function messagesToPrompt(messages, tools) {
 }
 
 // Extract TOOL_CALL lines; return { calls, restText }.
-// Guards against fabrication: output is cut at the first parsable TOOL_CALL
-// (the model must stop there — anything after is imagined continuation), and
-// any <tool_result> block the model wrote itself is discarded.
+// Guards against fabrication: a <tool_result written by the model OUTSIDE a
+// TOOL_CALL line truncates the output there (imagined continuation), and
+// everything after the first parsed TOOL_CALL is discarded. A TOOL_CALL whose
+// JSON merely *mentions* "<tool_result" is fine — line-level check, not global.
 const TOOL_CALL_RE = /TOOL_CALL:\s*(\{.*\})\s*$/;
 function parseToolCalls(text) {
-  // Drop self-written tool results (model pretending a tool ran).
-  // Everything from the first one on is imagined continuation — truncate there.
-  const fab = text.search(/<tool_result\b/);
-  const cleaned = fab >= 0 ? text.slice(0, fab) : text;
-  if (fab >= 0) console.log("[warn] model fabricated <tool_result>; output truncated at", fab);
-
   const calls = [];
   const rest = [];
   let sawCall = false;
-  for (const raw of cleaned.split("\n")) {
+  let fabricated = false;
+  for (const raw of text.split("\n")) {
     const line = raw.trim().replace(/^`+|`+$/g, "");
     const m = line.match(TOOL_CALL_RE); // not anchored at start: tolerates junk before prefix
     if (m) {
@@ -106,15 +102,21 @@ function parseToolCalls(text) {
           sawCall = true;
           continue;
         }
-      } catch { /* fall through */ }
-      console.log("[warn] unparsable TOOL_CALL line:", line.slice(0, 200));
+      } catch (e) {
+        console.log("[warn] unparsable TOOL_CALL line:", String(e.message).slice(0, 80), "|", line.slice(0, 160));
+      }
+    }
+    if (/<tool_result\b/.test(line)) {
+      fabricated = true;
+      console.log("[warn] model fabricated <tool_result>; output truncated");
+      break;
     }
     if (sawCall) continue; // everything after the first call is discarded
     if (line === "```") continue;
     rest.push(raw);
   }
   let restText = rest.join("\n").trim();
-  if (fab >= 0 && !calls.length && !restText) {
+  if (fabricated && !calls.length && !restText) {
     restText = "[shim] Ответ модели отброшен: она написала <tool_result> сама вместо вызова инструмента. Повтори запрос.";
   }
   return { calls, restText };

@@ -205,3 +205,5 @@ End-to-end: open a **new** Vellum chat on profile *Claude Code (Opus)*, ask for
 - Rollback: `cp server.js.bak-pre-tools server.js && systemctl --user restart claude-shim`.
 
 See `{baseDir}/references/failure-modes.md` for more.
+
+Why the code looks the way it does, and every problem hit while building it: `{baseDir}/references/lessons-learned.md`.
