@@ -39,3 +39,6 @@ Verified Ubuntu 24.04, Vellum 0.12.5, Claude Code 2.1.282, Agent SDK 0.3.x.
 ## License
 
 MIT. Use, adapt, republish.
+
+### [subagent-empty-response-patch](subagent-empty-response-patch/SKILL.md)
+Fix for the platform bug where subagents die silently after exactly one tool call (empty post-tool LLM response, no re-query nudge for `subagentSpawn`). One-line patch to the empty-response hook, verification procedure, and links to upstream issue vellum-ai/vellum-assistant#43327 and PR #43328. Re-apply after every upgrade until the PR merges.
