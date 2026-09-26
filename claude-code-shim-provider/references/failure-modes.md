@@ -34,3 +34,11 @@ Expected — the redirect goes to a loopback listener. Copy the full redirect UR
 **Cause:** with `maxTurns: 1` and a text contract, nothing physically stops the model from writing a fake result and going on. Triggered when a TOOL_CALL line failed to parse (e.g. glued to previous text on the same line) — the model then invented what the tool "returned".
 **Fix (in server.js):** output is truncated at the first model-written `<tool_result`; everything after the first parsed TOOL_CALL is discarded; regex no longer anchored at line start; contract says "STOP after TOOL_CALL, never write <tool_result>". If the whole output was fabricated, the shim returns a visible `[shim] ...` notice instead of an empty reply.
 **Rule for the human:** any Claude-Code-profile answer citing file paths or numbers should be spot-checked (`ls`, `sqlite3`) before acting on it.
+
+## Shim log: `Failed to authenticate. API Error: 401 OAuth access token has expired`
+**Cause:** the token came from the inline ACP "Connect Claude Code" card — a short-lived session token (~10 h), not a long-lived one.
+**Fix:** re-issue with `claude setup-token` (1-year token) as described in SKILL.md step 2, store in vault, restart claude-shim. Do not use the ACP card token for the shim.
+
+## `claude setup-token` ignores Enter after pasting the code
+**Cause:** the Ink TUI switches the terminal to kitty keyboard protocol; tmux's `Enter` (`\r`) is sometimes not accepted.
+**Fix:** `tmux send-keys -t st -l $'\e[13u'` (kitty-encoded Enter). Token then prints to the pane/pipe-pane log.

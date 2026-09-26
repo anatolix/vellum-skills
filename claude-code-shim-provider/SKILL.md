@@ -55,22 +55,43 @@ curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-ge
 bun add -g @agentclientprotocol/claude-agent-acp
 ```
 
-### 2. Obtain the OAuth token (headless VM, phone in hand)
+### 2. Obtain the OAuth token (headless VM, browser elsewhere)
 
-The VM has no browser; the OAuth redirect goes to `http://localhost:<port>/callback`
-**on the VM**. Trick: user opens the login URL on their phone, the final redirect
-fails to load (404 / connection refused — expected), user pastes that full redirect URL
-into chat, the assistant curls it into the VM loopback listener.
+**Use `claude setup-token` — it issues a 1-year token.** The token from Vellum's inline
+"Connect Claude Code" (ACP) card is a short-lived session token: it expired after ~10 h
+(`401 OAuth access token has expired` in the shim log) and killed every Claude Code
+profile until re-login.
 
-Option A — Vellum's inline "Connect Claude Code" card (acp skill) does this flow and
-stores the token as credential `acp/claude_oauth_token`.
+`setup-token` is an interactive Ink TUI; run it in tmux so it survives the bash timeout:
 
-Option B — manual:
 ```bash
-~/.local/bin/claude setup-token      # prints URL; paste redirect URL back when asked
-# then store the sk-ant-oat… token via secure prompt (never inline):
-assistant credentials prompt --service acp --field claude_oauth_token
+tmux new-session -d -s st -x 200 -y 50
+tmux pipe-pane -t st -o 'cat >> /tmp/st.log'
+tmux send-keys -t st "PATH=$HOME/.local/bin:\$PATH claude setup-token" Enter
+sleep 8
+tmux capture-pane -t st -p -J -S -50 | tr -d '\n' \
+  | grep -o 'https://claude.com/cai/oauth/authorize?[A-Za-z0-9%&=_.-]*state=[A-Za-z0-9_-]*'
 ```
+
+Give the URL to the user. They log in with their Claude subscription and get a code
+`XXXX#STATE` back on the page (no callback to the VM — redirect goes to platform.claude.com).
+Paste it in:
+
+```bash
+tmux send-keys -t st '<code#state>' Enter
+# Gotcha: the TUI enables kitty keyboard protocol; a plain Enter may be ignored.
+# If the prompt still shows asterisks after ~10 s, send the kitty-encoded Enter:
+tmux send-keys -t st -l $'\e[13u'
+TOK=$(grep -o 'sk-ant-oat01-[A-Za-z0-9_-]*' /tmp/st.log | head -1)
+assistant credentials set --service acp --field claude_oauth_token --generated \
+  --allowed-tools acp_spawn "$TOK"
+shred -u /tmp/st.log; tmux kill-server
+systemctl --user restart claude-shim
+```
+
+`claude auth status` will still say `loggedIn: false` — setup-token does not write
+`~/.claude/.credentials.json`; the token lives only in the vault and reaches the SDK via
+`CLAUDE_CODE_OAUTH_TOKEN`. That is fine.
 
 Verify: `assistant credentials list | grep acp` shows `acp:claude_oauth_token`.
 
