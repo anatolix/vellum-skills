@@ -55,12 +55,45 @@ curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-ge
 bun add -g @agentclientprotocol/claude-agent-acp
 ```
 
+### 1a. Claude CLI setup notes
+
+- Binary lives in `~/.local/bin/claude`. systemd user units do not have it on PATH —
+  `run.sh` exports PATH explicitly.
+- `~/.claude/` is created on first run (`projects/`, `policy-limits.json`,
+  `remote-settings.json`, `backups/`). No `settings.json` is needed for the shim.
+- The shim passes `settingSources: []` to the SDK, so user/project settings and any
+  `CLAUDE.md` under `~/.claude` are **ignored** — nothing leaks into Vellum prompts.
+  Keep it that way.
+- Health check: `claude doctor`. Auth check: `claude auth status` (JSON).
+  With a setup-token it shows `loggedIn: false, authMethod: none` — expected: the token
+  is not in `~/.claude`, it lives in the Vellum vault and reaches the SDK via
+  `CLAUDE_CODE_OAUTH_TOKEN`.
+- Optional: `export DISABLE_AUTOUPDATER=1` in `run.sh` to avoid surprise CLI upgrades
+  under a running service; upgrade deliberately with `claude update`.
+
+### 1b. OAuth tokens come in different lifetimes — pick the right one
+
+All of them look the same (`sk-ant-oat01-…`, 108 chars). You cannot tell the lifetime
+by looking at the token. What we observed:
+
+| Source | Lifetime | Where it ends up | Refresh |
+|---|---|---|---|
+| Vellum inline "Connect Claude Code" card (ACP) | **~10 h** (issued Sep 25 evening, `401` at 05:47 next morning) | vault `acp/claude_oauth_token` | none — dies silently |
+| `claude auth login` / `/login` in the TUI | short access token + refresh token (*not verified here — we never used this path*) | `~/.claude/.credentials.json` | CLI refreshes it itself; a copy exported into env would not |
+| **`claude setup-token`** | **1 year** (stated by the CLI) | printed once → store in vault | none; re-issue before expiry |
+
+Rule: **for the shim use only `setup-token`.** The ACP card token is fine for a quick
+ACP session, not for a service that must run for months.
+
+Symptom of an expired token: every Claude Code profile in Vellum fails, shim log shows
+`Failed to authenticate. API Error: 401 OAuth access token has expired`. Check:
+`journalctl --user -u claude-shim --since -1h | grep 401`.
+Fix: step 2 below, then `systemctl --user restart claude-shim` (run.sh reads the vault
+only at start).
+
 ### 2. Obtain the OAuth token (headless VM, browser elsewhere)
 
-**Use `claude setup-token` — it issues a 1-year token.** The token from Vellum's inline
-"Connect Claude Code" (ACP) card is a short-lived session token: it expired after ~10 h
-(`401 OAuth access token has expired` in the shim log) and killed every Claude Code
-profile until re-login.
+**Use `claude setup-token` — it issues a 1-year token** (see 1b for why not the ACP card).
 
 `setup-token` is an interactive Ink TUI; run it in tmux so it survives the bash timeout:
 
