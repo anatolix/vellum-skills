@@ -46,3 +46,7 @@ Expected — the redirect goes to a loopback listener. Copy the full redirect UR
 ## Valid TOOL_CALL lands in chat as text; log says `fabricated <tool_result>; output truncated`
 **Cause:** (fixed Sep 26) the fabrication guard was global and cut a TOOL_CALL whose JSON *mentioned* `<tool_result`.
 **Fix:** current server.js checks per line, only on non-TOOL_CALL lines. If you see this with the current code, check `[warn] unparsable TOOL_CALL line: <reason>` in the log — the JSON itself was broken.
+
+## Chat shows raw `<invoke name="bash"><parameter …>` blocks, several in a row
+**Cause:** on a long history (80+ msgs) Opus drifts from the TOOL_CALL contract back to Anthropic-native `<invoke>` XML, and writes several calls blind, without waiting for results. Log: `[req]` with no matching `[res]`.
+**Fix (Sep 26):** `parseInvoke()` fallback converts the FIRST `<invoke>` into a real tool_call (typed params coerced via the tool schema), drops the rest; contract forbids `<invoke>` XML. Log: `[warn] model used <invoke> XML instead of TOOL_CALL; took 1 of N`.

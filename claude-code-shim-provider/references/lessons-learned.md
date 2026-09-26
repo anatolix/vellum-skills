@@ -97,3 +97,6 @@ token lives in the vault, not in `~/.claude`.
   `GIT_SSH_COMMAND="ssh -i <workspace>/.ssh/id_ed25519 -o IdentitiesOnly=yes"`.
 - Keep the skill's `scripts/server.js` byte-identical to the running one (`diff -q`)
   before every commit; otherwise the runbook drifts from reality within a day.
+
+## 13. Contract drift on long histories
+At ~80 messages Opus forgot the TOOL_CALL contract and answered in its native `<invoke>` XML — eight calls in one reply, all written before any result. Nothing parsed, everything landed in chat. A text contract decays with context length; the parser must accept the model's native format as a fallback. Take only the first call: the rest were written without seeing results and are guesses.

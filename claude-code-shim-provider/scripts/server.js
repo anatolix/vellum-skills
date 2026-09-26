@@ -16,6 +16,7 @@ Rules:
 - Each TOOL_CALL must be a single line of valid JSON after the prefix.
 - Do not wrap TOOL_CALL lines in markdown fences and do not add commentary around them.
 - Call functions only when they are needed; otherwise answer normally in plain text.
+- Never use <function_calls>/<invoke> XML or any other native tool-call format. Only TOOL_CALL lines.
 - After your TOOL_CALL line(s), STOP. Do not write anything after them.
 - Results of your calls arrive in <tool_result> blocks in the NEXT message, from the system.
   NEVER write <tool_result> blocks yourself and never guess what a call would return.`;
@@ -86,7 +87,34 @@ function messagesToPrompt(messages, tools) {
 // everything after the first parsed TOOL_CALL is discarded. A TOOL_CALL whose
 // JSON merely *mentions* "<tool_result" is fine — line-level check, not global.
 const TOOL_CALL_RE = /TOOL_CALL:\s*(\{.*\})\s*$/;
-function parseToolCalls(text) {
+// Fallback: model slipped into Anthropic-native <invoke> XML instead of the contract.
+// Take ONLY the first invoke — later ones were written blind, before any result.
+const INVOKE_RE = /<(?:[\w-]+:)?invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/(?:[\w-]+:)?invoke>/;
+const PARAM_RE = /<(?:[\w-]+:)?parameter\s+name="([^"]+)"\s*>([\s\S]*?)<\/(?:[\w-]+:)?parameter>/g;
+function parseInvoke(text, tools) {
+  if (/TOOL_CALL:/.test(text)) return null;
+  const m = text.match(INVOKE_RE);
+  if (!m) return null;
+  const def = (tools || []).find((t) => (t.function?.name ?? t.name) === m[1]);
+  const props = def?.function?.parameters?.properties || {};
+  const args = {};
+  for (const p of m[2].matchAll(PARAM_RE)) {
+    let v = p[2].replace(/^\n/, "").replace(/\n$/, "");
+    const type = props[p[1]]?.type;
+    if (type && type !== "string") { try { v = JSON.parse(v.trim()); } catch {} }
+    args[p[1]] = v;
+  }
+  const total = (text.match(new RegExp(INVOKE_RE.source, "g")) || []).length;
+  let before = text.slice(0, m.index).replace(/<\/?(?:[\w-]+:)?function_calls>/g, "");
+  const fab = before.search(/<tool_result\b/);
+  if (fab >= 0) before = before.slice(0, fab);
+  console.log(`[warn] model used <invoke> XML instead of TOOL_CALL; took 1 of ${total}`);
+  return { calls: [{ name: m[1], arguments: args }], restText: before.trim() };
+}
+
+function parseToolCalls(text, tools = []) {
+  const inv = parseInvoke(text, tools);
+  if (inv) return inv;
   const calls = [];
   const rest = [];
   let sawCall = false;
@@ -200,7 +228,7 @@ Bun.serve({
           }
 
           if (hasTools) {
-            const { calls, restText } = parseToolCalls(buffer);
+            const { calls, restText } = parseToolCalls(buffer, tools);
             if (calls.length) {
               if (restText) send(sseChunk(id, model, { content: restText }));
               const tool_calls = calls.map((c, i) => ({
