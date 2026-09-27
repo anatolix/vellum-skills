@@ -1,0 +1,1 @@
+0 6 * * * vellum bash /home/vellum/bin/daily-health.sh >> /home/vellum/logs/daily-health.log 2>&1

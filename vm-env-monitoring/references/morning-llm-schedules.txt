@@ -1,0 +1,54 @@
+Name:                fail2ban daily digest
+Description:         Daily fail2ban/sshd security summary for the ai.anatolix.net VM, delivered to Anatoly in Telegram.
+Enabled:             enabled
+Status:              active
+Mode:                execute
+Syntax:              cron
+Expression:          0 9 * * *
+Cadence:             Every day at 9:00 AM (Asia/Baghdad)
+Timezone:            Asia/Baghdad
+One-shot:            no
+Message:             Daily fail2ban digest. Run ONE bash command gathering: `sudo fail2ban-client status sshd` (currently failed/banned, totals), and `sudo journalctl -u ssh --since "24 hours ago" | grep -oP 'from \K[0-9.]+' | sort | uniq -c | sort -rn | head -10` plus a count of Failed/Invalid lines in the same window. Compose a SHORT Russian summary (5-8 lines: failed attempts, total/currently banned, top attacking IPs, one-line verdict that password auth is disabled so it's background noise). Then deliver it to Anatoly's Telegram with messaging_send (platform: "telegram", conversation/chat id 449271). Keep it tight, no fluff.
+Script:              —
+Inference profile:   balanced
+Routing intent:      all_channels
+Quiet:               no
+Reuse conversation:  no
+Wake conversation:   —
+Retry count:         0
+Max retries:         3
+Retry backoff:       1m
+Timeout:             —
+Plugin:              -
+
+----
+Name:                vellum release watch
+Description:         Every morning check the vellum-assistant GitHub releases for a version newer than the last one seen; if found, summarize its commits in Russian and post the digest to the Telegram chat.
+Enabled:             enabled
+Status:              active
+Mode:                execute
+Syntax:              cron
+Expression:          30 8 * * *
+Cadence:             Every day at 8:30 AM (Asia/Baghdad)
+Timezone:            Asia/Baghdad
+One-shot:            no
+Message:             Проверь новые релизы vellum-assistant. Процедура:
+1. Прочитай файл состояния scratch/vellum-release-watch.txt (в workspace). Если файла нет — считай последней известной версией v0.12.5 и создай файл с ней.
+2. Получи список релизов: curl -s https://api.github.com/repos/vellum-ai/vellum-assistant/releases?per_page=5 — из JSON возьми tag_name последнего (первого в списке) релиза. Префер API, не HTML (страница JS-рендерится).
+3. Если tag_name совпадает с версией из файла состояния — ничего не делай, никому не пиши, просто завершись.
+4. Если версия новее: для каждого нового релиза (от версии в файле до последней включительно) получи коммиты через compare API: curl -s https://api.github.com/repos/vellum-ai/vellum-assistant/compare/<старая_версия>...<новая_версия> — сгруппируй коммиты по темам (LLM/профили, память, UI, фиксы, мониторинг и т.п.) и напиши сжатую выдержку НА РУССКОМ: версия, дата, основные изменения с номерами PR. Отдельно отметь, есть ли в релизе фикс subagent empty-response (наш PR #43328 / issue #43327) — это влияет на локальный патч.
+5. Отправь выдержку в Telegram-чат: используй messaging_send с platform "telegram" и conversation id 449271. Если messaging_send недоступен — assistant notifications send --source-channel scheduler --title "Vellum <версия>: что нового" --message "<выдержка>".
+6. Обнови scratch/vellum-release-watch.txt новой версией (только после успешной отправки).
+Script:              —
+Inference profile:   balanced
+Routing intent:      all_channels
+Quiet:               no
+Reuse conversation:  no
+Wake conversation:   —
+Retry count:         0
+Max retries:         3
+Retry backoff:       1m
+Timeout:             —
+Plugin:              -
+
+----
