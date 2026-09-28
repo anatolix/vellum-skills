@@ -3,6 +3,11 @@
 # inference profile kimi-k3-medium for the woken alert conversation).
 # Silent when OK. On threshold breach: collects diagnostics and wakes a fresh conversation
 # that analyses them and sends a short Russian summary to Telegram.
+set -u
+LOAD1=$(cut -d' ' -f1 /proc/loadavg)
+LOAD5=$(cut -d' ' -f2 /proc/loadavg)
+NPROC=$(nproc)
+MEM_AVAIL_MB=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
 MEM_TOTAL_MB=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
 SWAP_USED_MB=$(awk '/SwapTotal/{t=$2} /SwapFree/{f=$2} END{print int((t-f)/1024)}' /proc/meminfo)
 # CPU: два снимка /proc/stat через 2с; считаем busy всего и busy без nice
@@ -23,6 +28,9 @@ awk "BEGIN{exit !($LOAD1 > $NPROC*2)}" && PROBLEMS="$PROBLEMS
 # Алерт только по CPU без nice: nice-фон (TEI и пр.) ядрам не мешает
 [ "$CPU_USED_NONICE" -gt 90 ] && PROBLEMS="$PROBLEMS
 - CPU занят на ${CPU_USED_NONICE}% без nice (с nice: ${CPU_USED}%)"
+CLAUDE_N=$(pgrep -c -x claude || true)
+[ "${CLAUDE_N:-0}" -gt 8 ] && PROBLEMS="$PROBLEMS
+- Процессов claude CLI: ${CLAUDE_N} (порог 8)"
 if [ -n "$PROBLEMS" ]; then
   SNAP="=== ПРОБЛЕМЫ ===
 $PROBLEMS
@@ -42,6 +50,9 @@ $(ps aux --sort=-%cpu | head -n 11)
 === ps top-10 по MEM ===
 $(ps aux --sort=-%mem | head -n 11)
 
+=== claude CLI процессы ===
+$(ps -eo pid,etime,pcpu,rss,args | awk '$5 ~ /\/claude$/' | cut -c1-160)
+
 === df -h ===
 $(df -h / /home 2>/dev/null)
 
@@ -51,5 +62,5 @@ $(vmstat 1 3)"
   assistant conversations wake "$id" --hint "Сработал health check VM ai.anatolix.net. Проанализируй диагностику из external content: назови конкретные процессы-виновники, краткое резюме что происходит и что делать. Затем отправь итог в Telegram через messaging_send (platform: telegram, conversation ID 449271) — по-русски, коротко: ⚠️ заголовок, виновники, цифры, рекомендация. После отправки завершай." --external-content "$SNAP"
   echo "ALERT -> woke $id"
 else
-  echo "OK: load1=$LOAD1 cpu=${CPU_USED}% cpu_noice=${CPU_USED_NONICE}% mem_avail=${MEM_AVAIL_MB}MB"
+  echo "OK: load1=$LOAD1 cpu=${CPU_USED}% cpu_noice=${CPU_USED_NONICE}% mem_avail=${MEM_AVAIL_MB}MB claude=${CLAUDE_N}"
 fi
