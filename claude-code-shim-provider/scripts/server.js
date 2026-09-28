@@ -34,7 +34,7 @@ const short = (k) => (k ? k.slice(0, 12) : "-");
 // ---------------------------------------------------------------------------
 let cliSeq = 0;
 class Cli {
-  constructor(label, model, resume = null, systemPrompt = null) {
+  constructor(label, model, resume = null, systemPrompt = null, effort = null) {
     this.id = ++cliSeq;
     this.label = label;
     this.model = model;
@@ -58,6 +58,14 @@ class Cli {
         permissionMode: "bypassPermissions",
         settingSources: [],
         includePartialMessages: true,
+        // Thinking: adaptive by default; display:"summarized" is REQUIRED — without it
+        // subscription traffic gets redacted blocks (empty text + signature, only
+        // estimated_tokens). Summaries stream as thinking_delta → reasoning_content.
+        // reasoning_effort "none" disables thinking; xhigh/max clamp to high.
+        ...(effort === "none"
+          ? { thinking: { type: "disabled" } }
+          : { thinking: { type: "adaptive", display: "summarized" },
+              ...(effort ? { effort: ["low", "medium", "high"].includes(effort) ? effort : "high" } : {}) }),
       },
     });
     this.pump().catch(() => {});
@@ -126,6 +134,7 @@ class Chat {
     this.lastUsed = saved?.lastUsed ?? Date.now();
     this.served = saved?.served ?? 0;
     this.sysHash = saved?.sysHash ?? null;
+    this.effort = saved?.effort ?? null;
     this.cli = null;
     this.busy = false;
     this.lock = Promise.resolve();
@@ -134,7 +143,7 @@ class Chat {
   file() { return `${SESS_DIR}/${sha(this.key)}.json`; }
   save() {
     try {
-      writeFileSync(this.file(), JSON.stringify({ key: this.key, sessionId: this.sessionId, model: this.model, sent: this.sent, sysHash: this.sysHash, lastUsed: this.lastUsed, served: this.served, savedAt: Date.now() }));
+      writeFileSync(this.file(), JSON.stringify({ key: this.key, sessionId: this.sessionId, model: this.model, sent: this.sent, sysHash: this.sysHash, effort: this.effort, lastUsed: this.lastUsed, served: this.served, savedAt: Date.now() }));
     } catch (e) { console.error(`[sess] save failed ${short(this.key)}: ${e.message}`); }
   }
   park(reason) {
@@ -151,7 +160,7 @@ class Chat {
     let release; this.lock = new Promise((r) => (release = r));
     await prev;
     this.busy = true;
-    try { return await this._run(model, blocks, onMsg); }
+    try { return await this._run(model, blocks, onMsg, effort); }
     finally { this.busy = false; this.lastUsed = Date.now(); release(); manager.kick(); }
   }
 
@@ -161,12 +170,13 @@ class Chat {
   // the head) therefore sends just the summary; a retried identical history
   // re-sends the last user block. A fresh process is spawned only when there is
   // no live one, with `resume` when a session id exists.
-  async _run(model, blocks, onMsg) {
+  async _run(model, blocks, onMsg, effort = null) {
     const inputs = inputBlocks(blocks);
     const hashes = inputs.map((b) => sha(b.text));
     const sys = systemText(blocks);
     const sysHash = sys ? sha(sys) : null;
     if (this.live && sysHash !== this.sysHash) this.park("system changed");
+    if (this.live && (effort ?? null) !== (this.effort ?? null)) this.park("effort changed");
     const seen = new Set(this.sent);
     let unseen = inputs.filter((_, i) => !seen.has(hashes[i]));
     let why = !this.sent.length ? "new" : unseen.length ? `tail=${unseen.length}` : "repeat";
@@ -176,7 +186,7 @@ class Chat {
       const t0 = Date.now();
       try {
         if (!this.live) {
-          this.cli = await manager.spawn(short(this.key), model, this.sessionId, sys);
+          this.cli = await manager.spawn(short(this.key), model, this.sessionId, sys, effort);
           why += this.sessionId ? " resume" : " spawn";
           this.sysHash = sysHash;
         }
@@ -186,7 +196,7 @@ class Chat {
         const tPrep = Date.now() - t0;
         const res = await this.cli.send(prompt, (m) => { produced = true; onMsg(m); });
         for (const h of hashes) seen.add(h);
-        this.sent = [...seen]; this.sessionId = res.session_id || this.cli.sessionId; this.model = model; this.served++; this.lastUsed = Date.now();
+        this.sent = [...seen]; this.sessionId = res.session_id || this.cli.sessionId; this.model = model; this.effort = effort ?? null; this.served++; this.lastUsed = Date.now();
         this.save();
         if (res.subtype && res.subtype !== "success") console.log(`[sess] ${short(this.key)} result subtype=${res.subtype} ${String(res.result || "").slice(0, 120)}`);
         console.log(`[sess] ${short(this.key)} served #${this.served} model=${model} prep=${tPrep}ms total=${Date.now() - t0}ms in=${res.usage?.input_tokens ?? "?"} cache_read=${res.usage?.cache_read_input_tokens ?? "?"} session=${this.sessionId}`);
@@ -225,14 +235,14 @@ const manager = {
     return c;
   },
   // Wait for a free slot (parking the LRU idle chat if needed), then spawn.
-  async spawn(label, model, resume, systemPrompt = null) {
+  async spawn(label, model, resume, systemPrompt = null, effort = null) {
     while (this.liveCount() >= MAX_LIVE) {
       const idle = [...this.chats.values()].filter((c) => c.live && !c.busy).sort((a, b) => a.lastUsed - b.lastUsed);
       if (idle.length) { idle[0].park("evict"); continue; }
       await new Promise((r) => this.waiters.push(r));
     }
     this.reserved++;
-    try { return new Cli(label, model, resume, systemPrompt); } finally { this.reserved--; }
+    try { return new Cli(label, model, resume, systemPrompt, effort); } finally { this.reserved--; }
   },
   kick() { const w = this.waiters.splice(0); for (const r of w) r(); },
   reap() {
@@ -243,11 +253,11 @@ const manager = {
     }
   },
   oneshotWaiters: [],
-  async runEphemeral(model, blocks, onMsg, tag = "nokey", attempts = 3) {
+  async runEphemeral(model, blocks, onMsg, tag = "nokey", attempts = 3, effort = null) {
     while (MAX_ONESHOT > 0 && this.ephemeral.size >= MAX_ONESHOT) await new Promise((r) => this.oneshotWaiters.push(r));
     let lastErr;
     for (let a = 0; a < attempts; a++) {
-      const cli = new Cli(tag, model, null, systemText(blocks));
+      const cli = new Cli(tag, model, null, systemText(blocks), effort);
       this.ephemeral.add(cli);
       let produced = false;
       try {
@@ -273,10 +283,10 @@ const manager = {
   isOneShot(blocks) {
     return !blocks.some((b) => b.role === "assistant" || b.role === "tool");
   },
-  run(model, key, blocks, onMsg) {
-    if (!key) return this.runEphemeral(model, blocks, onMsg, "nokey");
-    if (!this.chats.has(key) && this.isOneShot(blocks)) return this.runEphemeral(model, blocks, onMsg, `oneshot ${short(key)}`);
-    return this.get(key).run(model, blocks, onMsg);
+  run(model, key, blocks, onMsg, effort = null) {
+    if (!key) return this.runEphemeral(model, blocks, onMsg, "nokey", 3, effort);
+    if (!this.chats.has(key) && this.isOneShot(blocks)) return this.runEphemeral(model, blocks, onMsg, `oneshot ${short(key)}`, 3, effort);
+    return this.get(key).run(model, blocks, onMsg, effort);
   },
   status() {
     return {
@@ -505,7 +515,9 @@ Bun.serve({
     const model = body.model || "claude-opus";
     const tools = Array.isArray(body.tools) ? body.tools : [];
     const hasTools = tools.length > 0;
-    console.log(`[req] model=${model} msgs=${(body.messages || []).length} tools=${tools.length} key=${typeof body.prompt_cache_key === "string" ? body.prompt_cache_key.slice(0, 12) : "-"}`);
+    const effort = typeof body.reasoning_effort === "string" ? body.reasoning_effort
+      : typeof body.reasoning?.effort === "string" ? body.reasoning.effort : null;
+    console.log(`[req] model=${model} msgs=${(body.messages || []).length} tools=${tools.length} effort=${effort ?? "-"} key=${typeof body.prompt_cache_key === "string" ? body.prompt_cache_key.slice(0, 12) : "-"}`);
     const sdkModel = model.replace(/^claude-/, ""); // opus | sonnet | haiku
     const blocks = messagesToBlocks(body.messages || [], tools);
     const cacheKey = typeof body.prompt_cache_key === "string" && body.prompt_cache_key ? body.prompt_cache_key : null;
@@ -520,6 +532,11 @@ Bun.serve({
           let buffer = "";
           let sawDelta = false;
           const result = await manager.run(sdkModel, cacheKey, blocks, (msg) => {
+            if (msg.type === "stream_event" && msg.event?.type === "content_block_delta" && msg.event.delta?.type === "thinking_delta") {
+              const thinking = msg.event.delta?.thinking;
+              if (thinking) send(sseChunk(id, model, { reasoning_content: thinking })); // Vellum renders as thinking
+              return;
+            }
             if (msg.type === "stream_event" && msg.event?.type === "content_block_delta") {
               const text = msg.event.delta?.text;
               if (!text) return;
@@ -533,7 +550,7 @@ Bun.serve({
               if (hasTools) buffer += text;
               else send(sseChunk(id, model, { content: text }));
             }
-          });
+          }, effort);
 
           if (hasTools) {
             const { calls, restText } = parseToolCalls(buffer, tools);

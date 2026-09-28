@@ -64,6 +64,13 @@ Key ideas:
    full two-block history — one wasted cache write, then normal. Before this, every
    `inference send` created a "chat" whose process sat in a slot until the 1h TTL and
    batch pipelines starved real chats of slots.
+6. **Thinking summaries stream to the UI.** Every spawn gets
+   `thinking: {type:"adaptive", display:"summarized"}` — without `display:"summarized"`
+   subscription thinking blocks are redacted (empty text, only `estimated_tokens`).
+   `thinking_delta` events are forwarded as SSE `delta.reasoning_content`, which Vellum
+   renders as the thinking block. `reasoning_effort` from the request maps to SDK
+   `effort` (xhigh/max clamp to high); `"none"` disables thinking. Mid-chat effort change
+   parks + respawns the process (same as system-prompt change).
 5. **Compaction** on the Vellum side just shows up as one new unseen block (the summary)
    — fed as text, the CLI keeps its own full transcript.
 6. **Keyless requests** (no `prompt_cache_key`, e.g. `assistant inference send`,
@@ -202,6 +209,8 @@ cp {baseDir}/scripts/claude-shim.service ~/.config/systemd/user/   # fix paths/a
   settingSources: [], resume?, systemPrompt?`, `env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN }`
 - Env knobs: `SHIM_MAX_LIVE` (8), `SHIM_MAX_ONESHOT` (32), `SHIM_IDLE_TTL_SEC` (3600),
   `SHIM_SESSIONS_DIR` (`./sessions`), `SHIM_PORT` (8317 — side-port testing)
+- Thinking: always spawned with `display:"summarized"`; raw CoT never available on
+  subscription (redacted by Anthropic), summaries are
 - `Bun.serve({ idleTimeout: 255 })` — default 10 s kills slow SDK spawns
 - Log lines: `[req]`, `[sess] <key> cli<N> spawn|resume|live blocks=… seen=…`,
   `[sess] … served #n … cache_read=…`, `[sess] … park (idle|evict|sigterm|sysprompt)`,
