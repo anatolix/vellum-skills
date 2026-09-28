@@ -27,3 +27,10 @@ Raw chain-of-thought is never available on OAuth subscription traffic — summar
 Vellum sends NO reasoning_effort for claude-code-* profiles, so the shim defaults to
 adaptive+summarized; "none" disables thinking. Interactive CLI equivalent: settings.json
 `"showThinkingSummaries": true`.
+
+## 24. Partial sed/python replaces: verify EVERY targeted line landed (Sep 28 night)
+A python `s.replace(old,new,1)` that silently matched zero times left `Chat.run` without the
+`effort` param while the body referenced it → runtime ReferenceError, one-shot path worked,
+keyed chats 500. `bun build` does NOT catch undefined vars. After any scripted edit: grep
+every intended anchor, and smoke-test BOTH the ephemeral and the keyed-chat path before
+restart.

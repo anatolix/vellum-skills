@@ -155,7 +155,7 @@ class Chat {
   }
 
   // Requests for one chat are serialised; Vellum sends full history each time.
-  async run(model, blocks, onMsg) {
+  async run(model, blocks, onMsg, effort = null) {
     const prev = this.lock;
     let release; this.lock = new Promise((r) => (release = r));
     await prev;
