@@ -54,6 +54,16 @@ Key ideas:
    Claude Code's own prompt. Vellum's system field is stable per chat (dynamic context
    is injected into the tail user message, not the system field), so this is safe; if it
    does change, the chat is parked and respawned with resume — transcript survives.
+5. **One-shot requests bypass the chat pool.** A request whose history has no `assistant`
+   or `tool` turn (first message of a conversation — which for `assistant inference send`,
+   subagent scripts and batch pipelines is the *only* message) is served by a throwaway
+   process, closed right after the answer, logged as `[oneshot <key>]`. Keyless requests
+   are the same path, tagged `[nokey]`. Neither counts against `SHIM_MAX_LIVE`; they have
+   their own OOM guard `SHIM_MAX_ONESHOT` (32, 0 = unlimited, ~220 MB per process).
+   Cost for a real chat: its turn 2 finds no Chat for the key and spawns one with the
+   full two-block history — one wasted cache write, then normal. Before this, every
+   `inference send` created a "chat" whose process sat in a slot until the 1h TTL and
+   batch pipelines starved real chats of slots.
 5. **Compaction** on the Vellum side just shows up as one new unseen block (the summary)
    — fed as text, the CLI keeps its own full transcript.
 6. **Keyless requests** (no `prompt_cache_key`, e.g. `assistant inference send`,
@@ -174,7 +184,8 @@ cp {baseDir}/scripts/claude-shim.service ~/.config/systemd/user/   # fix paths/a
 
 `server.js` (full source in `{baseDir}/scripts/server.js`, ~550 lines):
 - `GET /v1/models` → `claude-opus`, `claude-sonnet`; `GET /chats` (alias `/pool`) → live
-  chats, sessions, idle seconds, waiters
+  chats, sessions, idle seconds, waiters, plus `oneshot: [{cli,label,model}]`,
+  `maxOneshot`, `oneshotWaiters`
 - `POST /v1/chat/completions` (SSE), model id `claude-X` → SDK model `X`
 - Classes: `Cli` (one `claude` process via streaming-input `query()`, `close()` kills),
   `Chat` (per key: sessionId, sha1 list of fed blocks, sysHash, lock serialising
@@ -189,8 +200,8 @@ cp {baseDir}/scripts/claude-shim.service ~/.config/systemd/user/   # fix paths/a
   first call only
 - SDK options: `tools: [], allowedTools: [], permissionMode: "bypassPermissions",
   settingSources: [], resume?, systemPrompt?`, `env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN }`
-- Env knobs: `SHIM_MAX_LIVE` (8), `SHIM_IDLE_TTL_SEC` (3600), `SHIM_SESSIONS_DIR`
-  (`./sessions`)
+- Env knobs: `SHIM_MAX_LIVE` (8), `SHIM_MAX_ONESHOT` (32), `SHIM_IDLE_TTL_SEC` (3600),
+  `SHIM_SESSIONS_DIR` (`./sessions`), `SHIM_PORT` (8317 — side-port testing)
 - `Bun.serve({ idleTimeout: 255 })` — default 10 s kills slow SDK spawns
 - Log lines: `[req]`, `[sess] <key> cli<N> spawn|resume|live blocks=… seen=…`,
   `[sess] … served #n … cache_read=…`, `[sess] … park (idle|evict|sigterm|sysprompt)`,

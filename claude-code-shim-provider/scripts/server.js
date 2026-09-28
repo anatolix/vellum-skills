@@ -9,11 +9,15 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import { mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 
-const PORT = 8317;
+const PORT = Number(process.env.SHIM_PORT || 8317);
 
 const MAX_LIVE = Number(process.env.SHIM_MAX_LIVE || process.env.SHIM_POOL_SIZE || 8);
 const IDLE_TTL_MS = Number(process.env.SHIM_IDLE_TTL_SEC || 3600) * 1000;
 const SESS_DIR = process.env.SHIM_SESSIONS_DIR || `${import.meta.dir}/sessions`;
+// One-shot requests (first message of a conversation: no assistant/tool turns yet) get a
+// throwaway process that is closed right after the answer. They do not occupy chat slots;
+// SHIM_MAX_ONESHOT is a separate OOM guard (~220 MB per process). 0 = unlimited.
+const MAX_ONESHOT = Number(process.env.SHIM_MAX_ONESHOT ?? 32);
 const DEFAULT_MODEL = "sonnet";
 mkdirSync(SESS_DIR, { recursive: true });
 const sha = (s) => createHash("sha1").update(s).digest("hex");
@@ -204,7 +208,7 @@ const manager = {
   reserved: 0,
   waiters: [],
   liveCount() {
-    let n = this.ephemeral.size + this.reserved;
+    let n = this.reserved;
     for (const c of this.chats.values()) if (c.live) n++;
     return n;
   },
@@ -238,33 +242,45 @@ const manager = {
       else if (!c.live && !c.busy && now - c.lastUsed > 24 * 3600e3) this.chats.delete(c.key); // disk copy stays
     }
   },
-  async runEphemeral(model, blocks, onMsg, attempts = 3) {
+  oneshotWaiters: [],
+  async runEphemeral(model, blocks, onMsg, tag = "nokey", attempts = 3) {
+    while (MAX_ONESHOT > 0 && this.ephemeral.size >= MAX_ONESHOT) await new Promise((r) => this.oneshotWaiters.push(r));
     let lastErr;
     for (let a = 0; a < attempts; a++) {
-      const cli = await this.spawn("nokey", model, null, systemText(blocks));
+      const cli = new Cli(tag, model, null, systemText(blocks));
       this.ephemeral.add(cli);
       let produced = false;
       try {
         const t0 = Date.now();
         const res = await cli.send(blocksToPrompt(inputBlocks(blocks)), (m) => { produced = true; onMsg(m); });
-        console.log(`[nokey] cli${cli.id} model=${model} total=${Date.now() - t0}ms in=${res.usage?.input_tokens ?? "?"} cache_read=${res.usage?.cache_read_input_tokens ?? "?"}`);
+        console.log(`[${tag}] cli${cli.id} model=${model} total=${Date.now() - t0}ms in=${res.usage?.input_tokens ?? "?"} cache_read=${res.usage?.cache_read_input_tokens ?? "?"}`);
         return res;
       } catch (e) {
         lastErr = e;
         if (produced) throw e;
-        console.log(`[nokey] retry ${a + 1}/${attempts} after: ${String(e?.message || e).slice(0, 120)}`);
+        console.log(`[${tag}] retry ${a + 1}/${attempts} after: ${String(e?.message || e).slice(0, 120)}`);
       } finally {
         this.ephemeral.delete(cli); cli.close();
+        const w = this.oneshotWaiters.shift(); if (w) w();
       }
     }
     throw lastErr;
   },
+  // A request whose history has no assistant or tool turns is the first (and, for
+  // `assistant inference send` and subagent scripts, the only) message of a conversation.
+  // Serve it with a throwaway process; a real chat's second request finds no Chat for the
+  // key and spawns one with the full two-block history — one wasted cache write, no slot leak.
+  isOneShot(blocks) {
+    return !blocks.some((b) => b.role === "assistant" || b.role === "tool");
+  },
   run(model, key, blocks, onMsg) {
-    return key ? this.get(key).run(model, blocks, onMsg) : this.runEphemeral(model, blocks, onMsg);
+    if (!key) return this.runEphemeral(model, blocks, onMsg, "nokey");
+    if (!this.chats.has(key) && this.isOneShot(blocks)) return this.runEphemeral(model, blocks, onMsg, `oneshot ${short(key)}`);
+    return this.get(key).run(model, blocks, onMsg);
   },
   status() {
     return {
-      maxLive: MAX_LIVE, idleTtlSec: IDLE_TTL_MS / 1000, live: this.liveCount(), ephemeral: this.ephemeral.size, waiters: this.waiters.length,
+      maxLive: MAX_LIVE, maxOneshot: MAX_ONESHOT, idleTtlSec: IDLE_TTL_MS / 1000, live: this.liveCount(), oneshot: [...this.ephemeral].map((c) => ({ cli: c.id, label: c.label, model: c.model })), waiters: this.waiters.length, oneshotWaiters: this.oneshotWaiters.length,
       chats: [...this.chats.values()].map((c) => ({ key: short(c.key), live: c.live, busy: c.busy, cli: c.cli?.id ?? null, model: c.model, served: c.served, sent: c.sent.length, session: c.sessionId, idleSec: Math.round((Date.now() - c.lastUsed) / 1000) })),
     };
   },
