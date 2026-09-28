@@ -27,18 +27,7 @@ Why bother:
 Verified on Ubuntu 24.04, 4 vCPU / 16 GB, Vellum 0.12.4–0.12.5, TEI cpu-1.9.4, memory v3 live. Covers the **full lifecycle**: dockerless image extraction from ghcr, the glibc-mixing segfault, MKL/OMP thread capping, RAM capping via `--max-batch-tokens`, int8 model from a local dir — **and the post-switch re-index**: the `database is locked` fatal misclassification (patch included), the `content_hash` skip trap, why `embed_segment` jobs are no-ops under memory v3, the per-collection fill paths, and the SQL recipe to rebuild `messages_lexical` for old messages (no backfill does this).
 
 ### [claude-code-shim-provider](claude-code-shim-provider/SKILL.md)
-
-Use **Claude Opus/Sonnet on a Claude subscription** (no API key) as a Vellum chat model — with working tools.
-
-A small Bun server (`127.0.0.1:8317`) speaks OpenAI `chat/completions` and proxies to Claude Code via `@anthropic-ai/claude-agent-sdk`. Since the SDK does not accept OpenAI tool definitions, the shim renders Vellum's `tools` into the prompt as a strict text contract (`TOOL_CALL: {...}` lines), parses the model output, and returns real OpenAI `tool_calls` deltas. Tool **execution** stays on the Vellum side (trust rules, guardian approval); Claude Code's own Bash/Read tools are kept disabled so the model cannot bypass them.
-
-Covers: installing Claude Code CLI on a headless VM, getting the OAuth token with the loopback-callback trick (phone → paste redirect URL → curl into VM), storing it in the Vellum vault, systemd user unit, provider/profile registration, a 3-stage curl test script, and the failure modes we hit (`token_len=0`, Bun `idleTimeout`, "profile has no tools").
-
-Verified Ubuntu 24.04, Vellum 0.12.5, Claude Code 2.1.282, Agent SDK 0.3.x.
-
-## License
-
-MIT. Use, adapt, republish.
+Claude Opus/Sonnet as Vellum chat models on a Claude subscription. Claude Code CLI install, 1-year OAuth token via `setup-token`, Bun shim with **one Claude Code session per Vellum chat** (park after 1 h idle, resume on return, ~97% prompt-cache hits), OpenAI function calling via prompt contract, native system prompt, usage reporting; `vellum-mcp.ts` stdio bridge exposing Vellum tools to Claude Code (with trust-class header + tool timeout override) — used with the RichardAtCT wrapper fork. Depends on two patches from `anatolix/vellum-assistant` `local-patches`.
 
 ### [subagent-empty-response-patch](subagent-empty-response-patch/SKILL.md)
 Fix for the platform bug where subagents die silently after exactly one tool call (empty post-tool LLM response, no re-query nudge for `subagentSpawn`). One-line patch to the empty-response hook, verification procedure, and links to upstream issue vellum-ai/vellum-assistant#43327 and PR #43328. Re-apply after every upgrade until the PR merges.

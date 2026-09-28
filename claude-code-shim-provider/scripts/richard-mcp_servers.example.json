@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "vellum": {
+      "_comment": "Vellum tools via the vellum-mcp.ts stdio bridge (see anatolix/vellum-skills, skill claude-code-shim-provider). VELLUM_MCP_TRUST is injected per request from the X-Vellum-Trust header by the claude_cli patch; do not set it here.",
+      "command": "/home/USER/.bun/bin/bun",
+      "args": ["run", "/home/USER/claude-shim/vellum-mcp.ts"],
+      "env": {
+        "VELLUM_WORKSPACE_DIR": "/home/USER/.local/share/vellum/assistants/NAME/.vellum/workspace",
+        "VELLUM_DATA_DIR": "/home/USER/.local/share/vellum/assistants/NAME/.vellum/workspace/data",
+        "VELLUM_CLOUD": "local",
+        "PATH": "/home/USER/.bun/bin:/usr/local/bin:/usr/bin:/bin",
+        "VELLUM_MCP_EXCLUDE": "bash,host_bash,file_write,file_edit,host_file_write,host_file_edit,host_file_transfer,delete_memory_page,ask_question,ui_show,ui_update,ui_dismiss,file_upload,watch_retro_report,channel_setup,voice_picker,skill_execute",
+        "VELLUM_MCP_TOOL_TIMEOUT_SEC": "300"
+      }
+    }
+  }
+}

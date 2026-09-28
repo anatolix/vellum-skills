@@ -100,3 +100,56 @@ token lives in the vault, not in `~/.claude`.
 
 ## 13. Contract drift on long histories
 At ~80 messages Opus forgot the TOOL_CALL contract and answered in its native `<invoke>` XML — eight calls in one reply, all written before any result. Nothing parsed, everything landed in chat. A text contract decays with context length; the parser must accept the model's native format as a fallback. Take only the first call: the rest were written without seeing results and are guesses.
+
+## 14. Warm pool + /clear was the wrong shape (Sep 28)
+First attempt at avoiding cold starts: N warm processes, `/clear` before every request,
+whole history re-sent each time. It worked (`/clear` emits `conversation_reset`, new
+session id, no leakage — the `claude-sdk-session-isolation-test` skill has the proof), but
+`cache_read` stayed 0: re-sending the glued history under a text `Human:/Assistant:` markup
+never matched Anthropic's cached prefix byte-for-byte, and the model saw its own past
+replies as *our* text. Startup deadlock on top: workers waited for `init`, the CLI does not
+emit `init` until it gets a first message. Dead end; kept only the usage reporting from it.
+
+## 15. One process per chat, diff the history, never reset
+The fix that stuck: key on Vellum's `prompt_cache_key` (conversation id — needed a
+two-file Vellum patch, upstream sends it only to OpenAI/Anthropic providers), keep one
+long-lived CLI per chat, feed only blocks whose sha1 was not fed before. The CLI transcript
+holds assistant turns natively, so they are never re-fed. Anatoly's two rulings that
+simplified the code: «ресет давай изничтожим» (no `/clear` anywhere, even on resume
+failure — a fresh process just gets the full history), and «зачем ресет если чат живёт
+или резюмится всегда». Cache hit went 0 → ~97% on real chats; Opus answers in 4–7 s.
+
+## 16. System prompt native, not in the text
+Vellum's `system` field is stable for the life of a chat — `agent/loop.ts` keeps
+SOUL/IDENTITY/instructions there and injects all dynamic context (`<turn_context>`,
+`<info>`, memory, NOW.md) as text blocks into the *tail user message*, stripped and
+re-injected on compaction (`context/strip-injections.ts`, `RUNTIME_INJECTION_PREFIXES`).
+So passing it as `options.systemPrompt {type:'custom', snapshot:false}` is safe and
+replaces Claude Code's own prompt (its tools are off anyway). SDK accepts
+`string | string[] | {type:'custom'} | {type:'preset'}`. On a system change: park +
+respawn with `resume` — memory survives, verified with a PIRATE→ROBOT persona switch.
+
+## 17. Resume keeps the session id
+`resume: sessionId` at spawn continues the same session (no `forkSession`), so the saved
+JSON stays valid across any number of park/resume cycles. Resume takes ~1 s more than a
+plain spawn; the first request after it hits cache normally.
+
+## 18. Vellum tools over MCP — trust is a header, not a config
+`vellum-mcp.ts` runs tools through `ToolExecutor` with an explicit `trustClass`. Memory
+tools refuse anything but `guardian`; bash & co. are denied for non-guardian. Hard-coding
+`guardian` in the MCP config would give every caller full access, so the trust class rides
+a request header (`X-Vellum-Trust`, from a Vellum patch) → wrapper contextvar → env of the
+stdio server for that request. Verified: header → `recall` answers; no header →
+«only available to the guardian».
+
+## 19. Tool timeout inside the bridge
+`recall` is pinned to a cheap background model with 17–120 s+ latency; Vellum's default
+`toolExecutionTimeoutSec` (120) killed it inside Claude Code. `getConfig()` returns its
+cached object by reference — re-stamp `timeouts.toolExecutionTimeoutSec` before each call
+from `VELLUM_MCP_TOOL_TIMEOUT_SEC` (300) and config.json stays untouched. The slowness is
+recall itself, not the bridge — measured with `scripts/mcp-time.ts`.
+
+## 20. The 401 that wasn't
+Richard's wrapper returned «Missing API key» — I had curled without
+`Authorization: Bearer x`. Vellum always sends the header, so no profile was ever
+affected. Check your own curl before blaming the code.

@@ -1,6 +1,6 @@
 ---
 name: "Claude Code as a Vellum chat model — install, OAuth, tool-capable shim"
-description: "End-to-end: install Claude Code CLI on a self-hosted Vellum VM, obtain a Claude OAuth token via the loopback callback trick, run a local OpenAI-compatible shim (Bun + Claude Agent SDK) that supports OpenAI function calling via a prompt contract, register it as a Vellum provider, and verify tools work end-to-end. Verified Ubuntu 24.04, Vellum 0.12.x, Claude Code 2.1.x, Agent SDK 0.3.x."
+description: "End-to-end: install Claude Code CLI on a self-hosted Vellum VM, obtain a Claude OAuth token via the loopback callback trick, run a local OpenAI-compatible shim (Bun + Claude Agent SDK) that keeps one Claude Code session per Vellum conversation (prompt cache hits ~97%), supports OpenAI function calling via a prompt contract, passes the Vellum system prompt natively, reports token usage; plus a stdio MCP bridge (vellum-mcp.ts) that exposes Vellum tools to any Claude Code process (used with RichardAtCT/claude-code-openai-wrapper). Register as a Vellum provider and verify end-to-end. Verified Ubuntu 24.04, Vellum 0.12.x, Claude Code 2.1.x, Agent SDK 0.3.x."
 metadata:
   vellum:
     emoji: 🔌
@@ -10,6 +10,8 @@ metadata:
       - needs an OpenAI-compatible backend that proxies to Claude Code
       - wants to add claude-code as a Vellum inference provider
       - shim returns text instead of tool_calls
+      - Claude Code profile is slow / cache_read=0 on every request; wants session continuation
+      - wants Vellum tools (recall, web_search, telegram…) callable from inside Claude Code via MCP
     avoid-when:
       - user has an Anthropic API key and can use OpenRouter/Anthropic directly (native tools, no shim needed)
       - user only wants to delegate coding tasks to Claude Code (use the acp skill)
@@ -20,19 +22,51 @@ metadata:
 
 Make Claude Opus/Sonnet available as Vellum chat profiles **on a Claude subscription** (no API key), with working tools.
 
-Architecture:
+Architecture (current, Sep 28):
 
 ```
-Vellum daemon ──OpenAI chat/completions──▶ claude-shim (Bun, 127.0.0.1:8317)
-   ▲  executes tools, trust rules            │  @anthropic-ai/claude-agent-sdk query()
-   └──── tool_calls / content ◀──────────────┘  CLAUDE_CODE_OAUTH_TOKEN → Claude Code
+Vellum daemon ──OpenAI chat/completions + prompt_cache_key──▶ claude-shim (Bun, 127.0.0.1:8317)
+   ▲  executes tools, trust rules                              │  one long-lived `claude` process PER CHAT
+   │                                                           │  (streaming-input query(), resume after idle)
+   └──── tool_calls / content / usage ◀────────────────────────┘  CLAUDE_CODE_OAUTH_TOKEN → Claude Code
 ```
 
-Key insight: Claude Code's SDK does not accept OpenAI-style tool definitions, and Vellum
-must remain the executor (trust rules, guardian approval). The shim renders Vellum's
-`tools` into the prompt as a text contract, parses `TOOL_CALL:` lines from the model
-output, and returns real OpenAI `tool_calls` deltas. Claude Code's own tools
-(Bash/Read/...) stay disabled so the model cannot bypass Vellum.
+Key ideas:
+
+1. **Vellum stays the tool executor.** Claude Code's SDK does not take OpenAI tool
+   definitions, and Vellum must keep trust rules / guardian approval. The shim renders
+   `tools` into a text contract, parses `TOOL_CALL:` lines (or native `<invoke>` XML as a
+   fallback) and returns real OpenAI `tool_calls`. Claude Code's own tools stay disabled.
+2. **One CLI process per chat, keyed by `prompt_cache_key`** (= Vellum conversation id;
+   needs the local Vellum patch that forwards it to openai-compatible providers, see
+   step 7). The CLI transcript is the source of truth; Vellum's history is only *diffed*:
+   every user/tool_result block whose sha1 the chat has not seen is fed, in order.
+   Nothing is ever re-sent, there is no `/clear`, no reset. Result: on a live chat the
+   Anthropic prompt cache hits ~97% (`cache_read` ≈ whole prompt, write = the delta).
+3. **Park / resume.** A chat idle > `SHIM_IDLE_TTL_SEC` (3600) or evicted by the
+   `SHIM_MAX_LIVE` (8) cap is *parked*: `{sessionId, sent hashes, model, sysHash}` saved to
+   `sessions/<sha1(key)>.json`, process killed. Next request spawns with
+   `resume: sessionId` and feeds only the tail. SIGTERM parks everything, so a shim
+   restart keeps sessions. If resume fails → fresh process with the full history (no
+   cache hit, nothing to do about it).
+4. **System prompt goes native.** Vellum's `system` messages + the tool contract are
+   passed at spawn as `systemPrompt: {type:"custom", prompt, snapshot:false}`, replacing
+   Claude Code's own prompt. Vellum's system field is stable per chat (dynamic context
+   is injected into the tail user message, not the system field), so this is safe; if it
+   does change, the chat is parked and respawned with resume — transcript survives.
+5. **Compaction** on the Vellum side just shows up as one new unseen block (the summary)
+   — fed as text, the CLI keeps its own full transcript.
+6. **Keyless requests** (no `prompt_cache_key`, e.g. `assistant inference send`,
+   subagents from CLI scripts) get a throwaway process (`runEphemeral`, 3 attempts).
+7. **Usage** from the CLI result is emitted as a final SSE chunk (`prompt_tokens` =
+   input+cache_read+cache_write, `prompt_tokens_details.cached_tokens`,
+   `cache_write_tokens`) — Vellum shows it in the usage indicator / `assistant usage`.
+
+A second, independent piece: **`vellum-mcp.ts`** — a stdio MCP server that exposes
+Vellum's registered tools (via `ToolExecutor`, same path as `assistant tools run`) to
+*any* Claude Code process. Used to give RichardAtCT/claude-code-openai-wrapper access to
+Vellum tools (step 8). Not used by the shim itself (yet — next step is
+`createSdkMcpServer` from the request `tools`, replacing the text contract).
 
 ## Prerequisites
 
@@ -138,19 +172,32 @@ cp {baseDir}/scripts/{server.js,run.sh,package.json,bun.lock,tsconfig.json} ~/cl
 cp {baseDir}/scripts/claude-shim.service ~/.config/systemd/user/   # fix paths/assistant name in run.sh + unit first
 ```
 
-`server.js` (full source in `{baseDir}/scripts/server.js`):
-- `GET /v1/models` → `claude-opus`, `claude-sonnet`
+`server.js` (full source in `{baseDir}/scripts/server.js`, ~550 lines):
+- `GET /v1/models` → `claude-opus`, `claude-sonnet`; `GET /chats` (alias `/pool`) → live
+  chats, sessions, idle seconds, waiters
 - `POST /v1/chat/completions` (SSE), model id `claude-X` → SDK model `X`
-- `messagesToPrompt(messages, tools)`: system → `<system>`, user → `Human:`,
-  assistant → `Assistant:` (+ `TOOL_CALL:` lines for historical tool_calls),
-  role `tool` → `<tool_result name="...">…</tool_result>`; if `tools` present,
-  prepend `<tools>[defs]</tools>` + contract text
-- Contract: model emits ONLY `TOOL_CALL: {"name": "...", "arguments": {...}}` lines to call
-- Output with tools is **buffered** (no token streaming) so TOOL_CALL lines can be detected;
-  parsed calls → `delta.tool_calls` + `finish_reason: "tool_calls"`, else content + `stop`
+- Classes: `Cli` (one `claude` process via streaming-input `query()`, `close()` kills),
+  `Chat` (per key: sessionId, sha1 list of fed blocks, sysHash, lock serialising
+  requests, `park()`), `manager` (Map of chats, `spawn` with MAX_LIVE cap + LRU park,
+  reaper every 60 s, SIGTERM parks all)
+- `inputBlocks(messages)` = user + tool_result blocks only (system → `systemPrompt`,
+  assistant turns are already in the CLI transcript). `systemText(blocks)` = Vellum
+  system messages + tool contract (`<tools>` defs + "emit ONLY `TOOL_CALL: {...}`")
+- Output with tools is **buffered** so TOOL_CALL lines can be detected; parsed calls →
+  `delta.tool_calls` + `finish_reason: "tool_calls"`, else content + `stop`; fabrication
+  guard truncates at a model-written `<tool_result`; `<invoke>` XML fallback takes the
+  first call only
 - SDK options: `tools: [], allowedTools: [], permissionMode: "bypassPermissions",
-  settingSources: [], maxTurns: 1`, `env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN }`
-- `Bun.serve({ idleTimeout: 255 })` — default 10s kills slow SDK spawns
+  settingSources: [], resume?, systemPrompt?`, `env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN }`
+- Env knobs: `SHIM_MAX_LIVE` (8), `SHIM_IDLE_TTL_SEC` (3600), `SHIM_SESSIONS_DIR`
+  (`./sessions`)
+- `Bun.serve({ idleTimeout: 255 })` — default 10 s kills slow SDK spawns
+- Log lines: `[req]`, `[sess] <key> cli<N> spawn|resume|live blocks=… seen=…`,
+  `[sess] … served #n … cache_read=…`, `[sess] … park (idle|evict|sigterm|sysprompt)`,
+  `[usage] …`. Read with `journalctl --user -u claude-shim -f`.
+
+**Do not restart the shim casually** — SIGTERM parks sessions correctly, but a restart
+still costs every live chat a resume + the first request after it is slower.
 
 ### 4. Wrapper `run.sh` (pulls token from Vellum vault at start, never on disk)
 
@@ -207,6 +254,59 @@ assistant inference profiles create claude-code-sonnet \
 Optional default: `assistant inference profiles active claude-code-opus`
 (affects **new** sessions only).
 
+### 7. Vellum local patches this depends on (fork `anatolix/vellum-assistant`, branch `local-patches`)
+
+Two of the five local patches on that branch exist for this shim; without them the shim
+still works but every request is keyless (throwaway process, no cache):
+
+- **`prompt_cache_key` forwarding** (commit 239cd4af): `providers/retry.ts` adds
+  `openai-compatible` to `PROMPT_CACHE_KEY_PROVIDERS`;
+  `providers/openai/chat-completions-provider.ts` puts `configObj.promptCacheKey` on the
+  wire as `prompt_cache_key`. Vellum sets it to the conversation id.
+- **`X-Vellum-Trust` header** (commit fcfcdc50): `agent/loop.ts` stamps
+  `providerConfig.actorTrustClass`; `retry.ts` sends it as a header for openai-compatible
+  providers only. Consumed by Richard's wrapper (step 8) to set `VELLUM_MCP_TRUST`.
+
+Re-apply after every `bun install -g vellum` upgrade (cherry-pick the branch), then
+`systemctl --user restart vellum-<name>.service`.
+
+### 8. Optional: RichardAtCT/claude-code-openai-wrapper with Vellum tools over MCP
+
+Alternative backend (Python/FastAPI, `claude-agent-sdk`), useful to compare behaviour.
+Fork with two patches: `anatolix/claude-code-openai-wrapper` (`MCP_SERVERS_FILE`,
+`MCP_MAX_TURNS`, `X-Vellum-Trust` → `VELLUM_MCP_TRUST` in the stdio server env).
+
+```bash
+git clone git@github.com:anatolix/claude-code-openai-wrapper.git ~/richard-shim
+conda create -n richard python=3.12 -y && conda activate richard && pip install -e ~/richard-shim   # or poetry
+cp {baseDir}/scripts/richard-mcp_servers.example.json ~/richard-shim/mcp_servers.json   # fix paths
+cp ~/richard-shim/run.example.sh ~/richard-shim/run.sh                                 # fix paths
+echo 'MCP_SERVERS_FILE=/home/<user>/richard-shim/mcp_servers.json' >> ~/richard-shim/.env
+# systemd user unit: ExecStart=/home/<user>/richard-shim/run.sh, port 8000
+assistant inference providers create richard --provider openai-compatible --auth none \
+  --base-url http://127.0.0.1:8000/v1 --model claude-opus-4-1 --model claude-sonnet-4-5
+```
+
+`vellum-mcp.ts` (in `{baseDir}/scripts/`, lives at `~/claude-shim/vellum-mcp.ts`; needs
+`@modelcontextprotocol/sdk` — resolved from Vellum's global node_modules, no extra
+install) env:
+
+| var | meaning |
+|---|---|
+| `VELLUM_WORKSPACE_DIR`, `VELLUM_DATA_DIR`, `VELLUM_CLOUD=local` | as for the `assistant` CLI |
+| `VELLUM_MCP_INCLUDE` / `VELLUM_MCP_EXCLUDE` | comma lists; default exclude = UI-only tools. Richard config also excludes bash/write/host/skill_execute |
+| `VELLUM_MCP_TRUST` | `unknown` (default: approval-gated tools denied) or `guardian` (**no approval prompts at all** — only via the trust header, never hard-coded) |
+| `VELLUM_MCP_TOOL_TIMEOUT_SEC` | per-process override of `timeouts.toolExecutionTimeoutSec` (config.json untouched). 300 in our config — agentic `recall` on a slow background model takes 17–120 s+ |
+
+Test the bridge alone: `bun run {baseDir}/scripts/mcp-time.ts` (times one `recall` call
+through the MCP client). Test end-to-end: `curl :8000/v1/chat/completions -H 'Authorization: Bearer x'
+-H 'X-Vellum-Trust: guardian' …` — journal shows `MCP servers attached: ['vellum'] trust=guardian`.
+Without the header recall answers «only available to the guardian». `Authorization` header
+is required by the wrapper even with `--auth none` on the Vellum side (Vellum always sends one).
+
+Observed: Richard's per-request process spawn (no session continuation) is noticeably
+slower than the per-chat shim; kept alive for comparison only.
+
 ## Verification
 
 Three curl tests against the shim (`{baseDir}/scripts/test-shim.sh` runs all three):
@@ -217,6 +317,17 @@ Three curl tests against the shim (`{baseDir}/scripts/test-shim.sh` runs all thr
 
 End-to-end: open a **new** Vellum chat on profile *Claude Code (Opus)*, ask for
 `uname -a` — bash must run.
+
+Session/cache check: send 3–4 turns in one chat, then
+`journalctl --user -u claude-shim -n 30 | grep -E 'served|usage'` — request #2+ must show
+`cache_read` close to the full prompt and `[sess] … live blocks=1`. `curl :8317/chats` lists
+the chat with `served` growing and one `session` id. Short synthetic tests show
+`cache_read=0` — below Anthropic's cache minimum; measure on a real chat with the Vellum
+system prompt.
+
+Park/resume check: `SHIM_IDLE_TTL_SEC=20 bun run server.js` on a side port, tell the model a
+secret word, wait 30 s (`[sess] … park (idle)`), ask for the word — `resume` in the log and
+the word comes back.
 
 ## Gotchas
 
@@ -236,6 +347,15 @@ End-to-end: open a **new** Vellum chat on profile *Claude Code (Opus)*, ask for
   tools would let the model touch the filesystem outside Vellum's trust rules.
 - Bun `idleTimeout` default (10 s) → Vellum shows "Could not connect to the AI provider".
 - Rollback: `cp server.js.bak-pre-tools server.js && systemctl --user restart claude-shim`.
+- `prompt_cache_key` missing in `[req]` log (`key=-`) → the Vellum patch (step 7) is not
+  applied or the daemon was not restarted; everything runs keyless/ephemeral.
+- Every `[sess]` line says `spawn blocks=N` with N = whole history → the block hashes do not
+  match what was fed before (e.g. Vellum rewrote earlier messages). Expected only after
+  compaction (one summary block) or a failed resume.
+- `sessions/` grows one JSON per parked chat; harmless, delete old ones by mtime if you care.
+- Anthropic subscription *session limits* («You've hit your session limit · resets …») hit
+  all chats at once; the shim just relays the error text. Parallel resolve-style batch jobs
+  burn through it fast — 4 threads, not 16.
 
 See `{baseDir}/references/failure-modes.md` for more.
 

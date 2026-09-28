@@ -50,3 +50,19 @@ Expected — the redirect goes to a loopback listener. Copy the full redirect UR
 ## Chat shows raw `<invoke name="bash"><parameter …>` blocks, several in a row
 **Cause:** on a long history (80+ msgs) Opus drifts from the TOOL_CALL contract back to Anthropic-native `<invoke>` XML, and writes several calls blind, without waiting for results. Log: `[req]` with no matching `[res]`.
 **Fix (Sep 26):** `parseInvoke()` fallback converts the FIRST `<invoke>` into a real tool_call (typed params coerced via the tool schema), drops the rest; contract forbids `<invoke>` XML. Log: `[warn] model used <invoke> XML instead of TOOL_CALL; took 1 of N`.
+
+## `[req] … key=-` on every request; `/chats` empty; all work goes through ephemeral processes
+**Cause:** Vellum did not send `prompt_cache_key` — local patch 239cd4af not applied after an upgrade, or daemon not restarted.
+**Fix:** re-apply `local-patches`, `systemctl --user restart vellum-<name>.service`.
+
+## `[sess] … spawn blocks=<whole history>` on a chat that was live a minute ago
+**Cause:** resume failed (session file lost, `~/.claude/projects` cleaned, CLI upgraded) or Vellum rewrote earlier messages so no hash prefix matched.
+**Fix:** nothing — the fresh process gets the full history and continues; only the cache hit for that one request is lost. If it repeats every request, look for `[sess] … resume failed: …` in the log.
+
+## `recall` via MCP → «Tool execution timed out after 120s»
+**Cause:** Vellum's default tool timeout; recall on a slow background model takes longer.
+**Fix:** `VELLUM_MCP_TOOL_TIMEOUT_SEC=300` in the MCP server env (Richard: `mcp_servers.json`). Log line at start shows `toolTimeout=300s`.
+
+## Richard wrapper: `401 Missing API key`
+**Cause:** your curl has no `Authorization` header. Vellum always sends `Bearer …` even with `--auth none`, so real profiles are fine.
+**Fix:** add `-H 'Authorization: Bearer x'` to the test.
