@@ -75,7 +75,7 @@ Script mode = no LLM on healthy runs, cost ≈ 0 at 96 runs/day. Create with the
 
 Set the schedule's inference profile to a cheap tool-capable model (reference: kimi-k3-medium) — it only matters for the alert conversation.
 
-Thresholds: load1 > 2×nproc, MemAvailable < 1024 MB, CPU busy > 90 %. On breach it snapshots uptime/free/top/ps/df/vmstat, opens a new conversation (`assistant conversations new` + `wake --external-content`), and that conversation names the culprits and sends a short Russian ⚠️ summary to Telegram. OK runs just print one line to the schedule log.
+Thresholds: load1 > 2×nproc, MemAvailable < 1024 MB, CPU busy **excluding nice** > 90 % (two /proc/stat samples 2 s apart; nice-only load like a reniced TEI saturating idle cores is normal and must NOT alert — the alert line reports both numbers). Gotcha: /proc/stat has 10 numeric fields — `read` needs a trailing catch-all var or arithmetic breaks. On breach it snapshots uptime/free/top/ps/df/vmstat, opens a new conversation (`assistant conversations new` + `wake --external-content`), and that conversation names the culprits and sends a short Russian ⚠️ summary to Telegram. OK runs just print one line to the schedule log.
 
 Verify: `assistant schedules get <id>` → Last status ok; test the alert path once by temporarily lowering a threshold.
 
