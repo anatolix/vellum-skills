@@ -72,3 +72,19 @@ The 1309 `te_request_failure` dropped requests were a **symptom, not the cause**
 ## Patch Applied
 
 `persistence/job-utils.ts`: `classifyError` now returns "retryable" for `database is locked`, `SQLITE_BUSY`, `SQLITE_IOERR`. Backup: `job-utils.ts.bak-sep26`. Must be re-applied after every Vellum upgrade.
+
+
+## Root Cause C: Skill Index Exceeds `--max-client-batch-size` (found Sep 30, 2026)
+
+Symptoms, all at daemon boot and nowhere else:
+
+- TEI journal: `batch size 177 > maximum allowed batch size 64` (a few per boot, then silence).
+- Daemon log: `[memory-v2-skill-store] Embedding backend unavailable — seeding skill cache without dense Qdrant vectors` — a WARN, easy to miss.
+- `plugin hook 'user-prompt-submit' (default-memory) timed out after 30000ms` on the first turns after a restart, then fine.
+- Qdrant `memory_v2_concept_pages` has zero points with `payload.kind == "skill"` (check with a `points/count` filter). Skills are matched by BM25 only; the needle lane never sees them.
+
+Cause: `plugins/defaults/memory/substrate/skill-store.ts` embeds all skill seeds in a single `embedWithBackend(config, seeds.map(s => s.content))` call, and the OpenAI-compatible backend (`persistence/embeddings/embedding-openai.ts`) passes the array straight through — only the Gemini backend chunks (`GEMINI_EMBED_BATCH_SIZE = 100`). Seeds = workspace skills + catalog skills, so the count grows with the catalog and can exceed any fixed limit.
+
+Fix here: `--max-client-batch-size 256` in `tei.service`, `systemctl daemon-reload && systemctl restart tei`, then restart the daemon so `rebuildBm25CorpusStatsAndReseedSkills` runs again (it fires a few minutes after boot). Verify: the TEI journal stays clean, and the `kind: skill` count in Qdrant equals the number of seeds.
+
+Upstream-proper fix (not done): chunk inputs in `embedding-openai.ts` for `provider: custom` the way Gemini does. This was not introduced by 0.12.6 — it had been failing on every boot since TEI went live; the upgrade just made the log visible.

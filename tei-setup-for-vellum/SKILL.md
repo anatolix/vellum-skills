@@ -97,7 +97,7 @@ Critical gotchas baked in:
 - **MKL_ENABLE_INSTRUCTIONS=AVX2** — AVX512_E4 segfaults this stack even when the CPU supports AVX512f.
 - **RAYON_NUM_THREADS does NOT cap CPU.** MKL spawns its own OpenMP threads — set **OMP_NUM_THREADS and MKL_NUM_THREADS** too, or TEI eats 324% CPU while RAYON sits at 2.
 - **--max-batch-tokens 2048** — without it, TEI's warmup allocates a ~10.8 GB attention arena sized by max_batch_tokens. With it, RSS stays ~2.4 GB.
-- **--max-client-batch-size 64** — Vellum's concept-page reembed sends batches of 50 > TEI's default 32 and fails without this.
+- **--max-client-batch-size 256** — Vellum sends whole collections in ONE `/v1/embeddings` call and never chunks for custom endpoints: concept-page reembed ~50 items, and the boot-time skill index (`memory/substrate/skill-store.ts`, `seeds.map(s => s.content)`) = every workspace skill + the catalog, **177 on a 77-skill workspace**. TEI's default is 32. At 64 the skill seed got HTTP 413 on every daemon boot, logged only as `[memory-v2-skill-store] Embedding backend unavailable — seeding skill cache without dense Qdrant vectors`, and skills silently lived on BM25 alone (0 `kind: skill` points in `memory_v2_concept_pages`). Side effect: while TEI rejects those requests right after boot, the `user-prompt-submit` memory hook hits its 30 s timeout on the first few turns. 256 is safe — `--max-batch-tokens 2048` still splits the work internally; a 177-item request takes ~2 s on 4 vCPU. Size it to (skills + catalog) × 1.5.
 
 ```bash
 sudo mkdir -p /var/lib/tei/data
@@ -113,7 +113,7 @@ User=vellum
 ExecStart=/opt/tei-rootfs/usr/local/bin/text-embeddings-router \
   --model-id /var/lib/tei/models/bge-m3-int8 \
   --port 8081 --hostname 127.0.0.1 --json-output \
-  --max-client-batch-size 64 --max-batch-tokens 2048
+  --max-client-batch-size 256 --max-batch-tokens 2048
 Environment=HUGGINGFACE_HUB_CACHE=/var/lib/tei/data
 Environment=LD_LIBRARY_PATH=/opt/tei-libs
 Environment=MKL_ENABLE_INSTRUCTIONS=AVX2
