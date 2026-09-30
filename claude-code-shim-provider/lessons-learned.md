@@ -34,3 +34,8 @@ A python `s.replace(old,new,1)` that silently matched zero times left `Chat.run`
 keyed chats 500. `bun build` does NOT catch undefined vars. After any scripted edit: grep
 every intended anchor, and smoke-test BOTH the ephemeral and the keyed-chat path before
 restart.
+
+## 25. TOOL_CALL parsing must be multi-line and string-aware (Sep 30)
+
+The original parser matched `TOOL_CALL: {...}` per line (`/\{.*\}\s*$/`). Fable wrote a bash heredoc into `"command"` with *literal* newlines inside the JSON string — invalid JSON, spanning many lines — and the regex never matched, so the whole call went to the user as text. Fix: find `TOOL_CALL:`, scan a balanced `{...}` with a quote/escape-aware brace counter (newlines inside strings do not terminate it), then `JSON.parse`; on failure escape raw `\n \r \t` inside string literals and retry. Also handles pretty-printed JSON, code-fence wrapping, and several calls in a row. Everything after the last parsed call is discarded, `<tool_result` fabrication guard applies to the text before the first call.
+

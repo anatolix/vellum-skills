@@ -422,38 +422,83 @@ function parseInvoke(text, tools) {
   return { calls: [{ name: m[1], arguments: args }], restText: before.trim() };
 }
 
+// Scan a balanced JSON object starting at `text[start]` ('{'). String-aware,
+// so braces inside strings do not count, and raw newlines inside strings
+// (the model sometimes writes multi-line shell into a JSON string verbatim)
+// do not end the scan. Returns end index (exclusive) or -1.
+function scanJsonObject(text, start) {
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}") { depth--; if (depth === 0) return i + 1; }
+  }
+  return -1;
+}
+
+// JSON.parse with a fallback that escapes raw control characters found inside
+// string literals (invalid JSON, but exactly what a model emits when it pastes
+// a heredoc into "command": "...").
+function parseLooseJson(src) {
+  try { return JSON.parse(src); } catch (e0) {
+    let out = "", inStr = false, esc = false;
+    for (const ch of src) {
+      if (inStr) {
+        if (esc) { esc = false; out += ch; continue; }
+        if (ch === "\\") { esc = true; out += ch; continue; }
+        if (ch === '"') { inStr = false; out += ch; continue; }
+        if (ch === "\n") { out += "\\n"; continue; }
+        if (ch === "\r") { out += "\\r"; continue; }
+        if (ch === "\t") { out += "\\t"; continue; }
+        out += ch; continue;
+      }
+      if (ch === '"') inStr = true;
+      out += ch;
+    }
+    const obj = JSON.parse(out);
+    console.log("[warn] TOOL_CALL JSON had raw control chars in strings; repaired");
+    return obj;
+  }
+}
+
 function parseToolCalls(text, tools = []) {
   const inv = parseInvoke(text, tools);
   if (inv) return inv;
   const calls = [];
-  const rest = [];
-  let sawCall = false;
-  let fabricated = false;
-  for (const raw of text.split("\n")) {
-    const line = raw.trim().replace(/^`+|`+$/g, "");
-    const m = line.match(TOOL_CALL_RE); // not anchored at start: tolerates junk before prefix
-    if (m) {
-      try {
-        const obj = JSON.parse(m[1]);
-        if (obj && typeof obj.name === "string") {
-          calls.push({ name: obj.name, arguments: obj.arguments ?? {} });
-          sawCall = true;
-          continue;
-        }
-      } catch (e) {
-        console.log("[warn] unparsable TOOL_CALL line:", String(e.message).slice(0, 80), "|", line.slice(0, 160));
-      }
-    }
-    if (/<tool_result\b/.test(line)) {
-      fabricated = true;
-      console.log("[warn] model fabricated <tool_result>; output truncated");
+  let restText = null;
+  let pos = 0;
+  while (true) {
+    const at = text.indexOf("TOOL_CALL:", pos);
+    if (at < 0) break;
+    const brace = text.indexOf("{", at);
+    if (brace < 0) break;
+    const endIdx = scanJsonObject(text, brace);
+    if (endIdx < 0) {
+      console.log("[warn] unterminated TOOL_CALL JSON |", text.slice(at, at + 160).replace(/\n/g, "\\n"));
       break;
     }
-    if (sawCall) continue; // everything after the first call is discarded
-    if (line === "```") continue;
-    rest.push(raw);
+    if (restText === null) restText = text.slice(0, at);
+    try {
+      const obj = parseLooseJson(text.slice(brace, endIdx));
+      if (obj && typeof obj.name === "string") calls.push({ name: obj.name, arguments: obj.arguments ?? {} });
+      else console.log("[warn] TOOL_CALL without name |", text.slice(brace, brace + 120).replace(/\n/g, "\\n"));
+    } catch (e) {
+      console.log("[warn] unparsable TOOL_CALL:", String(e.message).slice(0, 80), "|", text.slice(brace, brace + 160).replace(/\n/g, "\\n"));
+    }
+    pos = endIdx; // anything between calls (or after the last) is discarded
   }
-  let restText = rest.join("\n").trim();
+  if (restText === null) restText = text;
+  let fabricated = false;
+  const fab = restText.search(/<tool_result\b/);
+  if (fab >= 0) { fabricated = true; restText = restText.slice(0, fab); console.log("[warn] model fabricated <tool_result>; output truncated"); }
+  restText = restText.split("\n").filter((l) => l.trim() !== "```").join("\n").trim();
   if (fabricated && !calls.length && !restText) {
     restText = "[shim] Ответ модели отброшен: она написала <tool_result> сама вместо вызова инструмента. Повтори запрос.";
   }
@@ -499,6 +544,8 @@ Bun.serve({
         data: [
           { id: "claude-opus", object: "model", created: 0, owned_by: "claude-code" },
           { id: "claude-sonnet", object: "model", created: 0, owned_by: "claude-code" },
+          { id: "claude-fable", object: "model", created: 0, owned_by: "claude-code" },
+          { id: "claude-haiku", object: "model", created: 0, owned_by: "claude-code" },
         ],
       });
     }
