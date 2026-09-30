@@ -104,3 +104,14 @@ on every stream_event resets a `BATCH_IDLE_MS` (5000, env `SHIM_BATCH_IDLE_MS`) 
 fires after 5 s of silence. `message_stop` with collected ≥ expected remains the primary close.
 Side finding: a `recall` in that batch hit the 120 s tool timeout because `memory-retrospective`
 had TEI at 375 % CPU with a 186-deep queue — not a shim problem; batching just makes it visible.
+
+## 32. Only the owning chat may resolve a parked handler — the compactor steals results (Sep 30, 16:00)
+Vellum's in-place compaction ("Compacting in place before provider call") re-sends the WHOLE
+history to the same profile WITHOUT `prompt_cache_key`, including the fresh `role: tool` result
+of the handler that is currently parked. `resolveToolResults` matched it by id, un-parked the live
+run into a response nobody was waiting for, and the real follow-up (compacted history, msgs 197→43,
+`tail=1`) was fed to the busy CLI as a new prompt → hang, 3 daemon retries × 4 min, then
+"OpenAI-compatible request failed: The operation timed out" in the chat. Fix: handler entries
+carry `chatKey`; `resolveToolResults(messages, reqKey)` returns 0 when the request has no key and
+skips entries whose chatKey differs (`[mcp] <id> belongs to another chat, ignoring result`).
+The key-less compactor request runs as a plain oneshot, as it should.

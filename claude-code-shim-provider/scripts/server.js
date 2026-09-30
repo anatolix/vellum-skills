@@ -446,7 +446,7 @@ async function buildMcp(tools, chatKey) {
     const name = t.function.name;
     return tool(name, t.function.description || name, shapes.get(name), async (args, extra) => {
       const id = extra?._meta?.["claudecode/toolUseId"] || `${name}#${++provisionalSeq}`;
-      return waitForVellum(name, id, args, extra?.signal);
+      return waitForVellum(name, id, args, extra?.signal, chatKey);
     });
   }) });
     if (process.env.SHIM_DEBUG_MCP) (async () => { try { const h = srv.instance?.server?._requestHandlers?.get("tools/list"); const r = await h({ method: "tools/list", params: {} }, { signal: new AbortController().signal }); console.log(`[mcp] debug in-process tools/list=${r.tools.length}`); } catch (e) { console.log(`[mcp] debug tools/list THROW ${e.message}`); } })();
@@ -473,11 +473,11 @@ function rekeyPending(tu, chatKey) {
 // results for handlers that have not fired yet wait here, keyed by tool_use id.
 const earlyResults = new Map();
 const emittedToolIds = new Set(); // tool_use ids this process forwarded to Vellum
-function waitForVellum(name, id, args, signal) {
+function waitForVellum(name, id, args, signal, chatKey) {
   const early = earlyResults.get(id);
   if (early) { earlyResults.delete(id); console.log(`[mcp] ${id} (${name}) served from early result`); return Promise.resolve(early); }
   return new Promise((resolve, reject) => {
-    const entry = { name, args, resolve, reject, timer: null, at: Date.now() };
+    const entry = { name, args, resolve, reject, timer: null, at: Date.now(), chatKey: chatKey || null };
     entry.timer = setTimeout(() => {
       pendingToolUses.delete(id);
       console.log(`[mcp] tool_use ${id} (${name}) timed out after ${TOOL_WAIT_MS / 1000}s waiting for Vellum`);
@@ -495,15 +495,20 @@ function waitForVellum(name, id, args, signal) {
 // Vellum echoes our ids back in `tool_call_id`. Match by id first; if the id
 // is unknown (session parked/resumed in between), fall back to the oldest
 // pending call with the same tool name.
-function resolveToolResults(messages) {
+// Only the request from the SAME chat (prompt_cache_key) may resolve a parked handler.
+// The daemon's compactor re-sends the whole history WITHOUT a key; letting it resolve
+// handlers un-parked the live run into nobody's response and hung the chat (Sep 30 16:00).
+function resolveToolResults(messages, reqKey) {
   let n = 0;
+  if (!reqKey) return 0;
   for (const m of messages || []) {
     if (m.role !== "tool") continue;
     const text = contentToText(m.content);
     let id = m.tool_call_id;
     let entry = id ? pendingToolUses.get(id) : null;
+    if (entry && entry.chatKey && entry.chatKey !== reqKey) { console.log(`[mcp] ${id} belongs to another chat, ignoring result from key=${reqKey.slice(0, 12)}`); continue; }
     if (!entry && m.name) {
-      for (const [k, v] of pendingToolUses) if (v.name === m.name) { id = k; entry = v; break; }
+      for (const [k, v] of pendingToolUses) if (v.name === m.name && (!v.chatKey || v.chatKey === reqKey)) { id = k; entry = v; break; }
     }
     const isError = /^\s*(error|\[error\]|denied|tool call (was )?(denied|rejected))/i.test(text);
     const result = { content: [{ type: "text", text: text || "(empty result)" }], ...(isError ? { isError: true } : {}) };
@@ -846,7 +851,7 @@ Bun.serve({
     const sdkModel = model.replace(/^claude-/, ""); // opus | sonnet | haiku
     if (process.env.SHIM_DUMP_TOOLS && hasTools) { try { writeFileSync(process.env.SHIM_DUMP_TOOLS, JSON.stringify(tools)); } catch {} }
     const mcp = TOOL_MODE === "mcp" && hasTools ? await buildMcp(tools, body.prompt_cache_key) : null;
-    const resolved = TOOL_MODE === "mcp" ? resolveToolResults(body.messages || []) : 0;
+    const resolved = TOOL_MODE === "mcp" ? resolveToolResults(body.messages || [], typeof body.prompt_cache_key === "string" && body.prompt_cache_key ? body.prompt_cache_key : null) : 0;
     if (resolved) console.log(`[mcp] resolved ${resolved} pending tool result(s)`);
     const blocks = messagesToBlocks(body.messages || [], tools);
     const cacheKey = typeof body.prompt_cache_key === "string" && body.prompt_cache_key ? body.prompt_cache_key : null;
