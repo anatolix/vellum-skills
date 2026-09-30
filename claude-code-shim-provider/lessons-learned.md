@@ -52,3 +52,35 @@ read `"name"`, then slice argument values between top-level `"<key>":` markers t
 schema (first key = first occurrence, later keys = last occurrence), decode each value leniently.
 Also added to TOOL_INSTRUCTIONS: commands needing heavy quoting go through `file_write` + one-line `bash`.
 Test harness: `scratch/shim-salvage-test.mjs` (4 cases, incl. healthy heredoc regression).
+
+## 27. Native tool_use via an in-process MCP server — Vellum still executes (Sep 30)
+The text contract was always a workaround. The Agent SDK accepts `mcpServers` built with
+`createSdkMcpServer`, so the request's OpenAI `tools` become MCP tools the model calls
+natively; the escaping problem (lessons 25–26) disappears because the API owns it. The
+handler does NOT execute anything: it parks on a promise, the request layer returns
+`tool_calls` to Vellum and ends the HTTP response, Vellum runs the tool with its own
+approvals/trust, and the next request's `role: tool` resolves the handler. Spikes that made
+it viable: a handler may hang 4+ min without the CLI complaining; abort+resume with an
+open tool_use recovers; `q.setMcpServers` swaps tools on a live session. One thing that
+does NOT work: sharing one server instance between two CLI processes — the second gets no
+tools, no error. `make()` per spawn.
+
+## 28. `init tools=0` with `vellum:connected` — one unconvertible schema empties the whole tool list (Sep 30)
+Simple test schemas registered fine; Vellum's real 19–20 tools gave `init tools=0` while
+the MCP server reported connected. The model, seeing tool talk in the history, wrote tool
+JSON as text. Cause: `type: object` without properties (`ui_show.data`, `skill_execute.input`)
+became `z.record(...)`; the SDK converts zod→JSON-schema with its own bundled zod core, and
+the external zod 4.6.5 record processor throws `ctx.deferred.push` there, failing
+`tools/list` for every tool. Fix: `z.looseObject` + `shapeFor()` validating each shape through
+a throwaway server's `tools/list`, per-tool fallback to an open object. Debugging trap that
+cost an hour: probe scripts in `/tmp` resolved zod from bun's cache and passed. Run probes
+from `~/claude-shim`.
+
+## 29. Parallel tool calls split into N round trips (Sep 30)
+Batch collection waited 50 ms after the first `tool_use`, but the CLI emits one
+`assistant` message per content block ~140 ms apart, so siblings were missed. Worse, the
+CLI runs MCP handlers strictly sequentially: handler 2 fires only after handler 1
+resolves, so even a correctly collected batch would deadlock on the second result. Fix:
+close the batch on `message_stop`; key handlers by `extra._meta["claudecode/toolUseId"]`;
+stash results whose handler hasn't fired in `earlyResults` and serve them when it does.
+Verified: two tools → one `tool_calls` chunk → one follow-up → "served from early result".

@@ -5,10 +5,13 @@
 // The model emits `TOOL_CALL: {"name": ..., "arguments": {...}}` lines; we parse them
 // and return real OpenAI `tool_calls` deltas. Tool execution stays on the Vellum side.
 // Claude Code's own SDK tools (Bash/Read/...) remain disabled on purpose.
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { createSdkMcpServer, tool, query } from "@anthropic-ai/claude-agent-sdk";
 import { mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 
+import { z } from "zod";
+const TOOL_MODE = process.env.SHIM_TOOL_MODE || "mcp"; // mcp | text
+const TOOL_WAIT_MS = Number(process.env.SHIM_TOOL_WAIT_SEC || 3600) * 1000; // how long a tool_use may wait for Vellum's result (approvals)
 const PORT = Number(process.env.SHIM_PORT || 8317);
 
 const MAX_LIVE = Number(process.env.SHIM_MAX_LIVE || process.env.SHIM_POOL_SIZE || 8);
@@ -34,8 +37,10 @@ const short = (k) => (k ? k.slice(0, 12) : "-");
 // ---------------------------------------------------------------------------
 let cliSeq = 0;
 class Cli {
-  constructor(label, model, resume = null, systemPrompt = null, effort = null) {
+  constructor(label, model, resume = null, systemPrompt = null, effort = null, mcp = null) {
     this.id = ++cliSeq;
+    this.toolNames = mcp?.names ?? [];
+    this.toolSig = mcp?.sig ?? null;
     this.label = label;
     this.model = model;
     this.sessionId = resume;
@@ -54,7 +59,7 @@ class Cli {
         ...(systemPrompt ? { systemPrompt: { type: "custom", prompt: systemPrompt, snapshot: false } } : {}),
         env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN },
         tools: [],
-        allowedTools: [],
+        ...(mcp ? { mcpServers: { vellum: mcp.make() }, allowedTools: mcp.names.map((n) => `mcp__vellum__${n}`) } : { allowedTools: [] }),
         permissionMode: "bypassPermissions",
         settingSources: [],
         includePartialMessages: true,
@@ -84,7 +89,16 @@ class Cli {
   async pump() {
     try {
       for await (const msg of this.q) {
-        if (msg.type === "system" && msg.subtype === "init") this.sessionId = msg.session_id;
+        if (TOOL_MODE === "mcp" && msg.type === "assistant" && (msg.message?.content || []).some((b) => b.type === "tool_use")) {
+          // Always remember tool_use batches until an observer has seen them.
+          (this.unobserved ||= []).push(msg);
+        }
+        if (msg.type === "system" && msg.subtype === "init") {
+          this.sessionId = msg.session_id;
+          const mcpTools = (msg.tools || []).filter((t) => String(t).startsWith("mcp__"));
+          const servers = (msg.mcp_servers || []).map((x) => `${x.name}:${x.status}`).join(",");
+          console.log(`[cli${this.id} ${this.label}] init tools=${mcpTools.length} mcp=[${servers}] expected=${this.toolNames.length}`);
+        }
         if (msg.type === "result" && msg.session_id) this.sessionId = msg.session_id;
         if (this.onMsg) this.onMsg(msg);
         if (msg.type === "result" && this.done) {
@@ -110,6 +124,22 @@ class Cli {
 
   close() { this.die(null); }
 
+  // Re-attach an observer to a send that is still in flight (mcp mode: the turn
+  // that emitted tool_use is still running while Vellum executed the tools).
+  attach(onMsg) {
+    return new Promise((resolve, reject) => {
+      if (!this.alive) return reject(new Error("cli closed"));
+      if (!this.done) return reject(new Error("no run in flight"));
+      const prev = this.done;
+      this.done = { resolve: (r) => { prev.resolve(r); resolve(r); }, reject: (e) => { prev.reject(e); reject(e); } };
+      this.onMsg = onMsg;
+      // tool_use batches that arrived while no request was attached
+      const replay = this.unobserved || []; this.unobserved = [];
+      for (const m of replay) onMsg(m);
+    });
+  }
+  markObserved() { this.unobserved = []; }
+
   send(content, onMsg) {
     return new Promise((resolve, reject) => {
       if (!this.alive) return reject(new Error("cli closed"));
@@ -123,7 +153,18 @@ class Cli {
   async setModel(m) {
     if (m !== this.model) { await this.q.setModel(m); this.model = m; }
   }
+
+  // Swap the Vellum tool set on a live session (skills load/unload between turns).
+  async setTools(mcp) {
+    const names = mcp?.names ?? [];
+    if ((mcp?.sig ?? null) === (this.toolSig ?? null)) return;
+    this.toolSig = mcp?.sig ?? null;
+    const r = await this.q.setMcpServers(mcp ? { vellum: mcp.make() } : {});
+    this.toolNames = names;
+    console.log(`[cli${this.id} ${this.label}] tools swapped -> ${names.length} (${JSON.stringify(r).slice(0, 80)})`);
+  }
 }
+function sameList(a, b) { return a.length === b.length && a.every((x, i) => x === b[i]); }
 
 class Chat {
   constructor(key, saved = null) {
@@ -155,13 +196,16 @@ class Chat {
   }
 
   // Requests for one chat are serialised; Vellum sends full history each time.
-  async run(model, blocks, onMsg, effort = null) {
+  async run(model, blocks, onMsg, effort = null, mcp = null) {
     const prev = this.lock;
     let release; this.lock = new Promise((r) => (release = r));
     await prev;
     this.busy = true;
-    try { return await this._run(model, blocks, onMsg, effort); }
-    finally { this.busy = false; this.lastUsed = Date.now(); release(); manager.kick(); }
+    let released = false;
+    const rel = () => { if (released) return; released = true; this.busy = false; this.lastUsed = Date.now(); release(); manager.kick(); };
+    this.releaseForTools = rel; // mcp mode: request layer releases once tool_calls are sent, so the follow-up can enter
+    try { return await this._run(model, blocks, onMsg, effort, mcp); }
+    finally { rel(); }
   }
 
   // No resets. The CLI transcript is the source of truth; Vellum's history is
@@ -170,7 +214,7 @@ class Chat {
   // the head) therefore sends just the summary; a retried identical history
   // re-sends the last user block. A fresh process is spawned only when there is
   // no live one, with `resume` when a session id exists.
-  async _run(model, blocks, onMsg, effort = null) {
+  async _run(model, blocks, onMsg, effort = null, mcp = null) {
     const inputs = inputBlocks(blocks);
     const hashes = inputs.map((b) => sha(b.text));
     const sys = systemText(blocks);
@@ -179,6 +223,19 @@ class Chat {
     if (this.live && (effort ?? null) !== (this.effort ?? null)) this.park("effort changed");
     const seen = new Set(this.sent);
     let unseen = inputs.filter((_, i) => !seen.has(hashes[i]));
+    // mcp mode: the tool results were handed to the CLI natively (resolveToolResults);
+    // mark them seen and, if nothing else is new while a run is in flight, attach to that run.
+    if (TOOL_MODE === "mcp") {
+      unseen = unseen.filter((b) => b.role !== "tool" || !b.consumed);
+      for (const h of hashes) if (!seen.has(h)) seen.add(h);
+      if (!unseen.length && this.cli?.done) {
+        console.log(`[sess] ${short(this.key)} continuing in-flight run (tool results delivered)`);
+        const res = await this.cli.attach(onMsg);
+        this.sent = [...seen]; this.sessionId = res.session_id || this.cli.sessionId; this.served++; this.lastUsed = Date.now(); this.save();
+        console.log(`[sess] ${short(this.key)} served #${this.served} model=${model} (continued) in=${res.usage?.input_tokens ?? "?"} cache_read=${res.usage?.cache_read_input_tokens ?? "?"} session=${this.sessionId}`);
+        return res;
+      }
+    }
     let why = !this.sent.length ? "new" : unseen.length ? `tail=${unseen.length}` : "repeat";
     if (!unseen.length) unseen = inputs.slice(-1);
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -186,16 +243,18 @@ class Chat {
       const t0 = Date.now();
       try {
         if (!this.live) {
-          this.cli = await manager.spawn(short(this.key), model, this.sessionId, sys, effort);
+          this.cli = await manager.spawn(short(this.key), model, this.sessionId, sys, effort, mcp);
           why += this.sessionId ? " resume" : " spawn";
           this.sysHash = sysHash;
         }
         await this.cli.setModel(model);
+        if (TOOL_MODE === "mcp") await this.cli.setTools(mcp);
         const prompt = unseen.map((b) => b.text).concat(["Assistant:"]).join("\n\n");
         console.log(`[sess] ${short(this.key)} cli${this.cli.id} ${why} blocks=${inputs.length} seen=${this.sent.length}`);
         const tPrep = Date.now() - t0;
-        const res = await this.cli.send(prompt, (m) => { produced = true; onMsg(m); });
         for (const h of hashes) seen.add(h);
+        if (TOOL_MODE === "mcp") { this.sent = [...seen]; this.save(); }
+        const res = await this.cli.send(prompt, (m) => { produced = true; onMsg(m); });
         this.sent = [...seen]; this.sessionId = res.session_id || this.cli.sessionId; this.model = model; this.effort = effort ?? null; this.served++; this.lastUsed = Date.now();
         this.save();
         if (res.subtype && res.subtype !== "success") console.log(`[sess] ${short(this.key)} result subtype=${res.subtype} ${String(res.result || "").slice(0, 120)}`);
@@ -235,14 +294,14 @@ const manager = {
     return c;
   },
   // Wait for a free slot (parking the LRU idle chat if needed), then spawn.
-  async spawn(label, model, resume, systemPrompt = null, effort = null) {
+  async spawn(label, model, resume, systemPrompt = null, effort = null, mcp = null) {
     while (this.liveCount() >= MAX_LIVE) {
       const idle = [...this.chats.values()].filter((c) => c.live && !c.busy).sort((a, b) => a.lastUsed - b.lastUsed);
       if (idle.length) { idle[0].park("evict"); continue; }
       await new Promise((r) => this.waiters.push(r));
     }
     this.reserved++;
-    try { return new Cli(label, model, resume, systemPrompt, effort); } finally { this.reserved--; }
+    try { return new Cli(label, model, resume, systemPrompt, effort, mcp); } finally { this.reserved--; }
   },
   kick() { const w = this.waiters.splice(0); for (const r of w) r(); },
   reap() {
@@ -253,11 +312,11 @@ const manager = {
     }
   },
   oneshotWaiters: [],
-  async runEphemeral(model, blocks, onMsg, tag = "nokey", attempts = 3, effort = null) {
+  async runEphemeral(model, blocks, onMsg, tag = "nokey", attempts = 3, effort = null, mcp = null) {
     while (MAX_ONESHOT > 0 && this.ephemeral.size >= MAX_ONESHOT) await new Promise((r) => this.oneshotWaiters.push(r));
     let lastErr;
     for (let a = 0; a < attempts; a++) {
-      const cli = new Cli(tag, model, null, systemText(blocks), effort);
+      const cli = new Cli(tag, model, null, systemText(blocks), effort, mcp);
       this.ephemeral.add(cli);
       let produced = false;
       try {
@@ -283,10 +342,10 @@ const manager = {
   isOneShot(blocks) {
     return !blocks.some((b) => b.role === "assistant" || b.role === "tool");
   },
-  run(model, key, blocks, onMsg, effort = null) {
-    if (!key) return this.runEphemeral(model, blocks, onMsg, "nokey", 3, effort);
-    if (!this.chats.has(key) && this.isOneShot(blocks)) return this.runEphemeral(model, blocks, onMsg, `oneshot ${short(key)}`, 3, effort);
-    return this.get(key).run(model, blocks, onMsg, effort);
+  run(model, key, blocks, onMsg, effort = null, mcp = null) {
+    if (!key) return this.runEphemeral(model, blocks, onMsg, "nokey", 3, effort, mcp);
+    if (!this.chats.has(key) && this.isOneShot(blocks) && !mcp) return this.runEphemeral(model, blocks, onMsg, `oneshot ${short(key)}`, 3, effort, mcp);
+    return this.get(key).run(model, blocks, onMsg, effort, mcp);
   },
   status() {
     return {
@@ -297,6 +356,171 @@ const manager = {
 };
 setInterval(() => manager.reap(), 60_000);
 process.on("SIGTERM", () => { for (const c of manager.chats.values()) c.park("shutdown"); process.exit(0); });
+
+// ---------------------------------------------------------------------------
+// MCP tool mode. Vellum's tools are registered on the CLI as an in-process MCP
+// server, so the model emits native tool_use (the API owns JSON escaping) and
+// nothing is parsed out of prose. Handlers do NOT execute anything: the tool
+// call is forwarded to Vellum as OpenAI `tool_calls`, and the handler waits
+// until Vellum's next request carries the `role: tool` result for that id.
+// Approvals, trust rules and execution stay inside Vellum, exactly as before.
+
+// tool_use id -> { resolve, reject, timer, name, chatKey }
+const pendingToolUses = new Map();
+const consumedToolIds = new Set(); // ids whose result reached the CLI as a native tool_result
+
+function jsonSchemaToZod(schema) {
+  const t = Array.isArray(schema?.type) ? schema.type[0] : schema?.type;
+  let z_;
+  if (schema?.enum && Array.isArray(schema.enum) && schema.enum.every((v) => typeof v === "string") && schema.enum.length) {
+    z_ = z.enum(schema.enum);
+  } else if (schema?.anyOf || schema?.oneOf) {
+    const opts = (schema.anyOf || schema.oneOf).map(jsonSchemaToZod);
+    z_ = opts.length > 1 ? z.union(opts) : opts[0] ?? z.unknown();
+  } else if (t === "string") z_ = z.string();
+  else if (t === "number") z_ = z.number();
+  else if (t === "integer") z_ = z.number().int();
+  else if (t === "boolean") z_ = z.boolean();
+  else if (t === "null") z_ = z.null();
+  else if (t === "array") z_ = z.array(schema.items ? jsonSchemaToZod(schema.items) : z.unknown());
+  else if (t === "object" || schema?.properties) {
+    const props = schema.properties || {};
+    const req = new Set(schema.required || []);
+    const shape = {};
+    for (const [k, v] of Object.entries(props)) shape[k] = req.has(k) ? jsonSchemaToZod(v) : jsonSchemaToZod(v).optional();
+    z_ = z.looseObject(shape); // never z.record: the SDK's bundled json-schema converter throws on it (ctx.deferred) and the CLI ends up with 0 tools
+  } else z_ = z.unknown();
+  if (schema?.description) z_ = z_.describe(schema.description);
+  return z_;
+}
+
+// Top-level params must be a zod *shape* (raw object of fields), not a z.object.
+function paramsToShape(parameters) {
+  const props = parameters?.properties || {};
+  const req = new Set(parameters?.required || []);
+  const shape = {};
+  for (const [k, v] of Object.entries(props)) {
+    let f;
+    try { f = jsonSchemaToZod(v); } catch { f = z.unknown(); }
+    shape[k] = req.has(k) ? f : f.optional();
+  }
+  return shape;
+}
+
+// An SDK MCP server instance is bound to the CLI process it is handed to, so
+// never share one across processes: `buildMcp` returns a spec { defs, names, sig }
+// and each Cli materialises its own server via `mcp.make()`.
+const shapeCache = new Map(); // tool signature -> zod shape
+// The SDK converts zod shapes to JSON schema with its own bundled zod core; some constructs from
+// the external zod copy blow up there, and ONE bad tool empties the whole tools/list (CLI then
+// runs with 0 tools while reporting the server "connected"). Validate each shape up front.
+async function shapeConvertible(name, shape) {
+  try {
+    const srv = createSdkMcpServer({ name: "probe", tools: [tool(name, name, shape, async () => ({ content: [] }))] });
+    const h = srv.instance?.server?._requestHandlers?.get("tools/list");
+    if (!h) return true;
+    const r = await h({ method: "tools/list", params: {} }, { signal: new AbortController().signal });
+    return Array.isArray(r?.tools) && r.tools.length === 1;
+  } catch { return false; }
+}
+async function shapeFor(t) {
+  const name = t.function.name;
+  const k = sha(name + JSON.stringify(t.function.parameters || {}));
+  let shape = shapeCache.get(k);
+  if (shape) return shape;
+  try { shape = paramsToShape(t.function.parameters); } catch (e) { console.log(`[mcp] schema for ${name} fell back to open object: ${e.message}`); shape = {}; }
+  if (!(await shapeConvertible(name, shape))) { console.log(`[mcp] schema for ${name} not convertible by SDK, using open object`); shape = {}; }
+  if (shapeCache.size > 512) shapeCache.delete(shapeCache.keys().next().value);
+  shapeCache.set(k, shape);
+  return shape;
+}
+async function buildMcp(tools, chatKey) {
+  const defs = (tools || []).filter((t) => t?.type === "function" && t.function?.name);
+  if (!defs.length) return null;
+  const sig = sha(JSON.stringify(defs.map((t) => [t.function.name, t.function.description, t.function.parameters])));
+  const names = defs.map((t) => t.function.name);
+  const shapes = new Map();
+  for (const t of defs) shapes.set(t.function.name, await shapeFor(t));
+  const make = () => { const srv = createSdkMcpServer({ name: "vellum", tools: defs.map((t) => {
+    const name = t.function.name;
+    return tool(name, t.function.description || name, shapes.get(name), async (args, extra) => {
+      const id = extra?._meta?.["claudecode/toolUseId"] || `${name}#${++provisionalSeq}`;
+      return waitForVellum(name, id, args, extra?.signal);
+    });
+  }) });
+    if (process.env.SHIM_DEBUG_MCP) (async () => { try { const h = srv.instance?.server?._requestHandlers?.get("tools/list"); const r = await h({ method: "tools/list", params: {} }, { signal: new AbortController().signal }); console.log(`[mcp] debug in-process tools/list=${r.tools.length}`); } catch (e) { console.log(`[mcp] debug tools/list THROW ${e.message}`); } })();
+    return srv; };
+  return { make, names, sig };
+}
+
+// The handler parks here. The request layer observes the tool_use via the
+// assistant stream event (it carries the real tool_use id) and forwards it to
+// Vellum; the next request with a matching `role: tool` message resolves it.
+let provisionalSeq = 0;
+function rekeyPending(tu, chatKey) {
+  if (pendingToolUses.has(tu.id)) return;
+  tu = { ...tu, name: tu.name.replace(/^mcp__vellum__/, "") };
+  // oldest provisional entry with the same name and equal args
+  for (const [k, v] of pendingToolUses) {
+    if (v.name === tu.name && !v.real && JSON.stringify(v.args ?? {}) === JSON.stringify(tu.input ?? {})) {
+      pendingToolUses.delete(k); v.real = true; pendingToolUses.set(tu.id, v); return;
+    }
+  }
+  for (const [k, v] of pendingToolUses) if (v.name === tu.name && !v.real) { pendingToolUses.delete(k); v.real = true; pendingToolUses.set(tu.id, v); return; }
+}
+// The CLI runs MCP handlers one at a time, but Vellum answers a whole batch at once:
+// results for handlers that have not fired yet wait here, keyed by tool_use id.
+const earlyResults = new Map();
+const emittedToolIds = new Set(); // tool_use ids this process forwarded to Vellum
+function waitForVellum(name, id, args, signal) {
+  const early = earlyResults.get(id);
+  if (early) { earlyResults.delete(id); console.log(`[mcp] ${id} (${name}) served from early result`); return Promise.resolve(early); }
+  return new Promise((resolve, reject) => {
+    const entry = { name, args, resolve, reject, timer: null, at: Date.now() };
+    entry.timer = setTimeout(() => {
+      pendingToolUses.delete(id);
+      console.log(`[mcp] tool_use ${id} (${name}) timed out after ${TOOL_WAIT_MS / 1000}s waiting for Vellum`);
+      resolve({ content: [{ type: "text", text: `[shim] no result from Vellum within ${TOOL_WAIT_MS / 1000}s (request abandoned or approval never answered)` }], isError: true });
+    }, TOOL_WAIT_MS);
+    signal?.addEventListener?.("abort", () => {
+      if (!pendingToolUses.has(id)) return;
+      pendingToolUses.delete(id); clearTimeout(entry.timer);
+      resolve({ content: [{ type: "text", text: "[shim] tool call aborted" }], isError: true });
+    });
+    pendingToolUses.set(id, entry);
+  });
+}
+
+// Vellum echoes our ids back in `tool_call_id`. Match by id first; if the id
+// is unknown (session parked/resumed in between), fall back to the oldest
+// pending call with the same tool name.
+function resolveToolResults(messages) {
+  let n = 0;
+  for (const m of messages || []) {
+    if (m.role !== "tool") continue;
+    const text = contentToText(m.content);
+    let id = m.tool_call_id;
+    let entry = id ? pendingToolUses.get(id) : null;
+    if (!entry && m.name) {
+      for (const [k, v] of pendingToolUses) if (v.name === m.name) { id = k; entry = v; break; }
+    }
+    const isError = /^\s*(error|\[error\]|denied|tool call (was )?(denied|rejected))/i.test(text);
+    const result = { content: [{ type: "text", text: text || "(empty result)" }], ...(isError ? { isError: true } : {}) };
+    if (!entry) {
+      const tid = m.tool_call_id;
+      if (tid && emittedToolIds.has(tid) && !consumedToolIds.has(tid)) {
+        earlyResults.set(tid, result); consumedToolIds.add(tid); n++;
+        if (earlyResults.size > 500) earlyResults.delete(earlyResults.keys().next().value);
+      }
+      continue;
+    }
+    pendingToolUses.delete(id); clearTimeout(entry.timer); consumedToolIds.add(id);
+    if (consumedToolIds.size > 5000) consumedToolIds.delete(consumedToolIds.values().next().value);
+    entry.resolve(result);
+    n++;
+  }
+  return n;
+}
 
 const TOOL_INSTRUCTIONS = `You have access to the functions listed in <tools>. To call one or more of them,
 output ONLY lines of the exact form (one per call, nothing else in the message):
@@ -343,7 +567,7 @@ function tcToJson(tc) {
 // worker has already seen and send only the tail.
 function messagesToBlocks(messages, tools) {
   const blocks = [];
-  if (Array.isArray(tools) && tools.length) {
+  if (TOOL_MODE !== "mcp" && Array.isArray(tools) && tools.length) {
     const defs = tools
       .filter((t) => t?.type === "function" && t.function?.name)
       .map((t) => ({
@@ -363,10 +587,15 @@ function messagesToBlocks(messages, tools) {
     } else if (role === "assistant") {
       const lines = [];
       if (text) lines.push(text);
-      for (const tc of m.tool_calls || []) lines.push(`TOOL_CALL: ${tcToJson(tc)}`);
+      if (TOOL_MODE !== "mcp") for (const tc of m.tool_calls || []) lines.push(`TOOL_CALL: ${tcToJson(tc)}`);
       blocks.push({ role, text: `Assistant: ${lines.join("\n")}` });
     } else if (role === "tool") {
       const label = m.name || m.tool_call_id || "tool";
+      // mcp mode: a result whose tool_use is still pending was consumed by
+      // resolveToolResults and lives in the CLI transcript as a real
+      // tool_result. Only orphaned results (session restarted in between) are
+      // rendered as text so the model still sees them.
+      if (TOOL_MODE === "mcp" && m.tool_call_id && consumedToolIds.has(m.tool_call_id)) { blocks.push({ role, text: `<tool_result id="${m.tool_call_id}"/>`, consumed: true }); continue; }
       blocks.push({ role, text: `<tool_result name="${label}">\n${text}\n</tool_result>` });
     } else {
       blocks.push({ role, text: `${role}: ${text}` });
@@ -614,6 +843,10 @@ Bun.serve({
       : typeof body.reasoning?.effort === "string" ? body.reasoning.effort : null;
     console.log(`[req] model=${model} msgs=${(body.messages || []).length} tools=${tools.length} effort=${effort ?? "-"} key=${typeof body.prompt_cache_key === "string" ? body.prompt_cache_key.slice(0, 12) : "-"}`);
     const sdkModel = model.replace(/^claude-/, ""); // opus | sonnet | haiku
+    if (process.env.SHIM_DUMP_TOOLS && hasTools) { try { writeFileSync(process.env.SHIM_DUMP_TOOLS, JSON.stringify(tools)); } catch {} }
+    const mcp = TOOL_MODE === "mcp" && hasTools ? await buildMcp(tools, body.prompt_cache_key) : null;
+    const resolved = TOOL_MODE === "mcp" ? resolveToolResults(body.messages || []) : 0;
+    if (resolved) console.log(`[mcp] resolved ${resolved} pending tool result(s)`);
     const blocks = messagesToBlocks(body.messages || [], tools);
     const cacheKey = typeof body.prompt_cache_key === "string" && body.prompt_cache_key ? body.prompt_cache_key : null;
     const id = "chatcmpl-" + Math.random().toString(36).slice(2);
@@ -621,12 +854,23 @@ Bun.serve({
     const stream = new ReadableStream({
       async start(controller) {
         const enc = new TextEncoder();
-        const send = (s) => controller.enqueue(enc.encode(s));
+        let closed = false;
+        const send = (s) => { if (closed) return; try { controller.enqueue(enc.encode(s)); } catch { closed = true; } };
         try {
           send(sseChunk(id, model, { role: "assistant" }));
           let buffer = "";
           let sawDelta = false;
-          const result = await manager.run(sdkModel, cacheKey, blocks, (msg) => {
+          const mcpMode = TOOL_MODE === "mcp";
+          const toolUses = [];      // native tool_use blocks seen this turn
+          let turnDone = null;      // resolves when the assistant message carrying tool_use(s) is complete
+          let batchTimer = null;    // fallback if message_stop never arrives
+          const runPromise = manager.run(sdkModel, cacheKey, blocks, (msg) => {
+            if (mcpMode && msg.type === "assistant") {
+              const tus = (msg.message?.content || []).filter((b) => b.type === "tool_use");
+              // the CLI emits one assistant message per content block: collect until message_stop
+              if (tus.length) { toolUses.push(...tus); if (!batchTimer) batchTimer = setTimeout(() => turnDone?.(), 2000); }
+            }
+            if (mcpMode && toolUses.length && msg.type === "stream_event" && msg.event?.type === "message_stop") { clearTimeout(batchTimer); turnDone?.(); }
             if (msg.type === "stream_event" && msg.event?.type === "content_block_delta" && msg.event.delta?.type === "thinking_delta") {
               const thinking = msg.event.delta?.thinking;
               if (thinking) send(sseChunk(id, model, { reasoning_content: thinking })); // Vellum renders as thinking
@@ -636,18 +880,47 @@ Bun.serve({
               const text = msg.event.delta?.text;
               if (!text) return;
               sawDelta = true;
-              if (hasTools) buffer += text;               // must buffer to detect TOOL_CALL
+              if (hasTools && !mcpMode) buffer += text;   // text mode must buffer to detect TOOL_CALL
               else send(sseChunk(id, model, { content: text }));
             } else if (msg.type === "assistant" && !sawDelta) {
               const text = (msg.message?.content || [])
                 .filter((b) => b.type === "text").map((b) => b.text).join("");
               if (!text) return;
-              if (hasTools) buffer += text;
+              if (hasTools && !mcpMode) buffer += text;
               else send(sseChunk(id, model, { content: text }));
             }
-          }, effort);
+          }, effort, mcp);
 
-          if (hasTools) {
+          // mcp mode: the CLI turn does not end while handlers wait for Vellum, so
+          // race the run against "a tool_use batch arrived" and answer Vellum then.
+          let result;
+          if (mcpMode) {
+            const gotTools = new Promise((r) => (turnDone = r));
+            const which = await Promise.race([runPromise.then(() => "done", () => "done"), gotTools.then(() => "tools")]);
+            if (which === "tools") {
+              clearTimeout(batchTimer);
+              const tool_calls = toolUses.map((tu, i) => ({ index: i, id: tu.id, type: "function", function: { name: tu.name.replace(/^mcp__vellum__/, ""), arguments: JSON.stringify(tu.input ?? {}) } }));
+              // the handler registered under a provisional id; re-key it to the real tool_use id
+              for (const tu of toolUses) { rekeyPending(tu, cacheKey); emittedToolIds.add(tu.id); }
+              if (emittedToolIds.size > 5000) emittedToolIds.delete(emittedToolIds.values().next().value);
+              if (cacheKey) manager.chats.get(cacheKey)?.cli?.markObserved();
+              send(sseChunk(id, model, { tool_calls }));
+              send(sseChunk(id, model, {}, "tool_calls"));
+              console.log(`[res] tool_calls(mcp)=${toolUses.map((t) => t.name).join(",")} pending=${pendingToolUses.size}`);
+              // the CLI run continues in the background until Vellum's next request resolves the handler;
+              // release the per-chat lock now so that request can enter (it only resolves handlers + feeds nothing new)
+              runPromise.catch(() => {});
+              closed = true; // anything the CLI emits before Vellum's next request attaches is dropped, not written here
+              if (cacheKey) manager.chats.get(cacheKey)?.releaseForTools?.();
+              send("data: [DONE]\n\n");
+              return;
+            }
+            result = await runPromise;
+          } else {
+            result = await runPromise;
+          }
+
+          if (hasTools && !mcpMode) {
             const { calls, restText } = parseToolCalls(buffer, tools);
             if (calls.length) {
               if (restText) send(sseChunk(id, model, { content: restText }));
@@ -679,7 +952,8 @@ Bun.serve({
           console.error("[err]", e);
           send(`data: ${JSON.stringify({ error: { message: String(e) } })}\n\n`);
         } finally {
-          controller.close();
+          closed = true;
+          try { controller.close(); } catch {}
         }
       },
     });
@@ -694,4 +968,4 @@ Bun.serve({
   },
 });
 
-console.log(`claude-shim listening on 127.0.0.1:${PORT} (tools: prompt-contract, one cli per chat, maxLive=${MAX_LIVE}, idleTtl=${IDLE_TTL_MS/1000}s)`);
+console.log(`claude-shim listening on 127.0.0.1:${PORT} (tools: ${TOOL_MODE === "mcp" ? "sdk-mcp" : "prompt-contract"}, one cli per chat, maxLive=${MAX_LIVE}, idleTtl=${IDLE_TTL_MS/1000}s)`);

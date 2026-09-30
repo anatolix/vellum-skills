@@ -1,6 +1,6 @@
 ---
 name: "Claude Code as a Vellum chat model — install, OAuth, tool-capable shim"
-description: "End-to-end: install Claude Code CLI on a self-hosted Vellum VM, obtain a Claude OAuth token via the loopback callback trick, run a local OpenAI-compatible shim (Bun + Claude Agent SDK) that keeps one Claude Code session per Vellum conversation (prompt cache hits ~97%), supports OpenAI function calling via a prompt contract, passes the Vellum system prompt natively, reports token usage; plus a stdio MCP bridge (vellum-mcp.ts) that exposes Vellum tools to any Claude Code process (used with RichardAtCT/claude-code-openai-wrapper). Register as a Vellum provider and verify end-to-end. Verified Ubuntu 24.04, Vellum 0.12.x, Claude Code 2.1.x, Agent SDK 0.3.x."
+description: "End-to-end: install Claude Code CLI on a self-hosted Vellum VM, obtain a Claude OAuth token via the loopback callback trick, run a local OpenAI-compatible shim (Bun + Claude Agent SDK) that keeps one Claude Code session per Vellum conversation (prompt cache hits ~97%), supports OpenAI function calling either natively (Vellum tools registered on the CLI as an in-process SDK MCP server, default) or via a text prompt contract, passes the Vellum system prompt natively, reports token usage; plus a stdio MCP bridge (vellum-mcp.ts) that exposes Vellum tools to any Claude Code process (used with RichardAtCT/claude-code-openai-wrapper). Register as a Vellum provider and verify end-to-end. Verified Ubuntu 24.04, Vellum 0.12.x, Claude Code 2.1.x, Agent SDK 0.3.x."
 metadata:
   vellum:
     emoji: 🔌
@@ -10,6 +10,8 @@ metadata:
       - needs an OpenAI-compatible backend that proxies to Claude Code
       - wants to add claude-code as a Vellum inference provider
       - shim returns text instead of tool_calls
+      - Claude Code profile prints tool calls as JSON/text; shim log says init tools=0 mcp=[vellum:connected]
+      - parallel tool calls from Claude Code arrive one per round trip
       - Claude Code profile is slow / cache_read=0 on every request; wants session continuation
       - wants Vellum tools (recall, web_search, telegram…) callable from inside Claude Code via MCP
     avoid-when:
@@ -22,21 +24,31 @@ metadata:
 
 Make Claude Opus/Sonnet available as Vellum chat profiles **on a Claude subscription** (no API key), with working tools.
 
-Architecture (current, Sep 28):
+Architecture (current, Sep 30):
 
 ```
 Vellum daemon ──OpenAI chat/completions + prompt_cache_key──▶ claude-shim (Bun, 127.0.0.1:8317)
    ▲  executes tools, trust rules                              │  one long-lived `claude` process PER CHAT
    │                                                           │  (streaming-input query(), resume after idle)
+   │                                                           │  request `tools` → in-process SDK MCP server
    └──── tool_calls / content / usage ◀────────────────────────┘  CLAUDE_CODE_OAUTH_TOKEN → Claude Code
 ```
 
 Key ideas:
 
-1. **Vellum stays the tool executor.** Claude Code's SDK does not take OpenAI tool
-   definitions, and Vellum must keep trust rules / guardian approval. The shim renders
-   `tools` into a text contract, parses `TOOL_CALL:` lines (or native `<invoke>` XML as a
-   fallback) and returns real OpenAI `tool_calls`. Claude Code's own tools stay disabled.
+1. **Vellum stays the tool executor — but the model calls tools natively.**
+   (`SHIM_TOOL_MODE=mcp`, default since Sep 30.) The shim turns the request's OpenAI
+   `tools` into an in-process MCP server (`createSdkMcpServer` + `tool()` with zod shapes
+   derived from the JSON schemas) and hands it to the CLI as `mcpServers: {vellum}`,
+   `allowedTools: ["mcp__vellum__<name>", …]`. The model emits real `tool_use` blocks; the
+   MCP handler **executes nothing** — it parks on a promise, the request layer forwards the
+   batch to Vellum as OpenAI `tool_calls` (prefix stripped, real `toolu_…` ids), ends the
+   HTTP response, and releases the per-chat lock. Vellum runs the tool (approvals, trust,
+   UI cards all stay in Vellum) and sends the next request with `role: tool`; the shim
+   resolves the parked handler by `tool_call_id` and *attaches* to the still-running CLI
+   turn instead of feeding a new prompt. Claude Code's own tools stay disabled.
+   `SHIM_TOOL_MODE=text` keeps the old contract: `tools` rendered into the system prompt,
+   `TOOL_CALL:` lines parsed (multi-line scanner + salvage) — see references/ for its history.
 2. **One CLI process per chat, keyed by `prompt_cache_key`** (= Vellum conversation id;
    needs the local Vellum patch that forwards it to openai-compatible providers, see
    step 7). The CLI transcript is the source of truth; Vellum's history is only *diffed*:
@@ -207,12 +219,15 @@ cp {baseDir}/scripts/claude-shim.service ~/.config/systemd/user/   # fix paths/a
   first call only
 - SDK options: `tools: [], allowedTools: [], permissionMode: "bypassPermissions",
   settingSources: [], resume?, systemPrompt?`, `env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN }`
-- Env knobs: `SHIM_MAX_LIVE` (8), `SHIM_MAX_ONESHOT` (32), `SHIM_IDLE_TTL_SEC` (3600),
+- Env knobs: `SHIM_TOOL_MODE` (`mcp` | `text`), `SHIM_DEBUG_MCP` (log in-process tools/list count per spawn), `SHIM_MAX_LIVE` (8), `SHIM_MAX_ONESHOT` (32), `SHIM_IDLE_TTL_SEC` (3600),
   `SHIM_SESSIONS_DIR` (`./sessions`), `SHIM_PORT` (8317 — side-port testing)
 - Thinking: always spawned with `display:"summarized"`; raw CoT never available on
   subscription (redacted by Anthropic), summaries are
 - `Bun.serve({ idleTimeout: 255 })` — default 10 s kills slow SDK spawns
-- Log lines: `[req]`, `[sess] <key> cli<N> spawn|resume|live blocks=… seen=…`,
+- Log lines: `[req]`, `[cli<N> <key>] init tools=<n> mcp=[vellum:connected] expected=<n>` (the two
+  numbers MUST match — see Gotchas), `[res] tool_calls(mcp)=bash,file_read pending=…`,
+  `[mcp] resolved N pending tool result(s)`, `[sess] … continuing in-flight run`,
+  `[sess] <key> cli<N> spawn|resume|live blocks=… seen=…`,
   `[sess] … served #n … cache_read=…`, `[sess] … park (idle|evict|sigterm|sysprompt)`,
   `[usage] …`. Read with `journalctl --user -u claude-shim -f`.
 
@@ -327,6 +342,51 @@ is required by the wrapper even with `--auth none` on the Vellum side (Vellum al
 Observed: Richard's per-request process spawn (no session continuation) is noticeably
 slower than the per-chat shim; kept alive for comparison only.
 
+### 9. MCP tool mode — how the pieces fit (server.js, Sep 30)
+
+Read this before touching `buildMcp` / `waitForVellum` / the request layer.
+
+- **One MCP server instance per CLI process.** `buildMcp(tools)` returns
+  `{make, names, sig}`; `make()` is called at every spawn. A `createSdkMcpServer` instance
+  shared by two `query()` calls silently leaves the second process without tools.
+  Only zod shapes are cached (`shapeCache`, keyed by name+schema).
+- **Schema → zod, validated through the SDK's own converter.** `jsonSchemaToZod` handles
+  string/number/integer/boolean/null/enum/array/object/anyOf/oneOf; unknown → `z.unknown()`;
+  objects are `z.looseObject` (never `z.record` — see Gotchas). `shapeFor()` builds a
+  throwaway server with the single tool and runs its `tools/list`; a shape the SDK cannot
+  convert falls back to an open object **for that tool only**. `buildMcp` is async because
+  of this check.
+- **Handler ids.** The handler keys itself by `extra._meta["claudecode/toolUseId"]` (the real
+  `toolu_…` id); `name#seq` provisional ids + `rekeyPending` remain as fallback.
+- **Batch = one assistant message.** The CLI emits one `assistant` message per content
+  block (~140 ms apart), so the batch is closed on `stream_event message_stop` (2 s timer
+  fallback), not on the first `tool_use`. Handlers run **sequentially** inside the CLI —
+  the second one fires only after the first resolves — so results Vellum returns for
+  handlers that have not fired yet go to `earlyResults` (only for ids in `emittedToolIds`)
+  and `waitForVellum` serves them without parking. Net effect: N parallel tool calls =
+  one Vellum round trip.
+- **Attach, don't re-feed.** A request whose unseen blocks are all tool results resolves
+  handlers and `cli.attach(onMsg)`es to the in-flight run. `tool_use` blocks emitted while
+  nobody was listening are buffered in `cli.unobserved` and replayed on attach.
+- **Tool set changes between turns** (skills loaded/unloaded): `Cli.setTools` compares
+  `sig` and calls `q.setMcpServers({vellum: make()})` on the live session.
+- **Timeouts.** `TOOL_WAIT_MS` = 1 h; a handler nobody answers resolves with an `isError`
+  text. `extra.signal` never fires on query close — the shim cleans up itself. The CLI
+  itself has no ceiling on a hanging handler (tested 4 min+).
+- **Resume with an open tool_use** works: the CLI logs "tool interrupted", the session
+  stays usable.
+- In mcp mode tool-bearing requests are never one-shot (the handler must outlive the
+  HTTP response); `sent` hashes are saved *before* `cli.send`.
+
+Side-by-side testing: run a second instance on another port under systemd
+(`systemd-run --user --unit=shim-mcp-test … -E SHIM_PORT=8318 -E SHIM_TOOL_MODE=mcp
+-E SHIM_SESSIONS_DIR=/tmp/shim-mcp-sessions`; background children of a tool shell die with
+it), register it as a separate provider connection (`claude-code-mcp`, profiles
+`claude-code-mcp-*`) and switch a chat to it. Batch harness: `{baseDir}/scripts/test-mcp-batch.sh`.
+To drive a real Vellum agent turn on that profile without a human:
+`assistant conversations new t --json` → `assistant inference session open <profile>
+--conversation-id <id>` → `assistant conversations wake <id> --persist --hint '<task>'`.
+
 ## Verification
 
 Three curl tests against the shim (`{baseDir}/scripts/test-shim.sh` runs all three):
@@ -365,8 +425,21 @@ the word comes back.
   parsed TOOL_CALL. Still: spot-check paths/numbers the model cites.
 - Keep `tools: [], allowedTools: []` in the SDK options. Enabling Claude Code's native
   tools would let the model touch the filesystem outside Vellum's trust rules.
+- **`init tools=0 mcp=[vellum:connected] expected=N`** → the MCP server connected but its
+  `tools/list` threw, and the CLI silently runs with no tools while the model, seeing tool
+  talk in the history, writes tool calls as text ("trash in the chat"). Cause seen: a zod
+  construct the SDK's *bundled* zod core cannot convert (`z.record` → `ctx.deferred.push`).
+  One bad tool empties the whole list. Fixed by `looseObject` + per-tool validation
+  (`shapeFor`); if it recurs, `SHIM_DEBUG_MCP=1` and `SHIM_DUMP_TOOLS=/tmp/tools.json`
+  (write the request's tools to disk) locate the culprit.
+- **Probe scripts must run from `~/claude-shim`.** A bun script in `/tmp` resolves `zod`
+  from `~/.bun/install/cache`, not from the shim's `node_modules` — a different copy that
+  passes tests the shim fails.
+- Restarting the mcp shim while a handler is parked (a Vellum tool is running for a chat
+  on that profile) loses that tool result; the chat recovers on resume ("tool interrupted")
+  but the turn is wasted. Restart from a chat on another profile.
 - Bun `idleTimeout` default (10 s) → Vellum shows "Could not connect to the AI provider".
-- Rollback: `cp server.js.bak-pre-tools server.js && systemctl --user restart claude-shim`.
+- Rollback: `SHIM_TOOL_MODE=text` in the unit env (old contract, same binary); or `cp server.js.bak-pre-mcp server.js && systemctl --user restart claude-shim`.
 - `prompt_cache_key` missing in `[req]` log (`key=-`) → the Vellum patch (step 7) is not
   applied or the daemon was not restarted; everything runs keyless/ephemeral.
 - Every `[sess]` line says `spawn blocks=N` with N = whole history → the block hashes do not
