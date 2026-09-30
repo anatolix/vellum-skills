@@ -11,6 +11,7 @@ import { createHash } from "node:crypto";
 
 import { z } from "zod";
 const TOOL_MODE = process.env.SHIM_TOOL_MODE || "mcp"; // mcp | text
+const BATCH_IDLE_MS = Number(process.env.SHIM_BATCH_IDLE_MS || 5000);
 const TOOL_WAIT_MS = Number(process.env.SHIM_TOOL_WAIT_SEC || 3600) * 1000; // how long a tool_use may wait for Vellum's result (approvals)
 const PORT = Number(process.env.SHIM_PORT || 8317);
 
@@ -866,16 +867,20 @@ Bun.serve({
           let batchTimer = null;    // fallback if message_stop never arrives
           let expectedTus = 0, msgStopped = false, batchWhy = "";   // content_block_start(tool_use) count vs collected assistant tool_use blocks
           const closeBatch = (why) => { if (batchWhy) return; batchWhy = why; clearTimeout(batchTimer); turnDone?.(); };
+          // fallback: close after BATCH_IDLE_MS with no stream activity (message_stop is the primary signal;
+          // a fixed window from the first block cut Fable off mid-batch while it was still writing arguments)
+          const kickBatchTimer = () => { if (!toolUses.length || batchWhy) return; clearTimeout(batchTimer); batchTimer = setTimeout(() => closeBatch("idle"), BATCH_IDLE_MS); };
           const runPromise = manager.run(sdkModel, cacheKey, blocks, (msg) => {
             if (mcpMode && msg.type === "assistant") {
               const tus = (msg.message?.content || []).filter((b) => b.type === "tool_use");
               // the CLI emits one assistant message per content block: collect until message_stop
               if (tus.length) {
                 toolUses.push(...tus);
-                if (!batchTimer) batchTimer = setTimeout(() => closeBatch("timer"), 1500);
+                kickBatchTimer();
                 if (msgStopped && toolUses.length >= expectedTus) closeBatch("late-block");
               }
             }
+            if (mcpMode && msg.type === "stream_event") kickBatchTimer();
             if (mcpMode && msg.type === "stream_event" && msg.event?.type === "content_block_start" && msg.event.content_block?.type === "tool_use") expectedTus++;
             if (mcpMode && msg.type === "stream_event" && msg.event?.type === "message_stop") {
               msgStopped = true;

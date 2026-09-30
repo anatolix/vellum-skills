@@ -93,3 +93,14 @@ collected ≥ expected — on `message_stop` if all blocks are in, or on the lat
 (`late-block`); 1.5 s timer as the last resort. `[mcp] batch closed: <why> collected=N
 expected=M` in the log tells which path fired. Verified: 3 tools → one `tool_calls`
 response, `resolved 3`, two served from early results. Test: `scripts/test-mcp-batch3.sh`.
+
+## 31. The batch fallback timer must be an idle watchdog, not a window from the first block (Sep 30, 15:50)
+Live on Fable: `batch closed: timer collected=2 expected=3` — 1.5 s from the first tool_use block
+was not enough for a model writing three calls with long `activity` strings (haiku in the spike
+did it in 140 ms). The third block then arrived after the response was closed, sat in
+`unobserved`, and was replayed into the *next* request as `collected=1 expected=0` (stream
+events are not replayed, only assistant messages) — an extra round trip. Fix: `kickBatchTimer()`
+on every stream_event resets a `BATCH_IDLE_MS` (5000, env `SHIM_BATCH_IDLE_MS`) timer; it only
+fires after 5 s of silence. `message_stop` with collected ≥ expected remains the primary close.
+Side finding: a `recall` in that batch hit the 120 s tool timeout because `memory-retrospective`
+had TEI at 375 % CPU with a 186-deep queue — not a shim problem; batching just makes it visible.
