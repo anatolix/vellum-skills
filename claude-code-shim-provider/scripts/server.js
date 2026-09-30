@@ -307,6 +307,9 @@ Rules:
 - Call functions only when they are needed; otherwise answer normally in plain text.
 - Never use <function_calls>/<invoke> XML or any other native tool-call format. Only TOOL_CALL lines.
 - After your TOOL_CALL line(s), STOP. Do not write anything after them.
+- Inside JSON strings every " and \\ must be escaped. If a shell command needs nested quotes, backslashes,
+  regexes, heredocs or a python -c one-liner, do NOT inline it: first call file_write to save it as a script
+  file (e.g. scratch/step.sh), then call bash with a short one-line command that runs that file.
 - Results of your calls arrive in <tool_result> blocks in the NEXT message, from the system.
   NEVER write <tool_result> blocks yourself and never guess what a call would return.`;
 
@@ -468,6 +471,47 @@ function parseLooseJson(src) {
   }
 }
 
+// Last resort for a TOOL_CALL whose JSON never closes (the model lost track of
+// quote escaping inside a long string). Recover {"name": ..., "arguments": {...}}
+// by slicing argument values between top-level key markers taken from the
+// tool's schema, then decoding each value leniently. Returns null if even the
+// name cannot be read.
+function salvageToolCall(chunk, tools) {
+  const head = chunk.match(/^\s*\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*\{/);
+  if (!head) return null;
+  const name = head[1];
+  const def = (tools || []).find((t) => (t.function?.name ?? t.name) === name);
+  const props = def?.function?.parameters?.properties || {};
+  const keys = Object.keys(props);
+  let body = chunk.slice(head[0].length).replace(/\s*```\s*$/, "").replace(/\s+$/, "");
+  body = body.replace(/\}\s*\}?\s*$/, ""); // drop closing braces if the model got that far
+  const marks = [];
+  for (const k of keys) {
+    const re = new RegExp(`(^|,)\\s*"${k}"\\s*:\\s*`, "g");
+    let m, first = null, last = null;
+    while ((m = re.exec(body))) { const o = { key: k, start: m.index, vstart: m.index + m[0].length }; if (!first) first = o; last = o; }
+    if (!first) continue;
+    marks.push(first.start === 0 ? first : last); // first key sits at 0; later keys: last occurrence wins
+  }
+  if (!marks.length) return null;
+  marks.sort((x, y) => x.start - y.start);
+  const args = {};
+  for (let i = 0; i < marks.length; i++) {
+    let raw = body.slice(marks[i].vstart, i + 1 < marks.length ? marks[i + 1].start : body.length).trim();
+    if (raw.startsWith('"')) {
+      raw = raw.slice(1).replace(/"\s*$/, "");
+      let v;
+      try { v = JSON.parse('"' + raw.replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t").replace(/(^|[^\\])"/g, '$1\\"') + '"'); }
+      catch { v = raw.replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\"/g, '"').replace(/\\\\/g, "\\"); }
+      args[marks[i].key] = v;
+    } else {
+      try { args[marks[i].key] = JSON.parse(raw); } catch { args[marks[i].key] = raw; }
+    }
+  }
+  console.log(`[warn] salvaged unterminated TOOL_CALL ${name} keys=${Object.keys(args).join(",")}`);
+  return { name, arguments: args };
+}
+
 function parseToolCalls(text, tools = []) {
   const inv = parseInvoke(text, tools);
   if (inv) return inv;
@@ -482,6 +526,8 @@ function parseToolCalls(text, tools = []) {
     const endIdx = scanJsonObject(text, brace);
     if (endIdx < 0) {
       console.log("[warn] unterminated TOOL_CALL JSON |", text.slice(at, at + 160).replace(/\n/g, "\\n"));
+      const sv = salvageToolCall(text.slice(brace), tools);
+      if (sv) { if (restText === null) restText = text.slice(0, at); calls.push(sv); }
       break;
     }
     if (restText === null) restText = text.slice(0, at);
@@ -491,6 +537,8 @@ function parseToolCalls(text, tools = []) {
       else console.log("[warn] TOOL_CALL without name |", text.slice(brace, brace + 120).replace(/\n/g, "\\n"));
     } catch (e) {
       console.log("[warn] unparsable TOOL_CALL:", String(e.message).slice(0, 80), "|", text.slice(brace, brace + 160).replace(/\n/g, "\\n"));
+      const sv = salvageToolCall(text.slice(brace, endIdx), tools);
+      if (sv) calls.push(sv);
     }
     pos = endIdx; // anything between calls (or after the last) is discarded
   }

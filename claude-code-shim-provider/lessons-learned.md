@@ -39,3 +39,16 @@ restart.
 
 The original parser matched `TOOL_CALL: {...}` per line (`/\{.*\}\s*$/`). Fable wrote a bash heredoc into `"command"` with *literal* newlines inside the JSON string — invalid JSON, spanning many lines — and the regex never matched, so the whole call went to the user as text. Fix: find `TOOL_CALL:`, scan a balanced `{...}` with a quote/escape-aware brace counter (newlines inside strings do not terminate it), then `JSON.parse`; on failure escape raw `\n \r \t` inside string literals and retry. Also handles pretty-printed JSON, code-fence wrapping, and several calls in a row. Everything after the last parsed call is discarded, `<tool_result` fabrication guard applies to the text before the first call.
 
+
+## Lesson 26 — salvage a TOOL_CALL whose JSON never closes
+
+The text contract makes the model hand-escape JSON strings. On shell commands with nested quotes
+(`python -c "..."`, `\"` inside `$( )`, regexes with `\\[`) Fable eventually drops or doubles one escape,
+the string never closes, and the whole call used to leak into the chat as plain text. Native tool-use never
+has this problem because the API, not the model, owns the escaping.
+
+Fix (server.js `salvageToolCall`): when `scanJsonObject` gives up, or the balanced chunk fails to parse,
+read `"name"`, then slice argument values between top-level `"<key>":` markers taken from the tool's own
+schema (first key = first occurrence, later keys = last occurrence), decode each value leniently.
+Also added to TOOL_INSTRUCTIONS: commands needing heavy quoting go through `file_write` + one-line `bash`.
+Test harness: `scratch/shim-salvage-test.mjs` (4 cases, incl. healthy heredoc regression).
