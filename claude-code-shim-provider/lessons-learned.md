@@ -84,3 +84,12 @@ resolves, so even a correctly collected batch would deadlock on the second resul
 close the batch on `message_stop`; key handlers by `extra._meta["claudecode/toolUseId"]`;
 stash results whose handler hasn't fired in `earlyResults` and serve them when it does.
 Verified: two tools → one `tool_calls` chunk → one follow-up → "served from early result".
+
+## 30. Batch close on message_stop alone still splits 3+ tools (Sep 30, 15:40)
+A live 3-tool batch through Vellum went out as 2+1: the assistant message for the third
+tool_use block can arrive *after* `message_stop`. Fix: count `content_block_start` events
+with `content_block.type === "tool_use"` (`expectedTus`), close the batch only when
+collected ≥ expected — on `message_stop` if all blocks are in, or on the late block if not
+(`late-block`); 1.5 s timer as the last resort. `[mcp] batch closed: <why> collected=N
+expected=M` in the log tells which path fired. Verified: 3 tools → one `tool_calls`
+response, `resolved 3`, two served from early results. Test: `scripts/test-mcp-batch3.sh`.

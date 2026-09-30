@@ -864,13 +864,23 @@ Bun.serve({
           const toolUses = [];      // native tool_use blocks seen this turn
           let turnDone = null;      // resolves when the assistant message carrying tool_use(s) is complete
           let batchTimer = null;    // fallback if message_stop never arrives
+          let expectedTus = 0, msgStopped = false, batchWhy = "";   // content_block_start(tool_use) count vs collected assistant tool_use blocks
+          const closeBatch = (why) => { if (batchWhy) return; batchWhy = why; clearTimeout(batchTimer); turnDone?.(); };
           const runPromise = manager.run(sdkModel, cacheKey, blocks, (msg) => {
             if (mcpMode && msg.type === "assistant") {
               const tus = (msg.message?.content || []).filter((b) => b.type === "tool_use");
               // the CLI emits one assistant message per content block: collect until message_stop
-              if (tus.length) { toolUses.push(...tus); if (!batchTimer) batchTimer = setTimeout(() => turnDone?.(), 2000); }
+              if (tus.length) {
+                toolUses.push(...tus);
+                if (!batchTimer) batchTimer = setTimeout(() => closeBatch("timer"), 1500);
+                if (msgStopped && toolUses.length >= expectedTus) closeBatch("late-block");
+              }
             }
-            if (mcpMode && toolUses.length && msg.type === "stream_event" && msg.event?.type === "message_stop") { clearTimeout(batchTimer); turnDone?.(); }
+            if (mcpMode && msg.type === "stream_event" && msg.event?.type === "content_block_start" && msg.event.content_block?.type === "tool_use") expectedTus++;
+            if (mcpMode && msg.type === "stream_event" && msg.event?.type === "message_stop") {
+              msgStopped = true;
+              if (toolUses.length && toolUses.length >= expectedTus) closeBatch("stop");
+            }
             if (msg.type === "stream_event" && msg.event?.type === "content_block_delta" && msg.event.delta?.type === "thinking_delta") {
               const thinking = msg.event.delta?.thinking;
               if (thinking) send(sseChunk(id, model, { reasoning_content: thinking })); // Vellum renders as thinking
@@ -899,6 +909,7 @@ Bun.serve({
             const which = await Promise.race([runPromise.then(() => "done", () => "done"), gotTools.then(() => "tools")]);
             if (which === "tools") {
               clearTimeout(batchTimer);
+              console.log(`[mcp] batch closed: ${batchWhy || "run-done"} collected=${toolUses.length} expected=${expectedTus}`);
               const tool_calls = toolUses.map((tu, i) => ({ index: i, id: tu.id, type: "function", function: { name: tu.name.replace(/^mcp__vellum__/, ""), arguments: JSON.stringify(tu.input ?? {}) } }));
               // the handler registered under a provisional id; re-key it to the real tool_use id
               for (const tu of toolUses) { rekeyPending(tu, cacheKey); emittedToolIds.add(tu.id); }
