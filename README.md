@@ -29,6 +29,9 @@ Verified on Ubuntu 24.04, 4 vCPU / 16 GB, Vellum 0.12.4–0.12.6, TEI cpu-1.9.4,
 ### [claude-code-shim-provider](claude-code-shim-provider/SKILL.md)
 Claude Opus/Sonnet as Vellum chat models on a Claude subscription. Claude Code CLI install, 1-year OAuth token via `setup-token`, Bun shim with **one Claude Code session per Vellum chat** (park after 1 h idle, resume on return, ~97% prompt-cache hits), OpenAI function calling via prompt contract, native system prompt, usage reporting; `vellum-mcp.ts` stdio bridge exposing Vellum tools to Claude Code (with trust-class header + tool timeout override) — used with the RichardAtCT wrapper fork. Depends on two patches from `anatolix/vellum-assistant` `local-patches`.
 
+### [codex-shim-provider](codex-shim-provider/SKILL.md)
+ChatGPT subscription models as a separate Vellum provider through a persistent `codex app-server` shim. Includes the v2 code, legacy v1 fallback, portable user service, optional conversation-ID/effort patch, setup/architecture and implementation lessons reconstructed from the development chat. Strict chat identity (keyless HTTP 400), unseen-history replay guards (>8 blocks), caller-owned dynamic tools, SSE reasoning summaries with an honest reasoning-token fallback, and quota-free fake-app-server regression tests. Keeps the Anthropic/Claude shim independent and unchanged.
+
 ### [subagent-empty-response-patch](subagent-empty-response-patch/SKILL.md)
 Fix for the platform bug where subagents die silently after exactly one tool call (empty post-tool LLM response, no re-query nudge for `subagentSpawn`). One-line patch to the empty-response hook, verification procedure, and links to upstream issue vellum-ai/vellum-assistant#43327 and PR #43328. Re-apply after every upgrade until the PR merges.
 - **vm-env-monitoring** — VM setup and monitoring: nginx (streaming-safe proxy, /charts/), atop, 15-min health check schedule, morning Telegram load report.

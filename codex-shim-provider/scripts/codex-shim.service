@@ -1,0 +1,15 @@
+[Unit]
+Description=Codex (ChatGPT) OpenAI-compatible shim
+After=network.target
+
+[Service]
+ExecStart=%h/codex-shim/run.sh
+WorkingDirectory=%h/codex-shim
+Restart=always
+RestartSec=5
+# Set optional overrides with systemctl --user edit codex-shim.service.
+# Environment=SHIM_DEFAULT_EFFORT=high
+# Environment=SHIM_DEBUG=1
+
+[Install]
+WantedBy=default.target
