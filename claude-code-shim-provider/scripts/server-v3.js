@@ -17,6 +17,7 @@ import { z } from "zod";
 const TOOL_MODE = process.env.SHIM_TOOL_MODE || "mcp"; // mcp | text
 const BATCH_IDLE_MS = Number(process.env.SHIM_BATCH_IDLE_MS || 5000);
 const TOOL_WAIT_MS = Number(process.env.SHIM_TOOL_WAIT_SEC || 3600) * 1000; // how long a tool_use may wait for Vellum's result (approvals)
+const FULL_HIST_MIN = Number(process.env.SHIM_FULL_HIST_MIN || 8); // feeding >= this many unseen blocks = full-history re-feed, warn in chat
 const PORT = Number(process.env.SHIM_PORT || 8317);
 
 const MAX_LIVE = Number(process.env.SHIM_MAX_LIVE || process.env.SHIM_POOL_SIZE || 8);
@@ -281,6 +282,7 @@ class Chat {
       }
     }
     let why = !this.sent.length ? "new" : unseen.length ? `tail=${unseen.length}` : "repeat";
+    if (unseen.length >= FULL_HIST_MIN) { const w = `[shim] WARNING: full history re-feed (${unseen.length}/${inputs.length} unseen blocks, chat served ${this.served} turns) — legitimate only when this chat just switched onto this shim/model.\n\n`; console.log(`[sess] ${short(this.key)} ${w.trim()}`); onMsg({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: w } } }); }
     if (!unseen.length) unseen = inputs.slice(-1);
     for (let attempt = 0; attempt < 2; attempt++) {
       let produced = false;
@@ -925,6 +927,7 @@ Bun.serve({
     if (resolved) console.log(`[mcp] resolved ${resolved} pending tool result(s)`);
     const blocks = messagesToBlocks(body.messages || [], tools);
     const cacheKey = typeof body.prompt_cache_key === "string" && body.prompt_cache_key ? body.prompt_cache_key : null;
+    if (!cacheKey) { console.log(`[req] REJECTED: no prompt_cache_key (full history without a chat id)`); return Response.json({ error: { message: "claude-shim: prompt_cache_key (chat id) is required; keyless requests are rejected" } }, { status: 400 }); }
     const id = "chatcmpl-" + Math.random().toString(36).slice(2);
 
     const stream = new ReadableStream({

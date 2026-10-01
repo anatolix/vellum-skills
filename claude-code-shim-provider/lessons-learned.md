@@ -133,6 +133,16 @@ Lesson 24 (`effort ReferenceError`, missed replace) is exactly how the port brok
 time: server.js had no `extra` plumbing, adding it touched fetch/run/manager signatures —
 grep every call site of a signature you change, `bun build --no-bundle` catches syntax only.
 
+## 35. Keyless requests are 400; full-history feeds warn in the chat (Oct 1, 19:55)
+Anatoly's safety rule: (1) no prompt_cache_key -> immediate 400, no oneshot fallback — keyless
+full-history requests (compactor, misconfigured profiles) must fail loudly, not silently burn
+a fresh CLI session; (2) any turn that feeds >= SHIM_FULL_HIST_MIN (default 8) unseen blocks
+emits "[shim] WARNING: full history re-feed (N/M unseen blocks, chat served K turns)" as SSE
+content INTO the chat + journal. Count BLOCKS not messages: messagesToBlocks merges each
+user+assistant turn into one block (12 pairs = 13 blocks), a 11-msg test at threshold 8
+silently passed as 6 blocks. Legit full-history case: a chat switched onto the shim/model
+mid-conversation (new chat, served=0) — expected, warning is informational there.
+
 ## 34. shim v3: VS Code extension findings ported (Oct 1, 00:00)
 server-v3.js on :8320 (unit shim-v3, MCP mode, provider claude-code-v3, profiles
 claude-code-v3-{opus,sonnet,haiku,fable}): verbatimPrompts (no CLAUDE.md/skill-listing
