@@ -221,6 +221,12 @@ cp {baseDir}/scripts/claude-shim.service ~/.config/systemd/user/   # fix paths/a
   settingSources: [], resume?, systemPrompt?`, `env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN }`
 - Env knobs: `SHIM_TOOL_MODE` (`mcp` | `text`), `SHIM_DEBUG_MCP` (log in-process tools/list count per spawn), `SHIM_MAX_LIVE` (8), `SHIM_MAX_ONESHOT` (32), `SHIM_IDLE_TTL_SEC` (3600),
   `SHIM_SESSIONS_DIR` (`./sessions`), `SHIM_PORT` (8317 — side-port testing)
+
+Three instances run on this VM: `:8317` claude-shim (text/prompt-contract tools, stable,
+never restart), `:8318` shim-mcp-test (`SHIM_TOOL_MODE=mcp`, experimental), `:8320` shim-v3
+(`server-v3.js`: verbatimPrompts, fallbackModel, effort switch via updateSettings, precompute
+compaction, context_usage/rate_limits/actual_model in usage — see lessons 33–34 and
+`scripts/server-v3.js`).
 - Thinking: always spawned with `display:"summarized"`; raw CoT never available on
   subscription (redacted by Anthropic), summaries are
 - `Bun.serve({ idleTimeout: 255 })` — default 10 s kills slow SDK spawns

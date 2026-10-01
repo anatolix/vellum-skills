@@ -1,3 +1,7 @@
+// claude-shim v3 — fork of server.js (Sep 30) with the SDK features found in the VS Code extension:
+// verbatimPrompts, fallbackModel, maxBudgetUsd, flag settings (precompute compaction), live effort
+// switch via updateSettings, getContextUsage + rate_limit_event in the usage chunk, json_schema
+// output for one-shots, actual-model reporting. See scratch/claude-vscode-ext-architecture.md.
 // OpenAI-compatible chat completions shim backed by Claude Code (Agent SDK + OAuth token).
 // Listens on 127.0.0.1:8317. Endpoints: POST /v1/chat/completions (SSE), GET /v1/models.
 //
@@ -23,6 +27,12 @@ const SESS_DIR = process.env.SHIM_SESSIONS_DIR || `${import.meta.dir}/sessions`;
 // SHIM_MAX_ONESHOT is a separate OOM guard (~220 MB per process). 0 = unlimited.
 const MAX_ONESHOT = Number(process.env.SHIM_MAX_ONESHOT ?? 32);
 const DEFAULT_MODEL = "sonnet";
+const SHIM_VERSION = "v3";
+const FALLBACK_MODEL = process.env.SHIM_FALLBACK_MODEL ?? "sonnet";   // "" disables; applied when it differs from the requested model
+const VERBATIM = process.env.SHIM_VERBATIM !== "0";                  // client_composed prompts: no @path/slash expansion, no CLAUDE.md / skill listings attached
+const CTX_USAGE = process.env.SHIM_CONTEXT_USAGE !== "0";            // ask the CLI for get_context_usage after each turn
+const PRECOMPUTE_COMPACT = process.env.SHIM_PRECOMPUTE_COMPACT !== "0"; // flag settings: compaction summary precomputed in the background
+const SYS_SNAPSHOT = process.env.SHIM_SYS_SNAPSHOT === "1";           // record the system prompt in the transcript; a changed prompt then starts a fresh session
 mkdirSync(SESS_DIR, { recursive: true });
 const sha = (s) => createHash("sha1").update(s).digest("hex");
 const short = (k) => (k ? k.slice(0, 12) : "-");
@@ -38,8 +48,11 @@ const short = (k) => (k ? k.slice(0, 12) : "-");
 // ---------------------------------------------------------------------------
 let cliSeq = 0;
 class Cli {
-  constructor(label, model, resume = null, systemPrompt = null, effort = null, mcp = null) {
+  constructor(label, model, resume = null, systemPrompt = null, effort = null, mcp = null, extra = {}) {
     this.id = ++cliSeq;
+    this.effort = effort ?? null;
+    this.actualModel = null;
+    this.extra = extra;
     this.toolNames = mcp?.names ?? [];
     this.toolSig = mcp?.sig ?? null;
     this.label = label;
@@ -57,7 +70,12 @@ class Cli {
         ...(resume ? { resume } : {}),
         // Vellum's system prompt replaces Claude Code's own (tools are off anyway).
         // snapshot:false so a changed prompt takes effect on respawn/resume.
-        ...(systemPrompt ? { systemPrompt: { type: "custom", prompt: systemPrompt, snapshot: false } } : {}),
+        ...(systemPrompt ? { systemPrompt: { type: "custom", prompt: systemPrompt, snapshot: SYS_SNAPSHOT } } : {}),
+        verbatimPrompts: VERBATIM,
+        ...(FALLBACK_MODEL && FALLBACK_MODEL !== model ? { fallbackModel: FALLBACK_MODEL } : {}),
+        ...(extra.maxBudgetUsd ? { maxBudgetUsd: extra.maxBudgetUsd } : {}),
+        ...(extra.outputFormat ? { outputFormat: extra.outputFormat } : {}),
+        ...(PRECOMPUTE_COMPACT ? { settings: { autoCompactEnabled: true, precomputeCompactionEnabled: true } } : {}),
         env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN },
         tools: [],
         ...(mcp ? { mcpServers: { vellum: mcp.make() }, allowedTools: mcp.names.map((n) => `mcp__vellum__${n}`) } : { allowedTools: [] }),
@@ -101,6 +119,8 @@ class Cli {
           console.log(`[cli${this.id} ${this.label}] init tools=${mcpTools.length} mcp=[${servers}] expected=${this.toolNames.length}`);
         }
         if (msg.type === "result" && msg.session_id) this.sessionId = msg.session_id;
+        if (msg.type === "assistant" && msg.message?.model && msg.message.model !== this.actualModel) { this.actualModel = msg.message.model; console.log(`[cli${this.id} ${this.label}] serving model=${this.actualModel}`); }
+        if (msg.type === "rate_limit_event") manager.noteRateLimit(msg.rate_limit_info);
         if (this.onMsg) this.onMsg(msg);
         if (msg.type === "result" && this.done) {
           const d = this.done; this.done = null; this.onMsg = null;
@@ -156,6 +176,22 @@ class Cli {
     if (m !== this.model) { await this.q.setModel(m); this.model = m; }
   }
 
+  // Live effort change through the flag-settings layer (what the VS Code host does). Returns false
+  // when a respawn is needed (thinking on<->off, or no explicit effort to apply).
+  async setEffort(effort) {
+    const cur = this.effort ?? null, nxt = effort ?? null;
+    if (cur === nxt) return true;
+    if (cur === "none" || nxt === "none" || nxt === null) return false;
+    const lvl = ["low", "medium", "high"].includes(nxt) ? nxt : "high";
+    try { await this.q.updateSettings({ effortLevel: lvl }); this.effort = nxt; console.log(`[cli${this.id} ${this.label}] effort ${cur} -> ${lvl} (live)`); return true; }
+    catch (e) { console.log(`[cli${this.id} ${this.label}] live effort change failed: ${String(e?.message || e).slice(0, 100)}`); return false; }
+  }
+
+  async contextUsage() {
+    if (!this.alive) return null;
+    try { return await this.q.getContextUsage({ detail: "summary" }); } catch (e) { console.log(`[cli${this.id}] get_context_usage failed: ${String(e?.message || e).slice(0, 80)}`); return null; }
+  }
+
   // Swap the Vellum tool set on a live session (skills load/unload between turns).
   async setTools(mcp) {
     const names = mcp?.names ?? [];
@@ -208,7 +244,7 @@ class Chat {
     extra.exposeRel?.(rel);
     if (extra.signal?.aborted) { rel(); throw new Error("client went away while queued"); }
     this.releaseForTools = rel; // mcp mode: request layer releases once tool_calls are sent, so the follow-up can enter
-    try { return await this._run(model, blocks, onMsg, effort, mcp); }
+    try { return await this._run(model, blocks, onMsg, effort, mcp, extra); }
     finally { rel(); }
   }
 
@@ -218,13 +254,17 @@ class Chat {
   // the head) therefore sends just the summary; a retried identical history
   // re-sends the last user block. A fresh process is spawned only when there is
   // no live one, with `resume` when a session id exists.
-  async _run(model, blocks, onMsg, effort = null, mcp = null) {
+  async _run(model, blocks, onMsg, effort = null, mcp = null, extra = {}) {
     const inputs = inputBlocks(blocks);
     const hashes = inputs.map((b) => sha(b.text));
     const sys = systemText(blocks);
     const sysHash = sys ? sha(sys) : null;
-    if (this.live && sysHash !== this.sysHash) this.park("system changed");
-    if (this.live && (effort ?? null) !== (this.effort ?? null)) this.park("effort changed");
+    if (sysHash !== this.sysHash) {
+      if (this.live) this.park("system changed");
+      // a recorded (snapshot) prompt is reused verbatim on resume, so a changed prompt needs a fresh session
+      if (SYS_SNAPSHOT && this.sessionId) { console.log(`[sess] ${short(this.key)} system changed under snapshot -> fresh session`); this.sessionId = null; this.sent = []; }
+    }
+    if (this.live && !(await this.cli.setEffort(effort))) this.park("effort changed");
     const seen = new Set(this.sent);
     let unseen = inputs.filter((_, i) => !seen.has(hashes[i]));
     // mcp mode: the tool results were handed to the CLI natively (resolveToolResults);
@@ -247,11 +287,12 @@ class Chat {
       const t0 = Date.now();
       try {
         if (!this.live) {
-          this.cli = await manager.spawn(short(this.key), model, this.sessionId, sys, effort, mcp);
+          this.cli = await manager.spawn(short(this.key), model, this.sessionId, sys, effort, mcp, { maxBudgetUsd: extra.maxBudgetUsd });
           why += this.sessionId ? " resume" : " spawn";
           this.sysHash = sysHash;
         }
         await this.cli.setModel(model);
+        this.model = model;
         if (TOOL_MODE === "mcp") await this.cli.setTools(mcp);
         const prompt = unseen.map((b) => b.text).concat(["Assistant:"]).join("\n\n");
         console.log(`[sess] ${short(this.key)} cli${this.cli.id} ${why} blocks=${inputs.length} seen=${this.sent.length}`);
@@ -260,6 +301,7 @@ class Chat {
         if (TOOL_MODE === "mcp") { this.sent = [...seen]; this.save(); }
         const res = await this.cli.send(prompt, (m) => { produced = true; onMsg(m); });
         this.sent = [...seen]; this.sessionId = res.session_id || this.cli.sessionId; this.model = model; this.effort = effort ?? null; this.served++; this.lastUsed = Date.now();
+        res.shim_actual_model = this.cli?.actualModel ?? null;
         this.save();
         if (res.subtype && res.subtype !== "success") console.log(`[sess] ${short(this.key)} result subtype=${res.subtype} ${String(res.result || "").slice(0, 120)}`);
         console.log(`[sess] ${short(this.key)} served #${this.served} model=${model} prep=${tPrep}ms total=${Date.now() - t0}ms in=${res.usage?.input_tokens ?? "?"} cache_read=${res.usage?.cache_read_input_tokens ?? "?"} session=${this.sessionId}`);
@@ -298,14 +340,14 @@ const manager = {
     return c;
   },
   // Wait for a free slot (parking the LRU idle chat if needed), then spawn.
-  async spawn(label, model, resume, systemPrompt = null, effort = null, mcp = null) {
+  async spawn(label, model, resume, systemPrompt = null, effort = null, mcp = null, extra = {}) {
     while (this.liveCount() >= MAX_LIVE) {
       const idle = [...this.chats.values()].filter((c) => c.live && !c.busy).sort((a, b) => a.lastUsed - b.lastUsed);
       if (idle.length) { idle[0].park("evict"); continue; }
       await new Promise((r) => this.waiters.push(r));
     }
     this.reserved++;
-    try { return new Cli(label, model, resume, systemPrompt, effort, mcp); } finally { this.reserved--; }
+    try { return new Cli(label, model, resume, systemPrompt, effort, mcp, extra); } finally { this.reserved--; }
   },
   kick() { const w = this.waiters.splice(0); for (const r of w) r(); },
   reap() {
@@ -316,17 +358,19 @@ const manager = {
     }
   },
   oneshotWaiters: [],
-  async runEphemeral(model, blocks, onMsg, tag = "nokey", attempts = 3, effort = null, mcp = null) {
+  async runEphemeral(model, blocks, onMsg, tag = "nokey", attempts = 3, effort = null, mcp = null, extra = {}) {
     while (MAX_ONESHOT > 0 && this.ephemeral.size >= MAX_ONESHOT) await new Promise((r) => this.oneshotWaiters.push(r));
     let lastErr;
     for (let a = 0; a < attempts; a++) {
-      const cli = new Cli(tag, model, null, systemText(blocks), effort, mcp);
+      const cli = new Cli(tag, model, null, systemText(blocks), effort, mcp, extra);
       this.ephemeral.add(cli);
       let produced = false;
       try {
         const t0 = Date.now();
         const res = await cli.send(blocksToPrompt(inputBlocks(blocks)), (m) => { produced = true; onMsg(m); });
-        console.log(`[${tag}] cli${cli.id} model=${model} total=${Date.now() - t0}ms in=${res.usage?.input_tokens ?? "?"} cache_read=${res.usage?.cache_read_input_tokens ?? "?"}`);
+        res.shim_actual_model = cli.actualModel;
+        if (CTX_USAGE) res.shim_context_usage = await cli.contextUsage();
+        console.log(`[${tag}] cli${cli.id} model=${model} actual=${cli.actualModel ?? "?"} total=${Date.now() - t0}ms in=${res.usage?.input_tokens ?? "?"} cache_read=${res.usage?.cache_read_input_tokens ?? "?"}`);
         return res;
       } catch (e) {
         lastErr = e;
@@ -347,14 +391,29 @@ const manager = {
     return !blocks.some((b) => b.role === "assistant" || b.role === "tool");
   },
   run(model, key, blocks, onMsg, effort = null, mcp = null, extra = {}) {
-    if (!key) return this.runEphemeral(model, blocks, onMsg, "nokey", 3, effort, mcp);
-    if (!this.chats.has(key) && this.isOneShot(blocks) && !mcp) return this.runEphemeral(model, blocks, onMsg, `oneshot ${short(key)}`, 3, effort, mcp);
+    if (!key) return this.runEphemeral(model, blocks, onMsg, "nokey", 3, effort, mcp, extra);
+    if (!this.chats.has(key) && this.isOneShot(blocks) && !mcp) return this.runEphemeral(model, blocks, onMsg, `oneshot ${short(key)}`, 3, effort, mcp, extra);
     return this.get(key).run(model, blocks, onMsg, effort, mcp, extra);
+  },
+  rateLimits: null,
+  noteRateLimit(info) {
+    if (!info) return;
+    const sig = JSON.stringify(info);
+    if (sig === this.rateLimits?.sig) return;
+    this.rateLimits = { at: Date.now(), sig, info };
+    const w = info.unifiedWindows || info;
+    const fmt = (x) => x && x.utilization != null ? `${Math.round(x.utilization * 100)}%${x.resets_at ? " resets " + x.resets_at : ""}` : "-";
+    console.log(`[ratelimit] status=${info.status ?? "?"} 5h=${fmt(w.five_hour)} 7d=${fmt(w.seven_day)}`);
+  },
+  async contextUsage(key) {
+    if (!CTX_USAGE || !key) return null;
+    const c = this.chats.get(key);
+    return c?.cli?.alive ? c.cli.contextUsage() : null;
   },
   status() {
     return {
-      maxLive: MAX_LIVE, maxOneshot: MAX_ONESHOT, idleTtlSec: IDLE_TTL_MS / 1000, live: this.liveCount(), oneshot: [...this.ephemeral].map((c) => ({ cli: c.id, label: c.label, model: c.model })), waiters: this.waiters.length, oneshotWaiters: this.oneshotWaiters.length,
-      chats: [...this.chats.values()].map((c) => ({ key: short(c.key), live: c.live, busy: c.busy, cli: c.cli?.id ?? null, model: c.model, served: c.served, sent: c.sent.length, session: c.sessionId, idleSec: Math.round((Date.now() - c.lastUsed) / 1000) })),
+      version: SHIM_VERSION, verbatim: VERBATIM, fallbackModel: FALLBACK_MODEL || null, rateLimits: this.rateLimits?.info ?? null, maxLive: MAX_LIVE, maxOneshot: MAX_ONESHOT, idleTtlSec: IDLE_TTL_MS / 1000, live: this.liveCount(), oneshot: [...this.ephemeral].map((c) => ({ cli: c.id, label: c.label, model: c.model })), waiters: this.waiters.length, oneshotWaiters: this.oneshotWaiters.length,
+      chats: [...this.chats.values()].map((c) => ({ key: short(c.key), live: c.live, busy: c.busy, cli: c.cli?.id ?? null, model: c.model, actual: c.cli?.actualModel ?? null, served: c.served, sent: c.sent.length, session: c.sessionId, idleSec: Math.round((Date.now() - c.lastUsed) / 1000) })),
     };
   },
 };
@@ -853,11 +912,14 @@ Bun.serve({
     const effort = typeof body.reasoning_effort === "string" ? body.reasoning_effort
       : typeof body.reasoning?.effort === "string" ? body.reasoning.effort : null;
     console.log(`[req] model=${model} msgs=${(body.messages || []).length} tools=${tools.length} effort=${effort ?? "-"} key=${typeof body.prompt_cache_key === "string" ? body.prompt_cache_key.slice(0, 12) : "-"}`);
-    const sdkModel = model.replace(/^claude-/, ""); // opus | sonnet | haiku
-    if (process.env.SHIM_DUMP_TOOLS && hasTools) { try { writeFileSync(process.env.SHIM_DUMP_TOOLS, JSON.stringify(tools)); } catch {} }
+    const sdkModel = model.replace(/^claude-/, ""); // opus | sonnet | haiku | fable
+    const maxBudgetUsd = Number(req.headers.get("x-shim-max-budget-usd") || body.max_budget_usd || 0) || null;
+    const rf = body.response_format;
+    const outputFormat = rf?.type === "json_schema" && rf.json_schema?.schema ? { type: "json_schema", schema: rf.json_schema.schema } : null; // honoured on one-shot processes only
     const ac = { aborted: false, rel: null, abort: null, onGone: null };
     req.signal?.addEventListener?.("abort", () => ac.abort?.());
-    const extra = { signal: req.signal, exposeRel: (r) => { ac.rel = r; } };
+    const extra = { maxBudgetUsd, outputFormat, signal: req.signal, exposeRel: (r) => { ac.rel = r; } };
+    if (process.env.SHIM_DUMP_TOOLS && hasTools) { try { writeFileSync(process.env.SHIM_DUMP_TOOLS, JSON.stringify(tools)); } catch {} }
     const mcp = TOOL_MODE === "mcp" && hasTools ? await buildMcp(tools, body.prompt_cache_key) : null;
     const resolved = TOOL_MODE === "mcp" ? resolveToolResults(body.messages || [], typeof body.prompt_cache_key === "string" && body.prompt_cache_key ? body.prompt_cache_key : null) : 0;
     if (resolved) console.log(`[mcp] resolved ${resolved} pending tool result(s)`);
@@ -973,14 +1035,21 @@ Bun.serve({
               send(sseChunk(id, model, {}, "stop"));
             }
           } else {
+            if (result?.structured_output !== undefined && !sawDelta) send(sseChunk(id, model, { content: typeof result.structured_output === "string" ? result.structured_output : JSON.stringify(result.structured_output) }));
             send(sseChunk(id, model, {}, "stop"));
           }
           const usage = usageFromResult(result);
           if (usage) {
+            const ctx = result?.shim_context_usage ?? await manager.contextUsage(cacheKey);
+            if (ctx) usage.context_usage = ctx;
+            if (manager.rateLimits) usage.rate_limits = manager.rateLimits.info;
+            if (result?.shim_actual_model) usage.actual_model = result.shim_actual_model;
+            if (typeof result?.total_cost_usd === "number") usage.cost_usd = result.total_cost_usd;
             send(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [], usage })}\n\n`);
+            if (ctx) console.log(`[ctx] ${JSON.stringify(ctx).slice(0, 300)}`);
             const d = usage.prompt_tokens_details;
             const uncached = usage.prompt_tokens - d.cached_tokens - d.cache_write_tokens;
-            console.log(`[usage] model=${model} prompt=${usage.prompt_tokens} cached=${d.cached_tokens} cache_write=${d.cache_write_tokens} uncached=${uncached} out=${usage.completion_tokens}`);
+            console.log(`[usage] model=${model} actual=${usage.actual_model ?? "?"} cost=${usage.cost_usd ?? "?"} prompt=${usage.prompt_tokens} cached=${d.cached_tokens} cache_write=${d.cache_write_tokens} uncached=${uncached} out=${usage.completion_tokens}`);
           }
           send("data: [DONE]\n\n");
         } catch (e) {
@@ -1004,4 +1073,4 @@ Bun.serve({
   },
 });
 
-console.log(`claude-shim listening on 127.0.0.1:${PORT} (tools: ${TOOL_MODE === "mcp" ? "sdk-mcp" : "prompt-contract"}, one cli per chat, maxLive=${MAX_LIVE}, idleTtl=${IDLE_TTL_MS/1000}s)`);
+console.log(`claude-shim ${SHIM_VERSION} listening on 127.0.0.1:${PORT} verbatim=${VERBATIM} fallback=${FALLBACK_MODEL || "off"} ctxUsage=${CTX_USAGE} precompact=${PRECOMPUTE_COMPACT} snapshot=${SYS_SNAPSHOT} (tools: ${TOOL_MODE === "mcp" ? "sdk-mcp" : "prompt-contract"}, one cli per chat, maxLive=${MAX_LIVE}, idleTtl=${IDLE_TTL_MS/1000}s)`);

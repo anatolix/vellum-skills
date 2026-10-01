@@ -115,3 +115,34 @@ run into a response nobody was waiting for, and the real follow-up (compacted hi
 carry `chatKey`; `resolveToolResults(messages, reqKey)` returns 0 when the request has no key and
 skips entries whose chatKey differs (`[mcp] <id> belongs to another chat, ignoring result`).
 The key-less compactor request runs as a plain oneshot, as it should.
+
+## 33. A dropped client connection deadlocks the chat lock — abort must propagate (Oct 1, 12:15)
+Vellum times a provider stream out after ~2 min of NO BYTES (not the 1800 s `streamTimeoutMs`
+— that one only fires with an active connection; an idle one is cut by the client-side socket
+timeout as "The operation timed out"). In MCP mode the request holds the per-chat lock while
+attached to an in-flight CLI turn (model thinking / writing tool args = minutes of silence).
+The shim never noticed the client was gone → chat `busy:true` forever, retries queued behind
+the lock, the tool batch written to a dead stream. Fix (server.js + server-v3.js, .bak-pre-abort):
+(1) SSE keepalive comment every 15 s keeps the socket alive through long thinking gaps;
+(2) `req.signal` abort + ReadableStream `cancel()` release the chat lock and park the tool
+batch in `cli.unobserved`; (3) `attach()` re-emits the last unanswered batch
+(`cli.lastBatch`, set by `markObserved()`) to the retried request — a retried turn CAN now
+re-execute a tool whose result never made it back, acceptable for idempotent Vellum tools;
+(4) `[DONE]` is sent BEFORE `closed=true` (was silently dropped after it).
+Lesson 24 (`effort ReferenceError`, missed replace) is exactly how the port broke the first
+time: server.js had no `extra` plumbing, adding it touched fetch/run/manager signatures —
+grep every call site of a signature you change, `bun build --no-bundle` catches syntax only.
+
+## 34. shim v3: VS Code extension findings ported (Oct 1, 00:00)
+server-v3.js on :8320 (unit shim-v3, MCP mode, provider claude-code-v3, profiles
+claude-code-v3-{opus,sonnet,haiku,fable}): verbatimPrompts (no CLAUDE.md/skill-listing
+attachment, no @path/slash expansion — SDK ≥2.1.248), fallbackModel=sonnet, maxBudgetUsd
+(x-shim-max-budget-usd header), settings {autoCompactEnabled, precomputeCompactionEnabled}
+(compaction summary precomputed → no 4-min hang mid-turn), live effort change via
+q.updateSettings({effortLevel}) (no respawn for low↔high; none/↔still respawns),
+getContextUsage after each turn → usage.context_usage, rate_limit_event → usage.rate_limits +
+/chats, actual_model + total_cost_usd in usage, response_format json_schema → SDK outputFormat
+(one-shot only). Dropped: sdkMcpServerManifests (SDK 0.3.282 sends them itself),
+excludeDynamicSections (preset prompts only), side_question (bridge-only in 0.3.282).
+Also from the rate_limit_event: subscription 7-day window was at 98–99 % — watch it
+before trusting Opus/Fable through any shim.
