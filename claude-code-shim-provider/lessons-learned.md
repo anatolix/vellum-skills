@@ -166,3 +166,11 @@ emitted by `shimNotice()` immediately before `cli.send()` in both `Chat._run` an
 not at the planning step, so an unforeseen re-feed path cannot bypass them. Markdown has no colour;
 Vellum's web client renders a ```diff fence with a `- ` line in red, so `SHIM_NOTICE_FMT=diff` is
 the default (`html`/`font`/`md` alternatives kept for other clients).
+
+## 37. "Full history" is a position test, not a count (Oct 1, 23:25)
+`unseen >= 8` fired on a plain 8-block tail after a shim restart (8/99) — a false positive that
+read as trash in the chat. The real anomaly is an unseen block positioned BEFORE the last block the
+chat has already seen (history rewritten or re-fed), or a known chat whose blocks all miss. A tail
+of any length is normal. Notices are now one combined diff block per send; the resume line carries
+the park reason (`after shutdown` = shim restart, `after idle`, `after system changed`…), so a
+resume right after a restart is not mistaken for an idle eviction.

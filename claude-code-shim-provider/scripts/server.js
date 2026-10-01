@@ -18,7 +18,7 @@ const FULL_HIST_MIN = Number(process.env.SHIM_FULL_HIST_MIN || 8); // feeding >=
 const NOTICE_FMT = process.env.SHIM_NOTICE_FMT || "diff";
 function fmtNotice(body) {
   if (NOTICE_FMT === "font") return `<font color="red">${body}</font>\n\n`;
-  if (NOTICE_FMT === "diff") return "```diff\n- " + body.replace(/\n/g, " ") + "\n```\n";
+  if (NOTICE_FMT === "diff") return "```diff\n" + body.split("\n").map((l) => "- " + l).join("\n") + "\n```\n";
   if (NOTICE_FMT === "md") return `> 🔴 **${body}**\n\n`;
   return `<span style="color:red">${body}</span>\n\n`;
 }
@@ -203,6 +203,7 @@ class Chat {
     } catch (e) { console.error(`[sess] save failed ${short(this.key)}: ${e.message}`); }
   }
   park(reason) {
+    this.parkedWhy = reason;
     if (this.cli) {
       console.log(`[sess] ${short(this.key)} park (${reason}) cli${this.cli.id} session=${this.sessionId}`);
       this.cli.close(); this.cli = null;
@@ -239,6 +240,7 @@ class Chat {
     if (this.live && sysHash !== this.sysHash) this.park("system changed");
     if (this.live && (effort ?? null) !== (this.effort ?? null)) this.park("effort changed");
     const seen = new Set(this.sent);
+    const prior = new Set(this.sent);
     let unseen = inputs.filter((_, i) => !seen.has(hashes[i]));
     // mcp mode: the tool results were handed to the CLI natively (resolveToolResults);
     // mark them seen and, if nothing else is new while a run is in flight, attach to that run.
@@ -272,9 +274,15 @@ class Chat {
         for (const h of hashes) seen.add(h);
         if (TOOL_MODE === "mcp") { this.sent = [...seen]; this.save(); }
         // emitted at the point of the actual send so any re-feed path is caught, foreseen or not
-        if (why.startsWith("new")) shimNotice(onMsg, short(this.key), `new chat session (${why}, cli${this.cli.id}, ${unseen.length} blocks)`);
-        else if (why.includes("resume")) shimNotice(onMsg, short(this.key), `resumed session ${this.sessionId} (${why}, cli${this.cli.id}, ${unseen.length} unseen of ${inputs.length} blocks)`);
-        if (unseen.length >= FULL_HIST_MIN) shimNotice(onMsg, short(this.key), `WARNING: full history re-feed — ${unseen.length}/${inputs.length} unseen blocks fed to the CLI, chat served ${this.served} turns before. Legitimate only right after switching this chat onto this shim/model.`);
+        const notes = [];
+        if (why.startsWith("new")) notes.push(`new chat session on this shim: ${unseen.length} history blocks fed${unseen.length >= FULL_HIST_MIN ? " (model switch?)" : ""}`);
+        else if (why.includes("resume")) notes.push(`resumed session ${String(this.sessionId).slice(0, 8)} after ${this.parkedWhy ?? "restart"}: tail of ${unseen.length} new blocks`);
+        // anomaly = unseen blocks positioned BEFORE the last block this chat has already seen (history rewritten / re-fed), or nothing matches at all
+        let lastSeenIdx = -1; for (let i = 0; i < hashes.length; i++) if (prior.has(hashes[i])) lastSeenIdx = i;
+        const refed = inputs.map((b, i) => i).filter((i) => !prior.has(hashes[i]) && i < lastSeenIdx && !(inputs[i].role === "tool" && inputs[i].consumed));
+        if (refed.length) notes.push(`WARNING: ${refed.length} block(s) from already-seen history re-fed (positions ${refed.slice(0, 6).join(",")}${refed.length > 6 ? ",…" : ""}; last seen block at ${lastSeenIdx}/${inputs.length})`);
+        else if (prior.size && lastSeenIdx < 0) notes.push(`WARNING: none of ${inputs.length} blocks match this chat's ${prior.size} known blocks — full history re-feed`);
+        if (notes.length) shimNotice(onMsg, short(this.key), notes.join("\n"));
         const res = await this.cli.send(prompt, (m) => { produced = true; onMsg(m); });
         this.sent = [...seen]; this.sessionId = res.session_id || this.cli.sessionId; this.model = model; this.effort = effort ?? null; this.served++; this.lastUsed = Date.now();
         this.save();
