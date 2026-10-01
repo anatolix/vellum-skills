@@ -14,6 +14,18 @@ const TOOL_MODE = process.env.SHIM_TOOL_MODE || "mcp"; // mcp | text
 const BATCH_IDLE_MS = Number(process.env.SHIM_BATCH_IDLE_MS || 5000);
 const TOOL_WAIT_MS = Number(process.env.SHIM_TOOL_WAIT_SEC || 3600) * 1000; // how long a tool_use may wait for Vellum's result (approvals)
 const FULL_HIST_MIN = Number(process.env.SHIM_FULL_HIST_MIN || 8); // feeding >= this many unseen blocks = full-history re-feed, warn in chat
+// Red-ish in-chat notices from the shim. Markdown has no colour; format is picked by SHIM_NOTICE_FMT: html | font | diff | md
+const NOTICE_FMT = process.env.SHIM_NOTICE_FMT || "diff";
+function fmtNotice(body) {
+  if (NOTICE_FMT === "font") return `<font color="red">${body}</font>\n\n`;
+  if (NOTICE_FMT === "diff") return "```diff\n- " + body.replace(/\n/g, " ") + "\n```\n";
+  if (NOTICE_FMT === "md") return `> 🔴 **${body}**\n\n`;
+  return `<span style="color:red">${body}</span>\n\n`;
+}
+function shimNotice(onMsg, tag, text) {
+  console.log(`[notice ${tag}] ${text}`);
+  onMsg({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: fmtNotice(`[shim] ${text}`) } } });
+}
 const PORT = Number(process.env.SHIM_PORT || 8317);
 
 const MAX_LIVE = Number(process.env.SHIM_MAX_LIVE || process.env.SHIM_POOL_SIZE || 8);
@@ -242,7 +254,6 @@ class Chat {
       }
     }
     let why = !this.sent.length ? "new" : unseen.length ? `tail=${unseen.length}` : "repeat";
-    if (unseen.length >= FULL_HIST_MIN) { const w = `[shim] WARNING: full history re-feed (${unseen.length}/${inputs.length} unseen blocks, chat served ${this.served} turns) — legitimate only when this chat just switched onto this shim/model.\n\n`; console.log(`[sess] ${short(this.key)} ${w.trim()}`); onMsg({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: w } } }); }
     if (!unseen.length) unseen = inputs.slice(-1);
     for (let attempt = 0; attempt < 2; attempt++) {
       let produced = false;
@@ -260,6 +271,10 @@ class Chat {
         const tPrep = Date.now() - t0;
         for (const h of hashes) seen.add(h);
         if (TOOL_MODE === "mcp") { this.sent = [...seen]; this.save(); }
+        // emitted at the point of the actual send so any re-feed path is caught, foreseen or not
+        if (why.startsWith("new")) shimNotice(onMsg, short(this.key), `new chat session (${why}, cli${this.cli.id}, ${unseen.length} blocks)`);
+        else if (why.includes("resume")) shimNotice(onMsg, short(this.key), `resumed session ${this.sessionId} (${why}, cli${this.cli.id}, ${unseen.length} unseen of ${inputs.length} blocks)`);
+        if (unseen.length >= FULL_HIST_MIN) shimNotice(onMsg, short(this.key), `WARNING: full history re-feed — ${unseen.length}/${inputs.length} unseen blocks fed to the CLI, chat served ${this.served} turns before. Legitimate only right after switching this chat onto this shim/model.`);
         const res = await this.cli.send(prompt, (m) => { produced = true; onMsg(m); });
         this.sent = [...seen]; this.sessionId = res.session_id || this.cli.sessionId; this.model = model; this.effort = effort ?? null; this.served++; this.lastUsed = Date.now();
         this.save();
@@ -327,7 +342,9 @@ const manager = {
       let produced = false;
       try {
         const t0 = Date.now();
-        const res = await cli.send(blocksToPrompt(inputBlocks(blocks)), (m) => { produced = true; onMsg(m); });
+        const ib = inputBlocks(blocks);
+        if (ib.length >= FULL_HIST_MIN) shimNotice(onMsg, tag, `WARNING: ${ib.length} history blocks fed to a one-shot process (${tag}) — no live chat session`);
+        const res = await cli.send(blocksToPrompt(ib), (m) => { produced = true; onMsg(m); });
         console.log(`[${tag}] cli${cli.id} model=${model} total=${Date.now() - t0}ms in=${res.usage?.input_tokens ?? "?"} cache_read=${res.usage?.cache_read_input_tokens ?? "?"}`);
         return res;
       } catch (e) {

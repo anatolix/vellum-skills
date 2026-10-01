@@ -156,3 +156,13 @@ getContextUsage after each turn → usage.context_usage, rate_limit_event → us
 excludeDynamicSections (preset prompts only), side_question (bridge-only in 0.3.282).
 Also from the rate_limit_event: subscription 7-day window was at 98–99 % — watch it
 before trusting Opus/Fable through any shim.
+
+## 36. In-chat notices live at the send point, rendered red via a ```diff block (Oct 1, 23:20)
+Anatoly's safety rules: (a) a request without `prompt_cache_key` gets 400 — never build a session
+for a keyless full history; (b) any time ≥ `SHIM_FULL_HIST_MIN` (8) unseen blocks are fed to the
+CLI, say so in the chat — the only legitimate case is a chat that just switched onto this
+shim/model; (c) also announce "new chat session" and "resumed session <id>". The notices are
+emitted by `shimNotice()` immediately before `cli.send()` in both `Chat._run` and `runEphemeral`,
+not at the planning step, so an unforeseen re-feed path cannot bypass them. Markdown has no colour;
+Vellum's web client renders a ```diff fence with a `- ` line in red, so `SHIM_NOTICE_FMT=diff` is
+the default (`html`/`font`/`md` alternatives kept for other clients).
