@@ -1,6 +1,10 @@
 import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
-for (const path of ['scratch/effort-20261002/claude-server-v3.after.js', 'skills/claude-code-shim-provider/scripts/server-v3.js']) {
+// usage: bun test-effort.mjs [path/to/server-v3.js ...]  (default: sibling server-v3.js)
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+const paths = process.argv.slice(2).length ? process.argv.slice(2) : [join(dirname(fileURLToPath(import.meta.url)), 'server-v3.js')];
+for (const path of paths) {
   const source = readFileSync(path, 'utf8');
   const classSource = source.slice(source.indexOf('class Cli {'), source.indexOf('\nfunction sameList'));
   const captures = [], changes = [];

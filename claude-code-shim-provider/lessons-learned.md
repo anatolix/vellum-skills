@@ -180,6 +180,8 @@ so "max" became xhigh), and the web profile editor hid the effort control for op
 Three-file Vellum patch: codex-shim-provider/patches/vellum-0.12.6-openai-compatible-effort.patch
 (shared with the Codex shim). Regression: scripts/test-effort.mjs (fake SDK; spawns all five tiers,
 live switches, none↔tier respawn). Journal shows `effort low -> max (live)` per switch.
+Rule (Anatoly, 18:00): never guess — an effort outside none|low|medium|high|xhigh|max is a 400
+`unsupported_effort` at request parse, before any CLI work; no silent fallback to high.
 
 ## 37. "Full history" is a position test, not a count (Oct 1, 23:25)
 `unseen >= 8` fired on a plain 8-block tail after a shim restart (8/99) — a false positive that

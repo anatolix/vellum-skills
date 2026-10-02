@@ -353,16 +353,32 @@ def run_tests():
             check("native-tools-off-and-per-turn-summary-effort", native_disabled)
 
             def effort_levels():
-                for model, levels in [("effort-model", [(e,e) for e in ["none", "low", "medium", "high", "xhigh"]] + [("max", "xhigh")]),
-                                      ("sparse-model", [("none", "low"), ("medium", "low"), ("max", "high")])]:
-                    for wanted, expected in levels:
-                        request("effort-" + model + wanted, model=model, effort=wanted)
-                        turn = [m["params"] for m in captured() if m.get("method") == "turn/start"][-1]
-                        assert turn["effort"] == expected, (wanted, expected, turn)
+                def rejected(model, effort, nested=False):
+                    before = len(captured())
+                    try:
+                        request("effort-rej-" + model + str(effort), model=model, effort=effort, nested=nested)
+                    except urllib.error.HTTPError as e:
+                        assert e.code == 400, e.code
+                        body = json.loads(e.read().decode())
+                        assert body["error"]["code"] == "unsupported_effort", body
+                    else:
+                        raise AssertionError("expected 400 for effort %r on %s" % (effort, model))
+                    assert not any(m.get("method") in ("thread/start", "turn/start") for m in captured()[before:])
+                for e in ["none", "low", "medium", "high", "xhigh"]:
+                    request("effort-ok-" + e, model="effort-model", effort=e)
+                    turn = [m["params"] for m in captured() if m.get("method") == "turn/start"][-1]
+                    assert turn["effort"] == e, (e, turn)
                 request("nested-effort", model="effort-model", effort="medium", nested=True)
                 turn = [m["params"] for m in captured() if m.get("method") == "turn/start"][-1]
                 assert turn["effort"] == "medium", turn
-            check("effort-all-levels-none-floor-ceiling-and-nested", effort_levels)
+                for model, bad in [("effort-model", "max"), ("effort-model", "ultra"), ("effort-model", "bogus"), ("effort-model", 3),
+                                   ("sparse-model", "none"), ("sparse-model", "medium"), ("sparse-model", "max")]:
+                    rejected(model, bad)
+                rejected("sparse-model", "xhigh", nested=True)
+                request("effort-sparse-ok", model="sparse-model", effort="low")
+                turn = [m["params"] for m in captured() if m.get("method") == "turn/start"][-1]
+                assert turn["effort"] == "low", turn
+            check("effort-explicit-values-pass-unsupported-400-before-inference", effort_levels)
 
             def live_thread_not_resumed():
                 before = len(captured())

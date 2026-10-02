@@ -189,6 +189,18 @@ async function handleChat(req) {
     return jsonResp({ error: { message: "codex-shim: no session key. Send prompt_cache_key or X-Conversation-Id header (Vellum: apply skills/codex-shim-provider/scripts/patch-vellum-retry.sh and restart the daemon). Refusing to run keyless: it would replay the whole history per request and burn quota.", type: "invalid_request_error", code: "missing_session_key" } }, 400);
   }
 
+  // Effort: validate, never guess. An explicit value must be one the model advertises
+  // (model/list.supportedReasoningEfforts); otherwise 400 before any inference.
+  const KNOWN_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+  const requestedEffort = body.reasoning_effort ?? body.reasoning?.effort ?? null;
+  const supportedEfforts = (srv.modelEfforts || {})[model];
+  const allowedEfforts = supportedEfforts && supportedEfforts.length ? supportedEfforts : KNOWN_EFFORTS;
+  if (requestedEffort !== null && (typeof requestedEffort !== "string" || !allowedEfforts.includes(requestedEffort))) {
+    log(`[req] REJECTED: effort ${JSON.stringify(requestedEffort)} not supported by ${model} (allowed: ${allowedEfforts.join(",")})`);
+    return jsonResp({ error: { message: `codex-shim: effort ${JSON.stringify(requestedEffort)} is not supported by model ${model}; allowed: ${allowedEfforts.join(", ")}`, type: "invalid_request_error", code: "unsupported_effort" } }, 400);
+  }
+  const effort = requestedEffort ?? process.env.SHIM_DEFAULT_EFFORT ?? "high";
+
   let state = key ? loadState(key) : null;
   let prevState = null, invalidReason = null;
   if (state && (state.model !== model || state.fingerprint !== fingerprint)) {
@@ -402,15 +414,7 @@ async function handleChat(req) {
         if (prompt.trim()) {
           // effort: Vellum sends OpenAI-style reasoning_effort (or reasoning.effort); summary:
           // reasoning summaries must be requested per turn or codex emits empty reasoning items.
-          let effort = body.reasoning_effort || body.reasoning?.effort || process.env.SHIM_DEFAULT_EFFORT || "high";
-          // Respect the model-supported floor and ceiling for caller-selected effort.
-          const ok = (srv.modelEfforts || {})[model];
-          if (effort && ok && ok.length && !ok.includes(effort)) {
-            const order = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
-            const want = order.indexOf(effort);
-            effort = ok.filter(e => order.indexOf(e) <= want).sort((a, b) => order.indexOf(b) - order.indexOf(a))[0] || [...ok].sort((a, b) => order.indexOf(a) - order.indexOf(b))[0];
-          }
-          if (effort) log(`[effort] model=${model} requested=${body.reasoning_effort || body.reasoning?.effort || "default"} effective=${effort}`);
+          log(`[effort] model=${model} requested=${requestedEffort ?? "default"} effective=${effort}`);
           await srv.request("turn/start", {
             threadId: state.threadId,
             input: [{ type: "text", text: prompt, text_elements: [] }],

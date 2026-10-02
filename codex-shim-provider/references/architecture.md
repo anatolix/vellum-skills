@@ -44,7 +44,7 @@ Wait for a turn to finish before a service restart. Updating a file alone does n
 
 ## Thinking and usage
 
-`turn/start` requests `summary: "detailed"` plus the selected supported effort. A thread-level `model_reasoning_summary` setting alone was insufficient in observed runs. Body `reasoning_effort`, then `reasoning.effort`, then `SHIM_DEFAULT_EFFORT` (**high**) determines effort; unsupported tiers are snapped to the model's available efforts. Values below the supported floor (including `none` on reasoning-only models) use the lowest supported effort, not the highest. Supported `none` is passed explicitly. Effective effort is recorded in `[effort]` journal entries.
+`turn/start` requests `summary: "detailed"` plus the effort. Body `reasoning_effort`, then `reasoning.effort`, then `SHIM_DEFAULT_EFFORT` (**high**). An explicit value is **validated, never snapped**: it must be in the model's `supportedReasoningEfforts` from `model/list` (fallback: the known tier names when the model advertises none); anything else, including a non-string or `none` on a model that does not list it, is HTTP **400 `unsupported_effort`** before any thread or turn is created. The effective tier is recorded in `[effort]` journal entries.
 
 Mapping:
 

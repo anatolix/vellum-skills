@@ -102,7 +102,7 @@ class Cli {
         ...(effort === "none"
           ? { thinking: { type: "disabled" } }
           : { thinking: { type: "adaptive", display: "summarized" },
-              ...(effort ? { effort: ["low", "medium", "high", "xhigh", "max"].includes(effort) ? effort : "high" } : {}) }),
+              ...(effort ? { effort } : {}) }),
       },
     });
     this.pump().catch(() => {});
@@ -195,7 +195,7 @@ class Cli {
     const cur = this.effort ?? null, nxt = effort ?? null;
     if (cur === nxt) return true;
     if (cur === "none" || nxt === "none" || nxt === null) return false;
-    const lvl = ["low", "medium", "high", "xhigh", "max"].includes(nxt) ? nxt : "high";
+    const lvl = nxt;
     try { await this.q.applyFlagSettings({ effortLevel: lvl }); this.effort = nxt; console.log(`[cli${this.id} ${this.label}] effort ${cur} -> ${lvl} (live)`); return true; }
     catch (e) { console.log(`[cli${this.id} ${this.label}] live effort change failed: ${String(e?.message || e).slice(0, 100)}`); return false; }
   }
@@ -936,8 +936,13 @@ Bun.serve({
     const model = body.model || "claude-opus";
     const tools = Array.isArray(body.tools) ? body.tools : [];
     const hasTools = tools.length > 0;
-    const effort = typeof body.reasoning_effort === "string" ? body.reasoning_effort
-      : typeof body.reasoning?.effort === "string" ? body.reasoning.effort : null;
+    // Effort: validate, never guess. Anything but the CLI's tiers (or "none" = thinking off) is a 400.
+    const KNOWN_EFFORT = ["none", "low", "medium", "high", "xhigh", "max"];
+    const effort = body.reasoning_effort ?? body.reasoning?.effort ?? null;
+    if (effort !== null && !KNOWN_EFFORT.includes(effort)) {
+      console.log(`[req] REJECTED: unsupported effort ${JSON.stringify(effort)} (allowed: ${KNOWN_EFFORT.join(",")})`);
+      return Response.json({ error: { message: `claude-shim: effort ${JSON.stringify(effort)} is not supported; allowed: ${KNOWN_EFFORT.join(", ")}`, type: "invalid_request_error", code: "unsupported_effort" } }, { status: 400 });
+    }
     console.log(`[req] model=${model} msgs=${(body.messages || []).length} tools=${tools.length} effort=${effort ?? "-"} key=${typeof body.prompt_cache_key === "string" ? body.prompt_cache_key.slice(0, 12) : "-"}`);
     const sdkModel = model.replace(/^claude-/, ""); // opus | sonnet | haiku | fable
     const maxBudgetUsd = Number(req.headers.get("x-shim-max-budget-usd") || body.max_budget_usd || 0) || null;
