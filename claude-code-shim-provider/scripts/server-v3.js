@@ -39,7 +39,7 @@ const SESS_DIR = process.env.SHIM_SESSIONS_DIR || `${import.meta.dir}/sessions`;
 // throwaway process that is closed right after the answer. They do not occupy chat slots;
 // SHIM_MAX_ONESHOT is a separate OOM guard (~220 MB per process). 0 = unlimited.
 const MAX_ONESHOT = Number(process.env.SHIM_MAX_ONESHOT ?? 32);
-// router-oneuse-<hash> keys come from shim-router for Vellum internal call sites:
+// router-oneuse-<uuid> keys come from shim-router for Vellum internal call sites:
 // one logical task per key. The CLI is killed right after its turn completes, is
 // never parked to disk, never counted against MAX_LIVE, and is listed separately
 // from real chats in /chats. SHIM_MAX_ONEUSE is the OOM guard for tool-bearing

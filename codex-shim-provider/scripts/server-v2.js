@@ -131,7 +131,7 @@ function sessPath(key) { return join(SESS_DIR, sha1(key) + ".json"); }
 function loadState(key) { try { return JSON.parse(readFileSync(sessPath(key), "utf8")); } catch { return null; } }
 function saveState(key, st) { writeFileSync(sessPath(key), JSON.stringify(st)); }
 
-// router-oneuse-<hash> keys come from shim-router for Vellum internal call sites:
+// router-oneuse-<uuid> keys come from shim-router for Vellum internal call sites:
 // one logical task per key. State lives ONLY in memory (never in SESS_DIR, so one-use
 // threads never show in /chats monitoring), the thread is dropped right after its turn
 // completes, and an idle reaper sweeps tasks abandoned mid tool round trip.
@@ -143,12 +143,22 @@ function persistState(key, st) {
   if (ONEUSE_RE.test(key)) { st.lastUsedAt = Date.now(); oneUseStates.set(key, st); return; }
   saveState(key, st);
 }
+function destroyOneUseState(key, st, reason) {
+  oneUseStates.delete(key);
+  if (!st?.threadId) return;
+  liveThreads.delete(st.threadId);
+  threadHandlers.delete(st.threadId);
+  // The app-server process is shared by all chats, so it cannot be killed per request.
+  // thread/delete is the protocol-level equivalent: the one-use thread is actually
+  // released upstream instead of merely disappearing from our maps.
+  void srv.request("thread/delete", { threadId: st.threadId })
+    .then(() => log(`[oneuse] ${reason}: thread deleted ${st.threadId}`))
+    .catch(e => log(`[oneuse] ${reason}: thread/delete failed ${String(e).slice(0, 160)}`));
+}
 setInterval(() => {
   for (const [k, st] of oneUseStates) {
     if (Date.now() - (st.lastUsedAt ?? 0) > ONEUSE_IDLE_MS) {
-      oneUseStates.delete(k);
-      if (st.threadId) { liveThreads.delete(st.threadId); threadHandlers.delete(st.threadId); }
-      log(`[oneuse] idle reaped ${k.slice(0, 32)}`);
+      destroyOneUseState(k, st, "idle reaped");
     }
   }
 }, 60_000);
@@ -508,9 +518,8 @@ async function handleChat(req) {
           if (parkedCalls.length) {
             persistState(key, state); // tool round trip pending: keep state in memory until it lands
           } else {
-            oneUseStates.delete(key);
-            liveThreads.delete(state.threadId);
-            log(`[oneuse] ${key.slice(0, 32)} turn done — thread dropped, nothing persisted`);
+            destroyOneUseState(key, state, "turn done");
+            log(`[oneuse] ${key.slice(0, 32)} turn done — thread deleted, nothing persisted`);
           }
         }
         log(`[res] ${agentBuf.length} chars parked=${parkedCalls.length} ${Date.now() - t0}ms`);

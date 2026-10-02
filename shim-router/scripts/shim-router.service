@@ -1,6 +1,6 @@
 [Unit]
 Description=shim-router (claude-sonnet -> gpt-6-luna -> openrouter sonnet) :8322
-After=network.target
+After=network-online.target shim-v3.service codex-shim.service
 
 [Service]
 ExecStart=/home/vellum/.bun/bin/bun run /home/vellum/shim-router/server.js
