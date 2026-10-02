@@ -28,6 +28,21 @@ const UPSTREAMS = [
 
 const log = (...a) => console.log(new Date().toISOString(), "[router]", ...a);
 
+// Stable one-use key: internal call sites arrive without prompt_cache_key, and both
+// shims treat router-oneuse-* as "kill right after the turn, never pool, never persist".
+// The key must be STABLE across a task's tool round-trips (same first user message) or
+// a follow-up carrying tool results would miss its in-flight process. Hashing the first
+// user + system blocks gives exactly that; tool-less tasks (greetings, titles) don't care.
+import { createHash } from "crypto";
+function oneUseKey(body) {
+  const msgs = Array.isArray(body.messages) ? body.messages : [];
+  const pick = (role) => {
+    const m = msgs.find((x) => x.role === role);
+    return m ? JSON.stringify(m.content) : "";
+  };
+  return "router-oneuse-" + createHash("sha1").update(pick("system") + "|" + pick("user")).digest("hex").slice(0, 24);
+}
+
 function cascadableStatus(status) {
   return status === 429 || status >= 500;
 }
@@ -36,7 +51,7 @@ async function attemptUpstream(up, body, streamWanted) {
   const payload = { ...body, model: up.model };
   // claude-shim rejects keyless requests; internal call sites may carry no cache key.
   // Give each such call a fresh id so every request is a clean one-shot session.
-  if (!payload.prompt_cache_key) payload.prompt_cache_key = `router-oneuse-${crypto.randomUUID()}`;
+  if (!payload.prompt_cache_key) payload.prompt_cache_key = oneUseKey(body);
   const headers = { "content-type": "application/json" };
   if (up.key) headers["authorization"] = `Bearer ${up.key}`;
   const ctrl = new AbortController();

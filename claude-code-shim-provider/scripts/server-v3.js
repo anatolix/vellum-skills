@@ -39,6 +39,14 @@ const SESS_DIR = process.env.SHIM_SESSIONS_DIR || `${import.meta.dir}/sessions`;
 // throwaway process that is closed right after the answer. They do not occupy chat slots;
 // SHIM_MAX_ONESHOT is a separate OOM guard (~220 MB per process). 0 = unlimited.
 const MAX_ONESHOT = Number(process.env.SHIM_MAX_ONESHOT ?? 32);
+// router-oneuse-<hash> keys come from shim-router for Vellum internal call sites:
+// one logical task per key. The CLI is killed right after its turn completes, is
+// never parked to disk, never counted against MAX_LIVE, and is listed separately
+// from real chats in /chats. SHIM_MAX_ONEUSE is the OOM guard for tool-bearing
+// one-use chats (tool-less ones go through runEphemeral like any one-shot).
+const ONEUSE_RE = /^router-oneuse-/;
+const MAX_ONEUSE = Number(process.env.SHIM_MAX_ONEUSE ?? 16);
+const ONEUSE_IDLE_MS = Number(process.env.SHIM_ONEUSE_IDLE_MS ?? 15 * 60e3);
 const DEFAULT_MODEL = "sonnet";
 const SHIM_VERSION = "v3";
 const FALLBACK_MODEL = process.env.SHIM_FALLBACK_MODEL ?? "sonnet";   // "" disables; applied when it differs from the requested model
@@ -229,11 +237,13 @@ class Chat {
     this.effort = saved?.effort ?? null;
     this.cli = null;
     this.busy = false;
+    this.oneUse = false;
     this.lock = Promise.resolve();
   }
   get live() { return !!this.cli?.alive; }
   file() { return `${SESS_DIR}/${sha(this.key)}.json`; }
   save() {
+    if (this.oneUse) return; // one-use chats are never persisted
     try {
       writeFileSync(this.file(), JSON.stringify({ key: this.key, sessionId: this.sessionId, model: this.model, sent: this.sent, sysHash: this.sysHash, effort: this.effort, lastUsed: this.lastUsed, served: this.served, savedAt: Date.now() }));
     } catch (e) { console.error(`[sess] save failed ${short(this.key)}: ${e.message}`); }
@@ -244,7 +254,7 @@ class Chat {
       console.log(`[sess] ${short(this.key)} park (${reason}) cli${this.cli.id} session=${this.sessionId}`);
       this.cli.close(); this.cli = null;
     }
-    this.save();
+    if (!this.oneUse) this.save();
   }
 
   // Requests for one chat are serialised; Vellum sends full history each time.
@@ -259,7 +269,7 @@ class Chat {
     if (extra.signal?.aborted) { rel(); throw new Error("client went away while queued"); }
     this.releaseForTools = rel; // mcp mode: request layer releases once tool_calls are sent, so the follow-up can enter
     try { return await this._run(model, blocks, onMsg, effort, mcp, extra); }
-    finally { rel(); }
+    finally { rel(); if (this.oneUse) setTimeout(() => manager.maybeDestroyOneUse(this.key), 500); }
   }
 
   // No resets. The CLI transcript is the source of truth; Vellum's history is
@@ -344,6 +354,8 @@ class Chat {
 
 const manager = {
   chats: new Map(),
+  oneuse: new Map(),
+  oneuseWaiters: [],
   ephemeral: new Set(),
   reserved: 0,
   waiters: [],
@@ -351,6 +363,24 @@ const manager = {
     let n = this.reserved;
     for (const c of this.chats.values()) if (c.live) n++;
     return n;
+  },
+  liveOneUse() { let n = 0; for (const c of this.oneuse.values()) if (c.live) n++; return n; },
+  async getOneUse(key) {
+    let c = this.oneuse.get(key);
+    if (!c) { c = new Chat(key, null); c.oneUse = true; this.oneuse.set(key, c); }
+    // OOM guard: a new process waits when too many one-use CLIs are live; a
+    // continuation of an already-live chat passes (it spawns nothing).
+    while (!c.live && this.liveOneUse() >= MAX_ONEUSE) await new Promise((r) => this.oneuseWaiters.push(r));
+    return c;
+  },
+  maybeDestroyOneUse(key) {
+    const c = this.oneuse.get(key);
+    if (!c || c.busy) return;
+    for (const p of pendingToolUses.values()) if (p.chatKey === key) return; // tool round trip still in flight
+    console.log(`[sess] ${short(key)} oneuse turn done — cli closed, nothing persisted`);
+    if (c.cli) { c.cli.close(); c.cli = null; }
+    this.oneuse.delete(key);
+    const w = this.oneuseWaiters.shift(); if (w) w();
   },
   get(key) {
     let c = this.chats.get(key);
@@ -377,6 +407,14 @@ const manager = {
   kick() { const w = this.waiters.splice(0); for (const r of w) r(); },
   reap() {
     const now = Date.now();
+    for (const c of this.oneuse.values()) {
+      if (!c.busy && now - c.lastUsed > ONEUSE_IDLE_MS) {
+        console.log(`[sess] ${short(c.key)} oneuse idle reaped`);
+        if (c.cli) { c.cli.close(); c.cli = null; }
+        this.oneuse.delete(c.key);
+        const w = this.oneuseWaiters.shift(); if (w) w();
+      }
+    }
     for (const c of this.chats.values()) {
       if (c.live && !c.busy && now - c.lastUsed > IDLE_TTL_MS) c.park("idle");
       else if (!c.live && !c.busy && now - c.lastUsed > 24 * 3600e3) this.chats.delete(c.key); // disk copy stays
@@ -419,6 +457,13 @@ const manager = {
   },
   run(model, key, blocks, onMsg, effort = null, mcp = null, extra = {}) {
     if (!key) return this.runEphemeral(model, blocks, onMsg, "nokey", 3, effort, mcp, extra);
+    if (ONEUSE_RE.test(key)) {
+      // No tools -> throwaway process, killed in runEphemeral's finally. With tools the
+      // handler must outlive this HTTP response, so a transient Chat survives until the
+      // turn ends (maybeDestroyOneUse) and is then closed, never parked, never pooled.
+      if (!mcp) return this.runEphemeral(model, blocks, onMsg, `oneuse ${short(key)}`, 3, effort, mcp, extra);
+      return this.getOneUse(key).then((c) => c.run(model, blocks, onMsg, effort, mcp, extra));
+    }
     if (!this.chats.has(key) && this.isOneShot(blocks) && !mcp) return this.runEphemeral(model, blocks, onMsg, `oneshot ${short(key)}`, 3, effort, mcp, extra);
     return this.get(key).run(model, blocks, onMsg, effort, mcp, extra);
   },
@@ -440,12 +485,14 @@ const manager = {
   status() {
     return {
       version: SHIM_VERSION, verbatim: VERBATIM, fallbackModel: FALLBACK_MODEL || null, rateLimits: this.rateLimits?.info ?? null, maxLive: MAX_LIVE, maxOneshot: MAX_ONESHOT, idleTtlSec: IDLE_TTL_MS / 1000, live: this.liveCount(), oneshot: [...this.ephemeral].map((c) => ({ cli: c.id, label: c.label, model: c.model })), waiters: this.waiters.length, oneshotWaiters: this.oneshotWaiters.length,
+      maxOneuse: MAX_ONEUSE,
+      oneuseChats: [...this.oneuse.values()].map((c) => ({ key: short(c.key), live: c.live, busy: c.busy, cli: c.cli?.id ?? null, model: c.model, served: c.served, idleSec: Math.round((Date.now() - c.lastUsed) / 1000) })),
       chats: [...this.chats.values()].map((c) => ({ key: short(c.key), live: c.live, busy: c.busy, cli: c.cli?.id ?? null, model: c.model, actual: c.cli?.actualModel ?? null, served: c.served, sent: c.sent.length, session: c.sessionId, idleSec: Math.round((Date.now() - c.lastUsed) / 1000) })),
     };
   },
 };
 setInterval(() => manager.reap(), 60_000);
-process.on("SIGTERM", () => { for (const c of manager.chats.values()) c.park("shutdown"); process.exit(0); });
+process.on("SIGTERM", () => { for (const c of manager.chats.values()) c.park("shutdown"); for (const c of manager.oneuse.values()) { if (c.cli) c.cli.close(); } process.exit(0); });
 
 // ---------------------------------------------------------------------------
 // MCP tool mode. Vellum's tools are registered on the CLI as an in-process MCP

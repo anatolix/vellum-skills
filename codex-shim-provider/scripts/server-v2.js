@@ -131,6 +131,28 @@ function sessPath(key) { return join(SESS_DIR, sha1(key) + ".json"); }
 function loadState(key) { try { return JSON.parse(readFileSync(sessPath(key), "utf8")); } catch { return null; } }
 function saveState(key, st) { writeFileSync(sessPath(key), JSON.stringify(st)); }
 
+// router-oneuse-<hash> keys come from shim-router for Vellum internal call sites:
+// one logical task per key. State lives ONLY in memory (never in SESS_DIR, so one-use
+// threads never show in /chats monitoring), the thread is dropped right after its turn
+// completes, and an idle reaper sweeps tasks abandoned mid tool round trip.
+const ONEUSE_RE = /^router-oneuse-/;
+const oneUseStates = new Map(); // key -> state (memory only)
+const ONEUSE_IDLE_MS = Number(process.env.SHIM_ONEUSE_IDLE_MS ?? 15 * 60e3);
+function persistState(key, st) {
+  if (!key || !st) return;
+  if (ONEUSE_RE.test(key)) { st.lastUsedAt = Date.now(); oneUseStates.set(key, st); return; }
+  saveState(key, st);
+}
+setInterval(() => {
+  for (const [k, st] of oneUseStates) {
+    if (Date.now() - (st.lastUsedAt ?? 0) > ONEUSE_IDLE_MS) {
+      oneUseStates.delete(k);
+      if (st.threadId) { liveThreads.delete(st.threadId); threadHandlers.delete(st.threadId); }
+      log(`[oneuse] idle reaped ${k.slice(0, 32)}`);
+    }
+  }
+}, 60_000);
+
 // system prompt (no tools contract — tools are native now)
 function systemText(messages) {
   return (messages || []).filter(m => m.role === "system" || m.role === "developer")
@@ -201,7 +223,8 @@ async function handleChat(req) {
   }
   const effort = requestedEffort ?? process.env.SHIM_DEFAULT_EFFORT ?? "high";
 
-  let state = key ? loadState(key) : null;
+  const oneUse = ONEUSE_RE.test(key);
+  let state = oneUse ? (oneUseStates.get(key) ?? null) : key ? loadState(key) : null;
   let prevState = null, invalidReason = null;
   if (state && (state.model !== model || state.fingerprint !== fingerprint)) {
     prevState = state;
@@ -301,7 +324,7 @@ async function handleChat(req) {
           const threadId = r.thread.id;
           liveThreads.add(threadId);
           state = { threadId, sent: [], model, fingerprint, parked: {} };
-          if (key) saveState(key, state);
+          persistState(key, state);
           log("[guard] thread started:", threadId, "model:", model);
         } else if (!liveThreads.has(state.threadId)) {
           // thread not loaded in this app-server process (we restarted) — reload from disk
@@ -386,7 +409,7 @@ async function handleChat(req) {
               state.parked[callId] = { rpcId: m.id, name: m.params.tool };
               parkedCalls.push({ callId, name: m.params.tool, arguments: m.params.arguments });
               log(`[tool] parked ${m.params.tool}`);
-              if (key) saveState(key, state);
+              persistState(key, state);
               return new Promise(() => {}); // never resolved here; answered via srv.respond later
             }
             if (m.method === "currentTime/read") return { currentTimeAt: Math.floor(Date.now() / 1000) };
@@ -408,7 +431,7 @@ async function handleChat(req) {
               delete state.parked[tr.id];
             }
           }
-          if (key) saveState(key, state);
+          persistState(key, state);
         }
 
         if (prompt.trim()) {
@@ -424,7 +447,7 @@ async function handleChat(req) {
         }
         // mark fed
         state.sent = blocks.map(blockHash);
-        if (key) saveState(key, state);
+        persistState(key, state);
 
         // wait for turn completion (or first parked tool call); heartbeat every 15s so a
         // long silent turn (encrypted reasoning at high effort) is visible in the journal
@@ -481,6 +504,15 @@ async function handleChat(req) {
         res.close();
         closed = true;
         threadHandlers.delete(state.threadId);
+        if (oneUse) {
+          if (parkedCalls.length) {
+            persistState(key, state); // tool round trip pending: keep state in memory until it lands
+          } else {
+            oneUseStates.delete(key);
+            liveThreads.delete(state.threadId);
+            log(`[oneuse] ${key.slice(0, 32)} turn done — thread dropped, nothing persisted`);
+          }
+        }
         log(`[res] ${agentBuf.length} chars parked=${parkedCalls.length} ${Date.now() - t0}ms`);
       } catch (e) {
         log("[err]", e);
@@ -491,7 +523,7 @@ async function handleChat(req) {
   return new Response(stream, { headers });
 }
 
-function saveStateAndRethrow(key, st) { if (key && st) saveState(key, st); }
+function saveStateAndRethrow(key, st) { persistState(key, st); }
 
 Bun.serve({
   port: PORT,
