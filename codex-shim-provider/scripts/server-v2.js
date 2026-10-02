@@ -403,19 +403,19 @@ async function handleChat(req) {
           // effort: Vellum sends OpenAI-style reasoning_effort (or reasoning.effort); summary:
           // reasoning summaries must be requested per turn or codex emits empty reasoning items.
           let effort = body.reasoning_effort || body.reasoning?.effort || process.env.SHIM_DEFAULT_EFFORT || "high";
-          // Vellum strips `effort` for openai-compatible providers (not in EFFORT_SUPPORTED_PROVIDERS), so default high.
+          // Respect the model-supported floor and ceiling for caller-selected effort.
           const ok = (srv.modelEfforts || {})[model];
           if (effort && ok && ok.length && !ok.includes(effort)) {
             const order = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
             const want = order.indexOf(effort);
-            effort = ok.filter(e => order.indexOf(e) <= want).sort((a, b) => order.indexOf(b) - order.indexOf(a))[0] || ok[ok.length - 1];
+            effort = ok.filter(e => order.indexOf(e) <= want).sort((a, b) => order.indexOf(b) - order.indexOf(a))[0] || [...ok].sort((a, b) => order.indexOf(a) - order.indexOf(b))[0];
           }
-          if (effort) dbg("[effort]", body.reasoning_effort || body.reasoning?.effort, "->", effort);
+          if (effort) log(`[effort] model=${model} requested=${body.reasoning_effort || body.reasoning?.effort || "default"} effective=${effort}`);
           await srv.request("turn/start", {
             threadId: state.threadId,
             input: [{ type: "text", text: prompt, text_elements: [] }],
             summary: process.env.SHIM_REASONING_SUMMARY || "detailed",
-            ...(effort && effort !== "none" ? { effort: String(effort) } : {}),
+            ...(effort ? { effort: String(effort) } : {}),
           });
         }
         // mark fed

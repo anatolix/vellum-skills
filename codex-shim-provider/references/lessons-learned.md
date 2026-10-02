@@ -42,6 +42,9 @@ Codex-native shell/unified-exec/sub-agent activity can happen inside app-server,
 
 Thread-level summary configuration alone still produced empty reasoning items in observed runs. Pass `summary: "detailed"` in `turn/start`, and pass a supported effort. Vellum also stripped effort for `openai-compatible`; the second shared patch hunk preserves it. The adapter defaults to high when none is supplied. Model-side summary availability remains variable; an empty observation is not proof that summaries can never be enabled.
 
+## 8a. Effort end to end (Oct 2)
+Vellum never delivered `effort` to an openai-compatible shim even with a profile set to high: stripped in `retry.ts`, capped at xhigh in the chat-completions client, hidden in the profile editor. Fixed in Vellum (see setup §5 and `patches/`). Shim side: snap to the model's supported list in BOTH directions — a request below the floor (`none` on a reasoning-only model) takes the lowest supported tier, not the highest; a supported `none` is passed explicitly; the effective tier is logged as `[effort]`. Codex models advertise their own list via `model/list.supportedReasoningEfforts` (gpt-6.x: low…ultra; gpt-5.5: low…xhigh), so no hard-coded ceiling.
+
 ## 9. Honest thinking fallback uses observed token usage
 
 The user requested some visible thinking even when the model supplies no readable summary. Preserve a real summary when present; otherwise report the **current model step's** positive integer reasoning token count. Never invent thought text from encrypted content.

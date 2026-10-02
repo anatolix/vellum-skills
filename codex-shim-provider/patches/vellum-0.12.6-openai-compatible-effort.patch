@@ -1,0 +1,89 @@
+diff --git a/assistant/src/providers/__tests__/retry-callsite.test.ts b/assistant/src/providers/__tests__/retry-callsite.test.ts
+index 41a0eec3..0873334b 100644
+--- a/assistant/src/providers/__tests__/retry-callsite.test.ts
++++ b/assistant/src/providers/__tests__/retry-callsite.test.ts
+@@ -1494,3 +1494,29 @@ describe("RetryProvider — no callSite (pre-resolved config passes through)", (
+ // level, and bun's `mock.module` leaks across files in a single suite
+ // run — that pollutes `inference.test.ts` (which exercises the real
+ // SQLite-backed `getConnection`).
++
++
++describe("local shim effort transport", () => {
++  test("passes all effort levels to Claude and Codex over HTTP", async () => {
++    const { OpenAIChatCompletionsProvider } = await import("../openai/chat-completions-provider.js");
++    const requests: Array<Record<string, unknown>> = [];
++    const server = Bun.serve({port: 0, hostname: "127.0.0.1", async fetch(request) {
++      requests.push(await request.json() as Record<string, unknown>);
++      return new Response('data: {"id":"mock","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', {headers: {"Content-Type":"text/event-stream"}});
++    }});
++    try {
++      for (const model of ["claude-opus", "gpt-6-astra"]) {
++        const inner = new OpenAIChatCompletionsProvider("not-needed", model, {
++          providerName: "openai-compatible", maxReasoningEffort: "max", baseURL: `http://127.0.0.1:${server.port}/v1`,
++        });
++        const wrapped = new RetryProvider(inner);
++        for (const effort of ["none", "low", "medium", "high", "xhigh", "max"]) {
++          await wrapped.sendMessage(DUMMY_MESSAGES, {config: {
++            model, effort, thinking: {enabled: false}, conversationId: "effort-regression",
++          }});
++          expect(requests.at(-1)?.reasoning_effort).toBe(effort);
++        }
++      }
++    } finally { server.stop(true); }
++  });
++});
+diff --git a/assistant/src/providers/inference/adapter-factory.ts b/assistant/src/providers/inference/adapter-factory.ts
+index d98c21f7..cd0242e3 100644
+--- a/assistant/src/providers/inference/adapter-factory.ts
++++ b/assistant/src/providers/inference/adapter-factory.ts
+@@ -178,6 +178,8 @@ const ADAPTER_FACTORIES: Record<string, AdapterFactory> = {
+     new OpenAIChatCompletionsProvider(apiKey || "not-needed", model, {
+       providerName: "openai-compatible",
+       providerLabel: "OpenAI-compatible",
++      // Custom endpoints own their model-specific effort limits.
++      maxReasoningEffort: "max",
+       streamTimeoutMs,
+       // Replay thinking as `reasoning_content` so DeepSeek-compatible
+       // thinking-mode endpoints accept follow-up requests that include tools.
+diff --git a/assistant/src/providers/retry.ts b/assistant/src/providers/retry.ts
+index 9c0e7780..a7122ae9 100644
+--- a/assistant/src/providers/retry.ts
++++ b/assistant/src/providers/retry.ts
+@@ -91,6 +91,7 @@ const PROMPT_CACHE_KEY_PROVIDERS = new Set([
+ 
+ /** Providers that support the `effort` config (extended thinking / reasoning). */
+ const EFFORT_SUPPORTED_PROVIDERS = new Set([
++  "openai-compatible", // Local shims accept reasoning_effort.
+   "anthropic",
+   "openai",
+   "openrouter",
+diff --git a/clients/web/src/domains/settings/ai/profile-param-visibility.test.ts b/clients/web/src/domains/settings/ai/profile-param-visibility.test.ts
+index 1c1640a0..39e55311 100644
+--- a/clients/web/src/domains/settings/ai/profile-param-visibility.test.ts
++++ b/clients/web/src/domains/settings/ai/profile-param-visibility.test.ts
+@@ -293,3 +293,11 @@ describe("geminiThinkingLevels", () => {
+     ]);
+   });
+ });
++
++ test("openai-compatible shims expose effort without a conflicting thinking toggle", () => {
++  for (const model of ["claude-opus", "claude-sonnet", "claude-fable", "claude-haiku", "gpt-6-astra", "gpt-6.1-sol"]) {
++    const vis = resolveProfileParamVisibility("openai-compatible", model);
++    expect(vis.effort).toBe(true);
++    expect(vis.thinking).toBe(false);
++  }
++});
+diff --git a/clients/web/src/domains/settings/ai/profile-param-visibility.ts b/clients/web/src/domains/settings/ai/profile-param-visibility.ts
+index d38d7778..d4876f5b 100644
+--- a/clients/web/src/domains/settings/ai/profile-param-visibility.ts
++++ b/clients/web/src/domains/settings/ai/profile-param-visibility.ts
+@@ -173,6 +173,9 @@ function supportsEffort(
+   if (provider === "openai") {
+     return isOpenAIGptReasoningFamily(modelId);
+   }
++  if (provider === "openai-compatible") {
++    return true;
++  }
+   if (provider === "openrouter" || provider === "vercel-ai-gateway") {
+     if (isVendorPrefixedAnthropicModel(modelId)) {
+       return !modelId.includes("haiku") && supportsThinking;

@@ -167,6 +167,20 @@ not at the planning step, so an unforeseen re-feed path cannot bypass them. Mark
 Vellum's web client renders a ```diff fence with a `- ` line in red, so `SHIM_NOTICE_FMT=diff` is
 the default (`html`/`font`/`md` alternatives kept for other clients).
 
+## 38. Effort: pass every CLI tier, switch live through applyFlagSettings (Oct 2)
+The shim clamped xhigh/max to high and switched live effort through `q.updateSettings({effortLevel})`.
+Both were wrong for SDK 0.3.282: `EffortLevel` is `low|medium|high|xhigh|max` and the CLI already
+downgrades a tier the model lacks ("xhigh" → "high" on older models, org caps via maxEffortLevel),
+so the shim must not pre-clamp. `updateSettings(source, …)` writes a settings FILE (userSettings takes
+effortLevel only and does NOT change the running session); the session-scoped switch the VS Code host
+uses is `applyFlagSettings({effortLevel})` — accepts 'max' too (session-only, never persisted).
+Vellum side: `effort` never reached openai-compatible providers at all — `retry.ts` strips it
+(EFFORT_SUPPORTED_PROVIDERS), the chat-completions client caps at `maxReasoningEffort` (default xhigh,
+so "max" became xhigh), and the web profile editor hid the effort control for openai-compatible.
+Three-file Vellum patch: codex-shim-provider/patches/vellum-0.12.6-openai-compatible-effort.patch
+(shared with the Codex shim). Regression: scripts/test-effort.mjs (fake SDK; spawns all five tiers,
+live switches, none↔tier respawn). Journal shows `effort low -> max (live)` per switch.
+
 ## 37. "Full history" is a position test, not a count (Oct 1, 23:25)
 `unseen >= 8` fired on a plain 8-block tail after a shim restart (8/99) — a false positive that
 read as trash in the chat. The real anomaly is an unseen block positioned BEFORE the last block the

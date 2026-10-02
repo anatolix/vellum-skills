@@ -11,7 +11,7 @@ A separate sibling of `claude-code-shim-provider`. Use `scripts/server-v2.js`: o
 
 - Keep the `codex-chatgpt` connection, `codex-*` profiles, `codex-shim.service`, `~/codex-shim/` and port 8321 separate from Claude's equivalents. Inspect existing listeners/config before installation; do not overwrite a sibling provider or share its state directory.
 - Do not alter or restart the Claude service, its code, MCP bridge or configuration. Packaging/updating this skill does not itself authorize deployment or merging the implementations.
-- The optional Vellum patch edits a **shared** `retry.ts`. Review its diff and preserve other patches. It adds conversation headers and effort support for `openai-compatible`; it does not change the `anthropic` branch. Back up before changes and re-check sibling providers when applying it.
+- The optional Vellum patch edits a **shared** `retry.ts`. Review its diff and preserve other patches. It adds conversation headers and effort support for `openai-compatible`; it does not change the `anthropic` branch. Full effort pass-through also needs `patches/vellum-0.12.6-openai-compatible-effort.patch` (retry.ts set, adapter-factory ceiling, web profile editor) — see setup §5. Back up before changes and re-check sibling providers when applying it.
 - Never publish ChatGPT auth files, session/rollout data, raw conversation exports, credentials or private runtime configuration. The history reference contains technical decisions only.
 
 ## Install and authenticate

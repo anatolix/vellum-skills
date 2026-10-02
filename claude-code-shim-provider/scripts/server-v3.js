@@ -1,6 +1,6 @@
 // claude-shim v3 — fork of server.js (Sep 30) with the SDK features found in the VS Code extension:
 // verbatimPrompts, fallbackModel, maxBudgetUsd, flag settings (precompute compaction), live effort
-// switch via updateSettings, getContextUsage + rate_limit_event in the usage chunk, json_schema
+// switch via applyFlagSettings, getContextUsage + rate_limit_event in the usage chunk, json_schema
 // output for one-shots, actual-model reporting. See scratch/claude-vscode-ext-architecture.md.
 // OpenAI-compatible chat completions shim backed by Claude Code (Agent SDK + OAuth token).
 // Listens on 127.0.0.1:8317. Endpoints: POST /v1/chat/completions (SSE), GET /v1/models.
@@ -98,11 +98,11 @@ class Cli {
         // Thinking: adaptive by default; display:"summarized" is REQUIRED — without it
         // subscription traffic gets redacted blocks (empty text + signature, only
         // estimated_tokens). Summaries stream as thinking_delta → reasoning_content.
-        // reasoning_effort "none" disables thinking; xhigh/max clamp to high.
+        // reasoning_effort "none" disables thinking; supported effort tiers pass to the CLI.
         ...(effort === "none"
           ? { thinking: { type: "disabled" } }
           : { thinking: { type: "adaptive", display: "summarized" },
-              ...(effort ? { effort: ["low", "medium", "high"].includes(effort) ? effort : "high" } : {}) }),
+              ...(effort ? { effort: ["low", "medium", "high", "xhigh", "max"].includes(effort) ? effort : "high" } : {}) }),
       },
     });
     this.pump().catch(() => {});
@@ -195,8 +195,8 @@ class Cli {
     const cur = this.effort ?? null, nxt = effort ?? null;
     if (cur === nxt) return true;
     if (cur === "none" || nxt === "none" || nxt === null) return false;
-    const lvl = ["low", "medium", "high"].includes(nxt) ? nxt : "high";
-    try { await this.q.updateSettings({ effortLevel: lvl }); this.effort = nxt; console.log(`[cli${this.id} ${this.label}] effort ${cur} -> ${lvl} (live)`); return true; }
+    const lvl = ["low", "medium", "high", "xhigh", "max"].includes(nxt) ? nxt : "high";
+    try { await this.q.applyFlagSettings({ effortLevel: lvl }); this.effort = nxt; console.log(`[cli${this.id} ${this.label}] effort ${cur} -> ${lvl} (live)`); return true; }
     catch (e) { console.log(`[cli${this.id} ${this.label}] live effort change failed: ${String(e?.message || e).slice(0, 100)}`); return false; }
   }
 

@@ -54,7 +54,7 @@ Environment=SHIM_MAX_FEED=8
 
 Diagnostics: `SHIM_DEBUG=1`; normal defaults keep verbose per-event content logging off. Logs and session files are private.
 
-## 5. Add the optional conversation-header / effort patch
+## 5. Add the Vellum patches (conversation header, effort)
 
 Vellum versions that omit `prompt_cache_key` for `openai-compatible` need an explicit conversation header. Check live outgoing requests first. The shim deliberately returns 400 for background probes/jobs with no chat identity.
 
@@ -62,7 +62,9 @@ Vellum versions that omit `prompt_cache_key` for `openai-compatible` need an exp
 bash scripts/patch-vellum-retry.sh   "$HOME/.bun/install/global/node_modules/@vellumai/assistant/src/providers/retry.ts"
 ```
 
-The patch is independently idempotent for its two hunks, writes only after both anchors validate, and keeps a `.bak-conv-header` backup. Review the actual `retry.ts` diff. It preserves other provider patches and existing headers, but is shared infrastructure: re-check the Claude provider after application. Restart **your actual Vellum daemon** once its current turn completes; discover its unit name rather than copying a machine-specific name. Re-apply after upgrades if upstream still needs it. Do not blindly restore an old entire-file backup over newer upstream changes.
+Effort needs three more Vellum changes, shipped as one git patch against 0.12.6 in `patches/vellum-0.12.6-openai-compatible-effort.patch`: `retry.ts` adds `openai-compatible` to `EFFORT_SUPPORTED_PROVIDERS` (otherwise `effort` is stripped before the client), `adapter-factory.ts` sets `maxReasoningEffort: "max"` for `openai-compatible` (default ceiling `xhigh` silently rewrote `max`), and the web `profile-param-visibility.ts` shows the effort control for `openai-compatible` profiles (needs a web rebuild from the patched checkout and a copy of `dist/` into the runtime). Apply with `git apply` in a source checkout, or edit the runtime `src/` files by hand; the retry.ts hunk is also applied by `patch-vellum-retry.sh`. Verify on the wire: shim journal `[effort] model=… requested=max effective=max`.
+
+The header/effort script is independently idempotent for its two hunks, writes only after both anchors validate, and keeps a `.bak-conv-header` backup. Review the actual `retry.ts` diff. It preserves other provider patches and existing headers, but is shared infrastructure: re-check the Claude provider after application. Restart **your actual Vellum daemon** once its current turn completes; discover its unit name rather than copying a machine-specific name. Re-apply after upgrades if upstream still needs it. Do not blindly restore an old entire-file backup over newer upstream changes.
 
 ## 6. Quota-free smoke checks
 

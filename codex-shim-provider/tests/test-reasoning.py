@@ -57,8 +57,11 @@ def fake_server():
         if method == "initialize":
             reply(mid, {})
         elif method == "model/list":
-            reply(mid, {"data": [{"id": "mock-model", "hidden": False,
-                                  "supportedReasoningEfforts": [{"reasoningEffort": "high"}]}]})
+            reply(mid, {"data": [
+                {"id": name, "hidden": False, "supportedReasoningEfforts": [{"reasoningEffort": e} for e in efforts]}
+                for name, efforts in [("mock-model", ["high"]),
+                    ("effort-model", ["none", "low", "medium", "high", "xhigh"]),
+                    ("sparse-model", ["high", "low"])] ]})
         elif method == "thread/start":
             counter += 1
             reply(mid, {"thread": {"id": "thread-" + str(counter)}})
@@ -150,8 +153,10 @@ def run_tests():
                                 stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True)
         url = "http://127.0.0.1:" + str(port)
 
-        def request(case, *, key=None, tools=None, messages=None, header=False):
-            body = {"model": "mock-model", "messages": messages or [{"role": "user", "content": case}]}
+        def request(case, *, key=None, tools=None, messages=None, header=False, effort=None, model="mock-model", nested=False):
+            body = {"model": model, "messages": messages or [{"role": "user", "content": case}]}
+            if effort is not None:
+                body.update({"reasoning": {"effort": effort}} if nested else {"reasoning_effort": effort})
             headers = {"Content-Type": "application/json"}
             if key is None:
                 key = "test-" + case
@@ -346,6 +351,18 @@ def run_tests():
                 turns = [m["params"] for m in captured() if m.get("method") == "turn/start"]
                 assert all(x["summary"] == "detailed" and x["effort"] == "high" for x in turns), turns
             check("native-tools-off-and-per-turn-summary-effort", native_disabled)
+
+            def effort_levels():
+                for model, levels in [("effort-model", [(e,e) for e in ["none", "low", "medium", "high", "xhigh"]] + [("max", "xhigh")]),
+                                      ("sparse-model", [("none", "low"), ("medium", "low"), ("max", "high")])]:
+                    for wanted, expected in levels:
+                        request("effort-" + model + wanted, model=model, effort=wanted)
+                        turn = [m["params"] for m in captured() if m.get("method") == "turn/start"][-1]
+                        assert turn["effort"] == expected, (wanted, expected, turn)
+                request("nested-effort", model="effort-model", effort="medium", nested=True)
+                turn = [m["params"] for m in captured() if m.get("method") == "turn/start"][-1]
+                assert turn["effort"] == "medium", turn
+            check("effort-all-levels-none-floor-ceiling-and-nested", effort_levels)
 
             def live_thread_not_resumed():
                 before = len(captured())

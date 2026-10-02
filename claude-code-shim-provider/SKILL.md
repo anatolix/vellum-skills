@@ -81,7 +81,8 @@ Key ideas:
    subscription thinking blocks are redacted (empty text, only `estimated_tokens`).
    `thinking_delta` events are forwarded as SSE `delta.reasoning_content`, which Vellum
    renders as the thinking block. `reasoning_effort` from the request maps to SDK
-   `effort` (xhigh/max clamp to high); `"none"` disables thinking. Mid-chat effort change
+   `effort` — all five CLI tiers pass through (low/medium/high/xhigh/max, the CLI itself downgrades
+   a tier the model lacks); `"none"` disables thinking. Mid-chat effort change
    parks + respawns the process (same as system-prompt change).
 5. **Compaction** on the Vellum side just shows up as one new unseen block (the summary)
    — fed as text, the CLI keeps its own full transcript.
@@ -224,7 +225,7 @@ cp {baseDir}/scripts/claude-shim.service ~/.config/systemd/user/   # fix paths/a
 
 Three instances run on this VM: `:8317` claude-shim (text/prompt-contract tools, stable,
 never restart), `:8318` shim-mcp-test (`SHIM_TOOL_MODE=mcp`, experimental), `:8320` shim-v3
-(`server-v3.js`: verbatimPrompts, fallbackModel, effort switch via updateSettings, precompute
+(`server-v3.js`: verbatimPrompts, fallbackModel, effort switch via applyFlagSettings (live, all tiers), precompute
 compaction, context_usage/rate_limits/actual_model in usage — see lessons 33–34 and
 `scripts/server-v3.js`).
 - Thinking: always spawned with `display:"summarized"`; raw CoT never available on
