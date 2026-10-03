@@ -14,6 +14,10 @@ Clone and copy the skill folder into your assistant's workspace `skills/` direct
 
 ## Skills
 
+### [configure-ai-proxy](configure-ai-proxy/SKILL.md)
+
+Configure authenticated HTTP/HTTPS proxies for local **Claude Code, the Claude Code VS Code extension, Claude Desktop, and Codex**. Includes separate client configuration paths, a loopback GOST forwarder and macOS LaunchAgent for Claude Desktop, diff-before-write and backup procedures, rollback, and a credential-safe API connectivity probe. The Russian-language runbook documents 14 observed failure modes and separates verified results from version-specific assumptions, including the conditional Codex HTTP/WebSocket fallback. Based on a macOS arm64 setup verified on 2026-10-03; this configures client networking, not a Vellum model-provider shim.
+
 ### [tei-setup-for-vellum](tei-setup-for-vellum/SKILL.md)
 
 Replace Vellum's two local ONNX embed-worker processes with a single shared [Text Embeddings Inference](https://github.com/huggingface/text-embeddings-inference) (TEI) server — **without Docker** — and switch the embedding model to **BAAI/bge-m3 (int8)**.

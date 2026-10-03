@@ -1,0 +1,4 @@
+interface:
+  display_name: "Прокси для Claude и Codex"
+  short_description: "Настройка и диагностика прокси Claude и Codex"
+  default_prompt: "Используй $configure-ai-proxy, чтобы настроить Claude и Codex через прокси с diff, backup и проверкой фактического маршрута."
