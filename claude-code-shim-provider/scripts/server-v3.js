@@ -14,21 +14,19 @@ import { mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 
 import { z } from "zod";
+import { NoticeTransport, noticeText, noticeFrame } from "./notice-transport.js";
+const noticeTransport = new NoticeTransport();
 const TOOL_MODE = process.env.SHIM_TOOL_MODE || "mcp"; // mcp | text
 const BATCH_IDLE_MS = Number(process.env.SHIM_BATCH_IDLE_MS || 5000);
 const TOOL_WAIT_MS = Number(process.env.SHIM_TOOL_WAIT_SEC || 3600) * 1000; // how long a tool_use may wait for Vellum's result (approvals)
 const FULL_HIST_MIN = Number(process.env.SHIM_FULL_HIST_MIN || 8); // feeding >= this many unseen blocks = full-history re-feed, warn in chat
-// Red-ish in-chat notices from the shim. Markdown has no colour; format is picked by SHIM_NOTICE_FMT: html | font | diff | md
-const NOTICE_FMT = process.env.SHIM_NOTICE_FMT || "diff";
-function fmtNotice(body) {
-  if (NOTICE_FMT === "font") return `<font color="red">${body}</font>\n\n`;
-  if (NOTICE_FMT === "diff") return "```diff\n" + body.split("\n").map((l) => "- " + l).join("\n") + "\n```\n";
-  if (NOTICE_FMT === "md") return `> 🔴 **${body}**\n\n`;
-  return `<span style="color:red">${body}</span>\n\n`;
-}
+// Diagnostics use their own transport, never model prose or reasoning.
 function shimNotice(onMsg, tag, text) {
   console.log(`[notice ${tag}] ${text}`);
-  onMsg({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: fmtNotice(`[shim] ${text}`) } } });
+  onMsg({ type: "shim_notice", text });
+}
+function diagnostic(onMsg, tag, event, detail) {
+  shimNotice(onMsg, tag, noticeText("claude-shim", event, detail));
 }
 const PORT = Number(process.env.SHIM_PORT || 8317);
 
@@ -157,6 +155,12 @@ class Cli {
   die(err) {
     if (!this.alive) return;
     this.alive = false;
+    if (err && !this.done) for (const chat of manager.chats.values()) {
+      if (chat.cli === this) {
+        chat.pendingNotices.push(noticeText("claude-shim", "CLI завершён", `${this.model}; ${String(err.message || err).slice(0, 120)}`));
+        chat.save();
+      }
+    }
     if (err) console.log(`[cli${this.id} ${this.label}] dead: ${String(err?.message || err).slice(0, 200)}`);
     if (this.done) { const d = this.done; this.done = null; this.onMsg = null; d.reject(err || new Error("closed")); }
     this.wake?.(); this.wake = null;
@@ -236,6 +240,8 @@ class Chat {
     this.sysHash = saved?.sysHash ?? null;
     this.effort = saved?.effort ?? null;
     this.cli = null;
+    this.pendingNotices = saved?.pendingNotices ?? [];
+    this.parkedWhy = saved?.parkedWhy ?? null;
     this.busy = false;
     this.oneUse = false;
     this.lock = Promise.resolve();
@@ -245,13 +251,14 @@ class Chat {
   save() {
     if (this.oneUse) return; // one-use chats are never persisted
     try {
-      writeFileSync(this.file(), JSON.stringify({ key: this.key, sessionId: this.sessionId, model: this.model, sent: this.sent, sysHash: this.sysHash, effort: this.effort, lastUsed: this.lastUsed, served: this.served, savedAt: Date.now() }));
+      writeFileSync(this.file(), JSON.stringify({ key: this.key, sessionId: this.sessionId, model: this.model, sent: this.sent, sysHash: this.sysHash, effort: this.effort, lastUsed: this.lastUsed, served: this.served, savedAt: Date.now(), pendingNotices: this.pendingNotices, parkedWhy: this.parkedWhy }));
     } catch (e) { console.error(`[sess] save failed ${short(this.key)}: ${e.message}`); }
   }
   park(reason) {
     this.parkedWhy = reason;
     if (this.cli) {
       console.log(`[sess] ${short(this.key)} park (${reason}) cli${this.cli.id} session=${this.sessionId}`);
+      this.pendingNotices.push(noticeText("claude-shim", "CLI завершён", `${this.model}; ${reason}`));
       this.cli.close(); this.cli = null;
     }
     if (!this.oneUse) this.save();
@@ -310,12 +317,15 @@ class Chat {
     for (let attempt = 0; attempt < 2; attempt++) {
       let produced = false;
       const t0 = Date.now();
+      let startedCli = false;
       try {
         if (!this.live) {
+          startedCli = true;
           this.cli = await manager.spawn(short(this.key), model, this.sessionId, sys, effort, mcp, { maxBudgetUsd: extra.maxBudgetUsd });
           why += this.sessionId ? " resume" : " spawn";
           this.sysHash = sysHash;
         }
+        if (!startedCli && this.model !== model && this.live) diagnostic(onMsg, short(this.key), "Смена модели", `${this.model} → ${model}`);
         await this.cli.setModel(model);
         this.model = model;
         if (TOOL_MODE === "mcp") await this.cli.setTools(mcp);
@@ -325,15 +335,18 @@ class Chat {
         for (const h of hashes) seen.add(h);
         if (TOOL_MODE === "mcp") { this.sent = [...seen]; this.save(); }
         // emitted at the point of the actual send so any re-feed path is caught, foreseen or not
-        const notes = [];
-        if (why.startsWith("new")) notes.push(`new chat session on this shim: ${unseen.length} history blocks fed${unseen.length >= FULL_HIST_MIN ? " (model switch?)" : ""}`);
-        else if (why.includes("resume")) notes.push(`resumed session ${String(this.sessionId).slice(0, 8)} after ${this.parkedWhy ?? "restart"}: tail of ${unseen.length} new blocks`);
-        // anomaly = unseen blocks positioned BEFORE the last block this chat has already seen (history rewritten / re-fed), or nothing matches at all
+        for (const note of this.pendingNotices.splice(0)) shimNotice(onMsg, short(this.key), note);
+        this.save();
+        if (startedCli) {
+          diagnostic(onMsg, short(this.key), "Старт", `${model}; ${this.sessionId ? "из файла" : "с нуля"}`);
+          startedCli = false;
+        }
+        const matched = hashes.filter(h => prior.has(h)).length;
+        if (unseen.length > FULL_HIST_MIN) diagnostic(onMsg, short(this.key), "Большой контекст", `+${unseen.length} блоков; видено=${matched}/${inputs.length}`);
         let lastSeenIdx = -1; for (let i = 0; i < hashes.length; i++) if (prior.has(hashes[i])) lastSeenIdx = i;
         const refed = inputs.map((b, i) => i).filter((i) => !prior.has(hashes[i]) && i < lastSeenIdx && !(inputs[i].role === "tool" && inputs[i].consumed));
-        if (refed.length) notes.push(`WARNING: ${refed.length} block(s) from already-seen history re-fed (positions ${refed.slice(0, 6).join(",")}${refed.length > 6 ? ",…" : ""}; last seen block at ${lastSeenIdx}/${inputs.length})`);
-        else if (prior.size && lastSeenIdx < 0) notes.push(`WARNING: none of ${inputs.length} blocks match this chat's ${prior.size} known blocks — full history re-feed`);
-        if (notes.length) shimNotice(onMsg, short(this.key), notes.join("\n"));
+        if (refed.length) diagnostic(onMsg, short(this.key), "История изменилась", `+${refed.length} до хвоста; отправляю=${unseen.length}; видено=${matched}/${inputs.length}`);
+        else if (prior.size && lastSeenIdx < 0) diagnostic(onMsg, short(this.key), "История не совпала", `отправляю=${unseen.length}; видено=0/${inputs.length}`);
         const res = await this.cli.send(prompt, (m) => { produced = true; onMsg(m); });
         this.sent = [...seen]; this.sessionId = res.session_id || this.cli.sessionId; this.model = model; this.effort = effort ?? null; this.served++; this.lastUsed = Date.now();
         res.shim_actual_model = this.cli?.actualModel ?? null;
@@ -342,11 +355,13 @@ class Chat {
         console.log(`[sess] ${short(this.key)} served #${this.served} model=${model} prep=${tPrep}ms total=${Date.now() - t0}ms in=${res.usage?.input_tokens ?? "?"} cache_read=${res.usage?.cache_read_input_tokens ?? "?"} session=${this.sessionId}`);
         return res;
       } catch (e) {
+        diagnostic(onMsg, short(this.key), "Ошибка CLI", `${model}; ${String(e?.message || e).slice(0, 120)}`);
         this.cli?.die(e); this.cli = null;
         if (produced || attempt) throw e;
         // Resume failed (session file gone, CLI upgrade, ...): start over with the full history.
         console.log(`[sess] ${short(this.key)} resume failed, starting fresh: ${String(e?.message || e).slice(0, 120)}`);
-        this.sessionId = null; this.sent = []; seen.clear(); unseen = inputs; why = "fresh";
+        diagnostic(onMsg, short(this.key), "Восстановление не удалось", `${model}; с нуля; ${inputs.length} блоков`);
+        this.sessionId = null; this.sent = []; seen.clear(); prior.clear(); unseen = inputs; why = "fresh";
       }
     }
   }
@@ -431,7 +446,8 @@ const manager = {
       try {
         const t0 = Date.now();
         const ib = inputBlocks(blocks);
-        if (ib.length >= FULL_HIST_MIN) shimNotice(onMsg, tag, `WARNING: ${ib.length} history blocks fed to a one-shot process (${tag}) — no live chat session`);
+        diagnostic(onMsg, tag, "Старт", `${model}; с нуля; одноразовый`);
+        if (ib.length > FULL_HIST_MIN) diagnostic(onMsg, tag, "Большой контекст", `+${ib.length} блоков; видено=0/${ib.length}`);
         const res = await cli.send(blocksToPrompt(ib), (m) => { produced = true; onMsg(m); });
         res.shim_actual_model = cli.actualModel;
         if (CTX_USAGE) res.shim_context_usage = await cli.contextUsage();
@@ -442,6 +458,7 @@ const manager = {
         if (produced) throw e;
         console.log(`[${tag}] retry ${a + 1}/${attempts} after: ${String(e?.message || e).slice(0, 120)}`);
       } finally {
+        diagnostic(onMsg, tag, "CLI завершён", `${model}; одноразовый завершён`);
         this.ephemeral.delete(cli); cli.close();
         const w = this.oneshotWaiters.shift(); if (w) w();
       }
@@ -956,7 +973,9 @@ Bun.serve({
   port: PORT,
   idleTimeout: 255, // Bun default 10s kills slow Claude Code spawns
   hostname: "127.0.0.1",
-  async fetch(req) {
+  async fetch(req) { return noticeTransport.fetch(req, handleRequest); },
+});
+async function handleRequest(req) {
     const url = new URL(req.url);
 
     if (url.pathname === "/v1/models" && req.method === "GET") {
@@ -1029,6 +1048,7 @@ Bun.serve({
           // a fixed window from the first block cut Fable off mid-batch while it was still writing arguments)
           const kickBatchTimer = () => { if (!toolUses.length || batchWhy) return; clearTimeout(batchTimer); batchTimer = setTimeout(() => closeBatch("idle"), BATCH_IDLE_MS); };
           const runPromise = manager.run(sdkModel, cacheKey, blocks, (msg) => {
+            if (msg.type === "shim_notice") { send(noticeFrame(msg.text)); return; }
             if (ac.aborted) return; // dead request: tool batches stay in cli.unobserved for the next one
             if (mcpMode && msg.type === "assistant") {
               const tus = (msg.message?.content || []).filter((b) => b.type === "tool_use");
@@ -1150,7 +1170,6 @@ Bun.serve({
         connection: "keep-alive",
       },
     });
-  },
-});
+}
 
 console.log(`claude-shim ${SHIM_VERSION} listening on 127.0.0.1:${PORT} verbatim=${VERBATIM} fallback=${FALLBACK_MODEL || "off"} ctxUsage=${CTX_USAGE} precompact=${PRECOMPUTE_COMPACT} snapshot=${SYS_SNAPSHOT} (tools: ${TOOL_MODE === "mcp" ? "sdk-mcp" : "prompt-contract"}, one cli per chat, maxLive=${MAX_LIVE}, idleTtl=${IDLE_TTL_MS/1000}s)`);

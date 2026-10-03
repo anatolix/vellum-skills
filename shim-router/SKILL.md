@@ -139,6 +139,9 @@ Do not route `mainAgent`, realtime voice/call classifiers, or anchored vision/pr
 
 ## Diagnostics
 
+`router-oneuse-*` requests never get in-chat red notices from the shims (log-only `[shim-notice]`),
+so cascade answers stay clean JSON/text. See the shims' `references/shim-notices.md`.
+
 ```bash
 curl -s http://127.0.0.1:8322/health | python3 -m json.tool
 journalctl --user -u shim-router --since -1h --no-pager

@@ -225,7 +225,7 @@ cp {baseDir}/scripts/claude-shim.service ~/.config/systemd/user/   # fix paths/a
 
 Three instances run on this VM: `:8317` claude-shim (text/prompt-contract tools, stable,
 never restart), `:8318` shim-mcp-test (`SHIM_TOOL_MODE=mcp`, experimental), `:8320` shim-v3
-(`server-v3.js`: verbatimPrompts, fallbackModel, effort switch via applyFlagSettings (live, all tiers), precompute
+(`server-v3.js` + `notice-transport.js` beside it — copy both: verbatimPrompts, fallbackModel, effort switch via applyFlagSettings (live, all tiers), precompute
 compaction, context_usage/rate_limits/actual_model in usage — see lessons 33–34 and
 `scripts/server-v3.js`).
 - Thinking: always spawned with `display:"summarized"`; raw CoT never available on
@@ -393,6 +393,15 @@ it), register it as a separate provider connection (`claude-code-mcp`, profiles
 To drive a real Vellum agent turn on that profile without a human:
 `assistant conversations new t --json` → `assistant inference session open <profile>
 --conversation-id <id>` → `assistant conversations wake <id> --persist --hint '<task>'`.
+
+## In-chat diagnostics
+
+v3 shows lifecycle events (CLI start/resume, CLI death/park, model change, >8 blocks fed,
+history mismatch, errors) as short red lines in the Vellum chat. It uses a fake failed call to
+the unregistered tool `__shim_notice__`, handled by `scripts/notice-transport.js`. Read
+[references/shim-notices.md](references/shim-notices.md) before touching notice texts or the transport.
+Keep texts short, because the UI truncates them. Offline tests: `node --test tests/test-notice-transport.mjs`,
+`bun tests/test-notice-lifecycle.mjs` (needs `node_modules` symlinked at the skill root).
 
 ## Verification
 

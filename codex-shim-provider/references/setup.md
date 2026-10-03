@@ -32,7 +32,7 @@ Do not replace files while a turn is in flight. Back up a previous deployment an
 
 ```bash
 mkdir -p "$HOME/codex-shim" "$HOME/.config/systemd/user"
-cp scripts/server-v2.js scripts/server.js scripts/run.sh "$HOME/codex-shim/"
+cp scripts/server-v2.js scripts/notice-transport.js scripts/server.js scripts/run.sh "$HOME/codex-shim/"
 chmod +x "$HOME/codex-shim/run.sh"
 cp scripts/codex-shim.service "$HOME/.config/systemd/user/"
 systemctl --user daemon-reload

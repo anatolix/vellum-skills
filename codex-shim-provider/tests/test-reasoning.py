@@ -166,12 +166,22 @@ def run_tests():
                 body["prompt_cache_key"] = key
             if tools:
                 body["tools"] = tools
-            req = urllib.request.Request(url + "/v1/chat/completions", json.dumps(body).encode(), headers)
-            with urllib.request.urlopen(req, timeout=8) as response:
-                wire = response.read().decode()
-            assert wire.endswith("data: [DONE]\n\n"), wire
-            chunks = [json.loads(line[6:]) for line in wire.splitlines()
-                      if line.startswith("data: ") and line != "data: [DONE]"]
+            for diagnostic_round in range(20):
+                req = urllib.request.Request(url + "/v1/chat/completions", json.dumps(body).encode(), headers)
+                with urllib.request.urlopen(req, timeout=8) as response:
+                    wire = response.read().decode()
+                assert wire.endswith("data: [DONE]\n\n"), wire
+                chunks = [json.loads(line[6:]) for line in wire.splitlines()
+                          if line.startswith("data: ") and line != "data: [DONE]"]
+                calls = [t for c in chunks for choice in c.get("choices", []) for t in choice.get("delta", {}).get("tool_calls", [])]
+                if len(calls) != 1 or calls[0].get("function", {}).get("name") != "__shim_notice__":
+                    break
+                t = calls[0]
+                assert not any(choice.get("delta", {}).get("reasoning_content") for c in chunks for choice in c.get("choices", [])), wire
+                body["messages"] += [{"role":"assistant","content":"---","tool_calls":[t]},
+                                     {"role":"tool","tool_call_id":t["id"],"content":"Unknown tool"}]
+            else:
+                raise AssertionError("diagnostic loop")
             return chunks
 
         def thinking(chunks):
@@ -294,7 +304,7 @@ def run_tests():
 
             def new_thread():
                 text = content(request("new-thread", key="guard-new"))
-                assert "новый тред ChatGPT" in text and "скармливаю 1 блоков" in text, text
+                assert "] Старт: " in log_text() and "с нуля" in log_text(), log_text()
             check("new-thread-notice", new_thread)
 
             def threshold():
@@ -303,7 +313,7 @@ def run_tests():
                 assert "REPLAY-SUSPECT" not in text, text
                 text = content(request("nine", key="guard-nine", messages=eight + [
                     {"role": "user", "content": "threshold-8"}]))
-                assert "REPLAY-SUSPECT: 9 unseen" in text and "лимит 8" in text, text
+                assert "+9 блоков" in log_text() and "видено=0/9" in log_text(), log_text()
             check("replay-threshold-strictly-more-than-eight", threshold)
 
             def unseen_only():
@@ -329,7 +339,7 @@ def run_tests():
                 messages = [{"role": "assistant", "content": "already generated " + str(i)} for i in range(20)]
                 messages.append({"role": "user", "content": "one unseen block"})
                 text = content(request("assistant-skip", messages=messages))
-                assert "скармливаю 1 блоков" in text and "REPLAY-SUSPECT" not in text, text
+                assert "REPLAY-SUSPECT" not in text and "feed=1 blocks" in log_text(), log_text()
             check("assistant-history-is-not-fed", assistant_skipped)
 
             def invalidation():
@@ -338,7 +348,7 @@ def run_tests():
                 text = content(request("after-change", key="guard-change", messages=[
                     {"role": "system", "content": "changed system"},
                     {"role": "user", "content": "after-change"}]))
-                assert "сессия инвалидирована" in text and "fingerprint" in text, text
+                assert "Сессия заменена" in log_text()[before:] and "настройки изменились" in log_text()[before:], log_text()[before:]
                 assert "DIFF prev:" in log_text()[before:]
             check("invalidation-notice-and-prior-state-diff", invalidation)
 
@@ -414,7 +424,7 @@ def run_tests():
             def disk_resume():
                 before = len(captured())
                 text = content(request("disk-two", key="guard-disk"))
-                assert "поднят с диска" in text and "новых 1" in text, text
+                assert "из файла" in log_text(), log_text()
                 calls = captured()[before:]
                 assert sum(m.get("method") == "thread/resume" for m in calls) == 1, calls
                 assert not any(m.get("method") == "thread/start" for m in calls), calls

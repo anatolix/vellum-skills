@@ -19,6 +19,9 @@ import { spawn } from "bun";
 import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { join } from "path";
+import { NoticeTransport, noticeText, noticeFrame } from "./notice-transport.js";
+const noticeTransport = new NoticeTransport();
+const threadOwners = new Map();
 
 const PORT = Number(process.env.SHIM_PORT || 8321);
 const HOME = process.env.HOME;
@@ -46,7 +49,7 @@ class AppServer {
     this.proc.exited.then(code => {
       log("[appserver] exited", code, "— failing pending and restarting");
       for (const [, p] of this.pending) p.rej(new Error("app-server died"));
-      this.onExit?.();
+      this.onExit?.(code);
       this.pending.clear();
       setTimeout(() => this.start(), 2000);
     });
@@ -107,7 +110,13 @@ srv.start();
 // per-thread handler registry (multiple concurrent conversations)
 const threadHandlers = new Map(); // threadId -> { notif(method,p), request(m) }
 const liveThreads = new Set();    // threads loaded in the current app-server process
-srv.onExit = () => liveThreads.clear();
+srv.onExit = code => {
+  for (const [tid, owner] of threadOwners) {
+    noticeTransport.queue(owner.key, noticeText("codex-shim", "CLI завершён", `${owner.model}; код=${code}`));
+    threadHandlers.get(tid)?.notif("turn/completed", {turn:{status:"failed",error:{message:`app-server exited (${code})`}}});
+  }
+  liveThreads.clear(); threadOwners.clear();
+};
 srv.onNotification = (method, p) => {
   const h = p.threadId && threadHandlers.get(p.threadId);
   if (h) h.notif(method, p);
@@ -298,24 +307,18 @@ async function handleChat(req) {
         sse(res, { ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
         res.write("data: [DONE]\n\n"); res.close();
       };
-      // user-visible guard notice: goes into the chat as an italic prefix line.
-      // Safe: assistant messages are never fed back to codex (blocksOf skips them).
-      const noticed = [];
-      const notice = txt => {
-        if (noticed.includes(txt)) return;
-        noticed.push(txt);
-        log(`[guard] notice -> chat: ${txt}`);
-        sse(res, { ...base, choices: [{ index: 0, delta: { content: `_⚙ шим: ${txt}_\n\n` } }] });
+      const noticed = new Set();
+      const notice = (event, detail) => {
+        const txt = noticeText("codex-shim", event, detail);
+        if (noticed.has(txt)) return;
+        noticed.add(txt); log(`[guard] ${txt}`); res.write(noticeFrame(txt));
       };
       try {
         // --- ensure thread ---
         if (!state) {
           log(`[guard] NEW THREAD key=${key.slice(0, 12)} reason=${invalidReason ? "state invalidated: " + invalidReason : "no prior state"} feed=${feedCount} blocks (~${feedChars} chars) sys=${sys.length} chars tools=${tools ? tools.length : 0}`);
           if (prevState) log(`[guard] DIFF prev: thread=${prevState.threadId} model=${prevState.model} sent=${(prevState.sent || []).length} blocks fp=${String(prevState.fingerprint).slice(0, 8)}`);
-          notice(prevState
-            ? `сессия инвалидирована (${invalidReason}) — поднимаю НОВЫЙ тред ChatGPT, скармливаю ${feedCount} блоков истории`
-            : `новый тред ChatGPT (модель ${model}, инструментов ${tools ? tools.length : 0}, системный промпт ${(sys.length / 1000).toFixed(1)}k chars, скармливаю ${feedCount} блоков)`);
-          if (feedCount > MAX_FEED) notice(`⚠ REPLAY-SUSPECT: ${feedCount} unseen блоков за один запрос (лимит ${MAX_FEED}) — похоже на переигровку всей истории!`);
+          if (prevState) notice("Сессия заменена", [prevState.model !== model ? `${prevState.model} → ${model}` : null, prevState.fingerprint !== fingerprint ? "настройки изменились" : null].filter(Boolean).join("; "));
           const dynTools = (tools || []).map(t => ({ type: "function", name: t.function.name,
             description: t.function.description || "", inputSchema: t.function.parameters || { type: "object" } }));
           const r = await srv.request("thread/start", {
@@ -333,24 +336,32 @@ async function handleChat(req) {
           });
           const threadId = r.thread.id;
           liveThreads.add(threadId);
+          if (!oneUse) threadOwners.set(threadId, {key, model});
+          notice("Старт", `${model}; с нуля`);
           state = { threadId, sent: [], model, fingerprint, parked: {} };
           persistState(key, state);
           log("[guard] thread started:", threadId, "model:", model);
         } else if (!liveThreads.has(state.threadId)) {
           // thread not loaded in this app-server process (we restarted) — reload from disk
           log(`[guard] RESUME thread=${state.threadId} key=${key.slice(0, 12)} alreadyFed=${(state.sent || []).length} new=${feedCount} (${userBlocks.length} user + ${toolResults.length} tool) parked=${Object.keys(state.parked || {}).length}`);
-          notice(`тред ChatGPT поднят с диска после рестарта шима (скормлено ${(state.sent || []).length}, новых ${feedCount}, припарковано ${Object.keys(state.parked || {}).length})`);
+
           try {
             await srv.request("thread/resume", { threadId: state.threadId, excludeTurns: true });
             liveThreads.add(state.threadId);
+            if (!oneUse) threadOwners.set(state.threadId, {key, model});
+            notice("Старт", `${model}; из файла; видено=${state.sent?.length || 0}`);
+            if (Object.keys(state.parked || {}).length) notice("Потеря tool call", `${Object.keys(state.parked).length}`);
             state.parked = {}; // rpc ids died with the old process
           } catch (e) {
             log("[sess] resume failed, fresh thread:", String(e).slice(0, 120));
             try { unlinkSync(sessPath(key)); } catch {}
+            notice("Восстановление не удалось", `${model}; повторите запрос`);
             return fail("thread lost after restart, please retry");
           }
         }
 
+        if (!oneUse) threadOwners.set(state.threadId, {key, model});
+        if (feedCount > MAX_FEED) notice("Большой контекст", `${model}; +${feedCount} блоков; видено=${blocks.length-feedCount}/${blocks.length}`);
         // --- run turn (handlers FIRST — answering a parked call resumes the turn immediately) ---
         const parkedCalls = [];
         const usage = { input: 0, output: 0, cached: 0, reasoning: null };
@@ -496,6 +507,7 @@ async function handleChat(req) {
           finish("tool_calls");
           log(`[res] tool_calls=${parkedCalls.map(c => c.name).join(",")} ${Date.now() - t0}ms`);
         } else if (turnError) {
+          notice("Ошибка CLI", `${model}; ${String(turnError).slice(0, 120)}`);
           sse(res, { ...base, choices: [{ index: 0, delta: { content: agentBuf ? "" : "⚠ codex: " + String(turnError).slice(0, 500) } }] });
           finish("stop");
         } else {
@@ -538,7 +550,9 @@ Bun.serve({
   port: PORT,
   hostname: "127.0.0.1",
   idleTimeout: 255,
-  async fetch(req) {
+  async fetch(req) { return noticeTransport.fetch(req, handleRequest); },
+});
+async function handleRequest(req) {
     const url = new URL(req.url);
     if (url.pathname === "/v1/models" && req.method === "GET") {
       return jsonResp({ object: "list", data: models().map(m => ({ id: m, object: "model", created: 0, owned_by: "codex-cli" })) });
@@ -557,7 +571,6 @@ Bun.serve({
       return jsonResp({ chats });
     }
     return jsonResp({ error: "not found" }, 404);
-  },
-});
+}
 
 log(`codex-shim v2 listening on 127.0.0.1:${PORT} (app-server, sandbox=${SANDBOX})`);

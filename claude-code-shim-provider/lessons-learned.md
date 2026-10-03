@@ -157,7 +157,7 @@ excludeDynamicSections (preset prompts only), side_question (bridge-only in 0.3.
 Also from the rate_limit_event: subscription 7-day window was at 98–99 % — watch it
 before trusting Opus/Fable through any shim.
 
-## 36. In-chat notices live at the send point, rendered red via a ```diff block (Oct 1, 23:20)
+## 36. In-chat notices live at the send point, rendered red via a ```diff block (Oct 1, 23:20) — SUPERSEDED by §39
 Anatoly's safety rules: (a) a request without `prompt_cache_key` gets 400 — never build a session
 for a keyless full history; (b) any time ≥ `SHIM_FULL_HIST_MIN` (8) unseen blocks are fed to the
 CLI, say so in the chat — the only legitimate case is a chat that just switched onto this
@@ -190,3 +190,13 @@ chat has already seen (history rewritten or re-fed), or a known chat whose block
 of any length is normal. Notices are now one combined diff block per send; the resume line carries
 the park reason (`after shutdown` = shim restart, `after idle`, `after system changed`…), so a
 resume right after a restart is not mistaken for an idle eviction.
+
+## 39. Red notices via a fake failed tool call, not text (Oct 3)
+The diff-fence notices polluted the model's own text and fed back into history. Vellum web
+renders a failed tool call's activity label as a separate red line, which Anatoly proved with `bash false`.
+Notices now ride on a call to the unregistered `__shim_notice__`. The transport ends the HTTP response,
+parks the upstream reader, and resumes the same reader when Vellum returns the "Unknown tool" result. It
+strips the synthetic call/result from later history. Zero extra inference. First deploy used long
+texts (timestamps, pids, "причина=…"), and the UI truncated them. Rule: `<Event>: <model>; <essentials>`,
+everything else to the journal. Anatoly kept "Большой контекст" and "История не совпала" firing together
+on the same turn because history can match partially. Details: references/shim-notices.md.
