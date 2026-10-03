@@ -38,7 +38,7 @@ executing anything. That error is what turns the line red. No shell, no skill, n
 |---|---|
 | `Старт: <model>; с нуля / из файла` (+`одноразовый` for oneshot) | `Старт: <model>; с нуля / из файла; видено=N` |
 | `CLI завершён: <model>; <reason>` (park/evict/idle/death, shown on next request) | `CLI завершён: <model>; код=N` (shared app-server exit) |
-| `Смена модели: A → B` | `Сессия заменена: A → B / настройки изменились` |
+| `Смена модели: A → B` | `Сессия заменена: A → B / инструменты 21→20 −x +y / промпт ±N симв., строка L / порядок инструментов` |
 | `Большой контекст: +N блоков; видено=M/T` (N > `SHIM_FULL_HIST_MIN`, default 8) | same, N > `SHIM_MAX_FEED` (8); fresh AND existing threads |
 | `История изменилась: +K до хвоста; …` / `История не совпала: отправляю=N; видено=0/T` | — |
 | `Ошибка CLI`, `Восстановление не удалось` | `Ошибка CLI`, `Восстановление не удалось`, `Потеря tool call: N` |
@@ -52,3 +52,12 @@ claude: `tests/test-notice-transport.mjs` (node --test, 6) and `tests/test-notic
 The lifecycle test needs `node_modules` resolvable from the skill root: `ln -sfn ~/claude-shim/node_modules <skill>/node_modules`.
 If it isn't there, bun loads the REAL SDK and fails with "Not logged in".
 codex: `tests/test-reasoning.py` (33, fake app-server) covers start/resume/replacement/large-context notices.
+
+## Codex: why a session was replaced (Oct 3)
+A Codex thread fixes `baseInstructions` + `dynamicTools` at creation, so any change in system prompt or
+tool list (names, in order) forces a NEW thread and a full-history replay. Expensive: Oct 3 19:36 one swap
+re-fed 365 blocks / ~930K chars. The state file now keeps `sys` and `toolNames`; on change `fpDiff()`
+puts the concrete cause in the red line and appends a record to `~/codex-shim/fp-changes/changes.jsonl`
+(first differing prompt line old/new, tools added/removed). Full old/new prompts go to `<stamp>.{old,new}.txt`.
+Sessions created before this change have no stored data and say "старая сессия без данных".
+Monitor: `tail ~/codex-shim/fp-changes/changes.jsonl`.

@@ -194,6 +194,40 @@ function blocksOf(messages) {
 }
 const blockHash = b => sha1(b.kind + ":" + b.id + ":" + b.text);
 const toolsHash = tools => sha1(JSON.stringify((tools || []).map(t => t.function?.name)));
+// What exactly broke the fingerprint: short text for the red notice + full record on disk.
+const FP_DIR = process.env.SHIM_FP_DIR || join(HOME, "codex-shim/fp-changes");
+function fpDiff(prev, sys, names, key) {
+  const parts = [], rec = { at: new Date().toISOString(), key: key.slice(0, 12), thread: prev.threadId, sent: (prev.sent || []).length };
+  const old = prev.toolNames;
+  if (!old) parts.push("старая сессия без данных о промпте/инструментах");
+  else {
+    const add = names.filter(n => !old.includes(n)), del = old.filter(n => !names.includes(n));
+    const lst = (sign, a) => sign + a.slice(0, 2).join(" " + sign) + (a.length > 2 ? ` +ещё ${a.length - 2}` : "");
+    if (add.length || del.length) {
+      parts.push(`инструменты ${old.length}→${names.length}` + (del.length ? " " + lst("−", del) : "") + (add.length ? " " + lst("+", add) : ""));
+    } else if (JSON.stringify(old) !== JSON.stringify(names)) parts.push("порядок инструментов");
+    rec.toolsAdded = add; rec.toolsRemoved = del;
+  }
+  if (typeof prev.sys === "string" && prev.sys !== sys) {
+    const a = prev.sys.split("\n"), b = sys.split("\n");
+    let i = 0; while (i < a.length && i < b.length && a[i] === b[i]) i++;
+    const d = sys.length - prev.sys.length;
+    parts.push(`промпт ${d >= 0 ? "+" : ""}${d} симв., строка ${i + 1}`);
+    rec.sysLenOld = prev.sys.length; rec.sysLenNew = sys.length; rec.firstDiffLine = i + 1;
+    rec.oldLine = (a[i] ?? "").slice(0, 300); rec.newLine = (b[i] ?? "").slice(0, 300);
+  }
+  try {
+    mkdirSync(FP_DIR, { recursive: true });
+    const stamp = rec.at.replace(/[:.]/g, "-") + "-" + rec.key;
+    if (typeof prev.sys === "string" && prev.sys !== sys) {
+      writeFileSync(join(FP_DIR, stamp + ".old.txt"), prev.sys); writeFileSync(join(FP_DIR, stamp + ".new.txt"), sys);
+      rec.files = stamp + ".{old,new}.txt";
+    }
+    writeFileSync(join(FP_DIR, "changes.jsonl"), JSON.stringify(rec) + "\n", { flag: "a" });
+  } catch (e) { log("[fp] record failed", String(e).slice(0, 120)); }
+  log(`[fp] ${JSON.stringify(rec)}`);
+  return parts.join("; ") || "настройки изменились";
+}
 
 // ---------- HTTP ----------
 function sse(res, obj) { res.write(`data: ${JSON.stringify(obj)}\n\n`); }
@@ -212,6 +246,7 @@ async function handleChat(req) {
 
   const sys = systemText(messages);
   const fingerprint = sha1(sys + "|" + toolsHash(tools));
+  const toolNames = (tools || []).map(t => t.function?.name);
   const blocks = blocksOf(messages);
 
   // Session key: explicit prompt_cache_key → X-Conversation-Id header (local Vellum
@@ -318,7 +353,7 @@ async function handleChat(req) {
         if (!state) {
           log(`[guard] NEW THREAD key=${key.slice(0, 12)} reason=${invalidReason ? "state invalidated: " + invalidReason : "no prior state"} feed=${feedCount} blocks (~${feedChars} chars) sys=${sys.length} chars tools=${tools ? tools.length : 0}`);
           if (prevState) log(`[guard] DIFF prev: thread=${prevState.threadId} model=${prevState.model} sent=${(prevState.sent || []).length} blocks fp=${String(prevState.fingerprint).slice(0, 8)}`);
-          if (prevState) notice("Сессия заменена", [prevState.model !== model ? `${prevState.model} → ${model}` : null, prevState.fingerprint !== fingerprint ? "настройки изменились" : null].filter(Boolean).join("; "));
+          if (prevState) notice("Сессия заменена", [prevState.model !== model ? `${prevState.model} → ${model}` : null, prevState.fingerprint !== fingerprint ? fpDiff(prevState, sys, toolNames, key) : null].filter(Boolean).join("; "));
           const dynTools = (tools || []).map(t => ({ type: "function", name: t.function.name,
             description: t.function.description || "", inputSchema: t.function.parameters || { type: "object" } }));
           const r = await srv.request("thread/start", {
@@ -338,7 +373,7 @@ async function handleChat(req) {
           liveThreads.add(threadId);
           if (!oneUse) threadOwners.set(threadId, {key, model});
           notice("Старт", `${model}; с нуля`);
-          state = { threadId, sent: [], model, fingerprint, parked: {} };
+          state = { threadId, sent: [], model, fingerprint, parked: {}, sys, toolNames };
           persistState(key, state);
           log("[guard] thread started:", threadId, "model:", model);
         } else if (!liveThreads.has(state.threadId)) {

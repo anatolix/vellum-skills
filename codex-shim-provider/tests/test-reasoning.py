@@ -143,7 +143,7 @@ def run_tests():
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
         env = {**os.environ, "CODEX_BIN": str(fake), "SHIM_PORT": str(port),
-               "CODEX_WORKDIR": tmp + "/workdir", "SHIM_SESSIONS_DIR": tmp + "/sessions",
+               "CODEX_WORKDIR": tmp + "/workdir", "SHIM_SESSIONS_DIR": tmp + "/sessions", "SHIM_FP_DIR": tmp + "/fp",
                "SHIM_MODELS": "mock-model", "FAKE_CODEX_CAPTURE": tmp + "/rpc.jsonl"}
         for name in ("SHIM_ALLOW_KEYLESS", "SHIM_NATIVE_TOOLS", "SHIM_MAX_FEED",
                      "SHIM_DEFAULT_EFFORT", "SHIM_REASONING_SUMMARY"):
@@ -348,7 +348,8 @@ def run_tests():
                 text = content(request("after-change", key="guard-change", messages=[
                     {"role": "system", "content": "changed system"},
                     {"role": "user", "content": "after-change"}]))
-                assert "Сессия заменена" in log_text()[before:] and "настройки изменились" in log_text()[before:], log_text()[before:]
+                assert "Сессия заменена" in log_text()[before:] and "промпт +14 симв., строка 1" in log_text()[before:], log_text()[before:]
+                assert '"oldLine":""' in log_text()[before:] and '"newLine":"changed system"' in log_text()[before:], log_text()[before:]
                 assert "DIFF prev:" in log_text()[before:]
             check("invalidation-notice-and-prior-state-diff", invalidation)
 
