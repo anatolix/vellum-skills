@@ -106,3 +106,8 @@ literals inside the summary/key_state bodies (`<` → `‹`, `neuterResultTags`)
 model-written block structurally first (`sanitizeCompactionResult`: real `<tail_start` is the last one,
 real `</summary>` is the last one before `<key_state>`). The final block sent to Vellum is dumped to
 `~/{codex,claude}-shim/compact-dumps/<iso>-<tag>.txt` for forensics.
+
+**Compaction after a shim restart (claude-shim):** chats load lazily on their first normal turn, so a
+compaction arriving first used to hit `manager.chats.get()` → 409 `no_session` → Vellum "provider error"
+(seen 2026-10-04 08:49, three retries). `handleCompaction` now loads the saved state from disk like
+`manager.get()` does. codex-shim was never affected (`loadState()` reads disk).

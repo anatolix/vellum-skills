@@ -1064,7 +1064,9 @@ function buildCompactionResult(summary, blocks) {
 }
 async function handleCompaction({ model, sdkModel, cacheKey, blocks, id }) {
   const tag = short(cacheKey);
-  const chat = manager.chats.get(cacheKey);
+  // Chats are loaded lazily on their first normal turn; after a shim restart a compaction may arrive
+  // first, so pull the saved state from disk the same way manager.get() does (never create an empty one).
+  const chat = manager.chats.get(cacheKey) ?? (existsSync(`${SESS_DIR}/${sha(cacheKey)}.json`) ? manager.get(cacheKey) : null);
   if (!chat || !(chat.sessionId || chat.cli?.sessionId)) { console.log(`[compact] ${tag} REJECTED: no session for this chat yet`); return Response.json({ error: { message: "claude-shim: nothing to compact — no session for this chat yet", type: "invalid_request_error", code: "no_session" } }, { status: 409 }); }
   if (chat.busy) { console.log(`[compact] ${tag} REJECTED: chat busy`); return Response.json({ error: { message: "claude-shim: compaction deferred — a turn is in flight", type: "invalid_request_error", code: "busy" } }, { status: 409 }); }
   console.log(`[compact] ${tag} session=${chat.sessionId || chat.cli?.sessionId} model=${sdkModel} blocks=${blocks.length}`);
