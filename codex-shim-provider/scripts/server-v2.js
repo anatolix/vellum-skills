@@ -20,6 +20,7 @@ import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { join } from "path";
 import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from "./notice-transport.js";
+import { promptForSession } from "./history-rehydration.js";
 const noticeTransport = new NoticeTransport();
 const threadOwners = new Map();
 
@@ -44,7 +45,7 @@ class AppServer {
   start() {
     log("[appserver] starting", CODEX_BIN);
     this.proc = spawn({ cmd: [CODEX_BIN, "app-server"], stdin: "pipe", stdout: "pipe", stderr: "pipe",
-      env: { ...process.env, CODEX_HOME: join(HOME, ".codex") } });
+      env: { ...process.env, CODEX_HOME: process.env.SHIM_CODEX_HOME || join(HOME, ".codex") } });
     this.readLoop();
     this.proc.exited.then(code => {
       log("[appserver] exited", code, "— failing pending and restarting");
@@ -430,6 +431,9 @@ async function handleCompaction({ req, key, model, blocks, lastUserBlock, effort
             while (!compacted && !cFailed && Date.now() < cd) await new Promise(r => setTimeout(r, 150));
             log(`[compact] ${tag} native compaction ${compacted ? "done" : cFailed ? "FAILED: " + cFailed : "TIMEOUT"} in ${Date.now() - c0}ms`);
             const st = loadState(key) || state;
+            // Model switching may have created a new thread while this detached compact
+            // was running. Never write the old thread's completion into the new state.
+            if (st.threadId !== state.threadId) { log(`[compact] ${tag} old-thread completion ignored (session replaced)`); return; }
             if (compacted) { st.compactedAt = Date.now(); st.compactions = (st.compactions || 0) + 1; }
             st.pendingCompactNotice = `${model}; summary ${text.length} симв.; тред ${compacted ? "сжат" : "НЕ сжат"} за ${Math.round((Date.now() - c0) / 1000)} с`;
             persistState(key, st);
@@ -597,7 +601,8 @@ async function handleChat(req) {
       return jsonResp({ error: { message: "nothing new to feed", type: "invalid_request_error" } }, 400);
     }
   }
-  const prompt = userBlocks.map(b => b.text).join("\n\n");
+  const prompt = promptForSession(messages, userBlocks.map(b => b.text).join("\n\n"), !state);
+  if (!state) log(`[history] ${key.slice(0, 12)} fresh rehydration messages=${messages.length} chars=${prompt.length} summary=${messages.some(m => m.role === "assistant" && JSON.stringify(m.content ?? "").includes("<context_summary>"))}`);
 
   const headers = { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" };
   const base = { id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model };

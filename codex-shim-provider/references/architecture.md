@@ -8,11 +8,11 @@ The model list comes from `model/list` (`data`, filtered for non-hidden models).
 
 Session key precedence: body `prompt_cache_key`, then `X-Conversation-Id`. Missing key is a pre-inference HTTP 400 `missing_session_key`. Debug-only `SHIM_ALLOW_KEYLESS=1` derives an identity from the first user block and fingerprint; it is unsafe as a production fallback.
 
-Session state files are `SHIM_SESSIONS_DIR/<sha1(key)>.json`, storing thread ID, model, fingerprint, fed block hashes and parked calls. Rollouts belong to Codex under `~/.codex/`. Neither is part of the source package. Keep separate state dirs/ports/units from Anthropic. The app-server is configured with the login user's `~/.codex` home; it is not a multi-user auth router.
+Session state files are `SHIM_SESSIONS_DIR/<sha1(key)>.json`, storing thread ID, model, fingerprint, fed block hashes and parked calls. Rollouts belong to Codex under `~/.codex/`. Neither is part of the source package. Keep separate state dirs/ports/units from Anthropic. The app-server uses the login user's `~/.codex` home by default (`SHIM_CODEX_HOME` overrides it for isolated tests); it is not a multi-user auth router.
 
 Fingerprint = system/developer prompt plus **stable tool names**. Client-dependent tools (`request_system_permission`, `ask_question`, `host_*`; override with `SHIM_VOLATILE_TOOLS`) are excluded: Vellum adds/removes them per connected device, and a phone<->laptop switch must not replace the thread. They are still offered to the thread as the union of the current request and every volatile tool seen before (`SHIM_SESSIONS_DIR/volatile-tools.json`); a call to one the current request lacks is answered with an error (`success: false`) instead of being parked. Pre-Oct-4 session fingerprints migrate once (`[fp] migrated`). A model or fingerprint change creates a new thread and emits an invalidation notice/diff. Tool schemas/descriptions are not currently fingerprinted; do not silently change these mid-thread expecting them to update upstream.
 
-Only nonempty user blocks and tool results are candidates for feeding; assistant history is skipped. Unseen blocks positioned **before the last seen block** are rewritten history (reload after idle, compaction, `/clean`, memory re-injection), not new input: they are marked seen but never fed (`[guard] HISTORY-EDIT`, red notice «Не отправлено»). Only the tail after the last seen block is fed; a tool result for a still-parked call is always delivered. A new thread (model or fingerprint change) has no seen marks and receives the full history. Hashes identify previously seen content. Repeated identical user content is therefore treated as seen and may enter retry-tail replay; this is content-based deduplication, not message-ID tracking.
+For **warm/resumed threads**, only nonempty user blocks and tool results are candidates for incremental feeding; assistant history is skipped because the CLI already owns its replies. For a **fresh thread** (first request, model/fingerprint change, retry after failed resume), `history-rehydration.js` serializes ALL non-system incoming messages in chronological order: assistant-role `<context_summary>`, kept user/assistant turns, and recorded tool calls/results. Historical tool calls/results are text, never live RPCs. This uses the Vellum request context (summary + preserved tail), not the uncut UI/database archive. System/developer instructions still go via baseInstructions. A warm thread never replays this historical packet. Unseen blocks positioned **before the last seen block** are rewritten history (reload after idle, compaction, `/clean`, memory re-injection), not new input: they are marked seen but never fed (`[guard] HISTORY-EDIT`, red notice «Не отправлено»). Only the tail after the last seen block is fed; a tool result for a still-parked call is always delivered. A new thread (model or fingerprint change) has no seen marks and receives the full history. Hashes identify previously seen content. Repeated identical user content is therefore treated as seen and may enter retry-tail replay; this is content-based deduplication, not message-ID tracking.
 
 ## Dynamic tool transport
 
@@ -69,6 +69,7 @@ Counts arrive **after a model step**, not continuously during silent generation.
 | --- | --- |
 | `SHIM_PORT` | 8321, loopback only |
 | `CODEX_BIN` | `~/.local/bin/codex` |
+| `SHIM_CODEX_HOME` | optional isolated app-server home; default `~/.codex` |
 | `CODEX_WORKDIR` | `~/codex-shim/workdir` |
 | `SHIM_SESSIONS_DIR` | `~/codex-shim/sessions` |
 | `SHIM_MODELS` | optional comma-separated model override; otherwise live list |
@@ -156,3 +157,9 @@ subscription quota; no end-to-end success is claimed for that run.
 ## Permission description versus enforcement
 
 `include_permissions_instructions = false` suppresses Codex's `<permissions instructions>` developer text without altering the sandbox policy. The shim sets it on both `thread/start` and `thread/resume`; the local Codex config also sets it at the top level. Invisible native tools remain disabled. Already-recorded instructions in old thread history are not erased; a fresh thread is needed to guarantee a clean history. Real isolated Codex 0.159.3 smoke: effective flag false, readOnly/networkAccess false returned by thread/start, answer OK, zero permission developer blocks in rollout.
+
+## Summary rehydration regression (Oct 4, 2026)
+
+Vellum intentionally retains the full UI/database archive. Compaction persists context_summary separately and sends it as an assistant message ahead of the kept tail. Dropping all assistant messages was correct only for an existing CLI, not a new one. Test facts must occur ONLY in an old assistant reply or its summary, never in kept user messages: native compact -> switch model -> switch back -> ask for those exact facts. A separate CODEX_HOME is essential because app-server daemons can otherwise share state. Also ensure detached compact completion cannot update a replacement thread's state.
+
+Offline: `bun test codex-shim-provider/scripts/{history-rehydration,compaction-routing}.test.js`. Real Oct-4 smoke on :8346/:8347 passed for both engines, including forced fresh Claude sessions; see workspace scratch/context-loss-20261004/live for sanitized response/usage records.

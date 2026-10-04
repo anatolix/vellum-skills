@@ -15,6 +15,7 @@ import { createHash } from "node:crypto";
 
 import { z } from "zod";
 import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from "./notice-transport.js";
+import { promptForSession } from "./history-rehydration.js";
 const noticeTransport = new NoticeTransport();
 const TOOL_MODE = process.env.SHIM_TOOL_MODE || "mcp"; // mcp | text
 const BATCH_IDLE_MS = Number(process.env.SHIM_BATCH_IDLE_MS || 5000);
@@ -389,6 +390,7 @@ class Chat {
       let produced = false;
       const t0 = Date.now();
       let startedCli = false;
+      const freshSession = !this.sessionId && !this.live;
       try {
         if (!this.live) {
           startedCli = true;
@@ -400,7 +402,8 @@ class Chat {
         await this.cli.setModel(model);
         this.model = model;
         if (TOOL_MODE === "mcp") await this.cli.setTools(mcp);
-        const prompt = unseen.map((b) => b.text).concat(["Assistant:"]).join("\n\n");
+        const prompt = promptForSession(extra.historyMessages, unseen.map((b) => b.text).concat(["Assistant:"]).join("\n\n"), freshSession);
+        if (freshSession) console.log(`[history] ${short(this.key)} fresh rehydration messages=${extra.historyMessages?.length ?? 0} chars=${prompt.length}`);
         console.log(`[sess] ${short(this.key)} cli${this.cli.id} ${why} blocks=${inputs.length} seen=${this.sent.length}`);
         const tPrep = Date.now() - t0;
         for (const h of hashes) seen.add(h);
@@ -519,7 +522,7 @@ const manager = {
         const ib = inputBlocks(blocks);
         diagnostic(onMsg, tag, "Старт", `${model}; с нуля; одноразовый`);
         if (ib.length > FULL_HIST_MIN) diagnostic(onMsg, tag, "Большой контекст", `+${ib.length} блоков; видено=0/${ib.length}`);
-        const res = await cli.send(blocksToPrompt(ib), (m) => { produced = true; onMsg(m); });
+        const res = await cli.send(promptForSession(extra.historyMessages, blocksToPrompt(ib), true), (m) => { produced = true; onMsg(m); });
         res.shim_actual_model = cli.actualModel;
         if (CTX_USAGE) res.shim_context_usage = await cli.contextUsage();
         console.log(`[${tag}] cli${cli.id} model=${model} actual=${cli.actualModel ?? "?"} total=${Date.now() - t0}ms in=${res.usage?.input_tokens ?? "?"} cache_read=${res.usage?.cache_read_input_tokens ?? "?"}`);
@@ -1158,7 +1161,7 @@ async function handleRequest(req) {
     const outputFormat = rf?.type === "json_schema" && rf.json_schema?.schema ? { type: "json_schema", schema: rf.json_schema.schema } : null; // honoured on one-shot processes only
     const ac = { aborted: false, rel: null, abort: null, onGone: null };
     req.signal?.addEventListener?.("abort", () => ac.abort?.());
-    const extra = { maxBudgetUsd, outputFormat, signal: req.signal, exposeRel: (r) => { ac.rel = r; } };
+    const extra = { historyMessages: body.messages || [], maxBudgetUsd, outputFormat, signal: req.signal, exposeRel: (r) => { ac.rel = r; } };
     if (process.env.SHIM_DUMP_TOOLS && hasTools) { try { writeFileSync(process.env.SHIM_DUMP_TOOLS, JSON.stringify(tools)); } catch {} }
     const mcp = TOOL_MODE === "mcp" && hasTools ? await buildMcp(tools, body.prompt_cache_key) : null;
     const resolved = TOOL_MODE === "mcp" ? resolveToolResults(body.messages || [], typeof body.prompt_cache_key === "string" && body.prompt_cache_key ? body.prompt_cache_key : null) : 0;

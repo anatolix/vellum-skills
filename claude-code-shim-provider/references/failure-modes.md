@@ -66,3 +66,9 @@ Expected — the redirect goes to a loopback listener. Copy the full redirect UR
 ## Richard wrapper: `401 Missing API key`
 **Cause:** your curl has no `Authorization` header. Vellum always sends `Bearer …` even with `--auth none`, so real profiles are fine.
 **Fix:** add `-H 'Authorization: Bearer x'` to the test.
+
+
+## Fresh session sees only the tail after Vellum compaction (Oct 4, 2026)
+**Cause:** Vellum sends `<context_summary>` as assistant-role history. `inputBlocks` excluded all assistant messages because a warm CLI already owns them. A fresh CLI does not.
+**Fix:** `promptForSession(extra.historyMessages, tail, freshSession)` rehydrates all non-system OpenAI messages (summary, user/assistant tail, tool-call/result text) only when no resumable session/live CLI exists. The ephemeral and resume-failure paths use the same reconstruction. Warm/resumed CLI sessions continue to receive only new inputs; changing Claude models in the same live session does NOT itself require reconstruction.
+**Regression:** force a genuinely fresh session key with ONLY assistant summary + kept user tail. A normal in-session Claude model switch can falsely appear to pass even if summary reconstruction remains broken. Full UI history remains unchanged; the source is the incoming compacted request, not a second archive.
