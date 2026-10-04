@@ -277,6 +277,32 @@ function blockPreview(text) {
   while (t.startsWith("<") && t.includes("</")) { const m = t.match(/<\/[a-zA-Z_][\w-]*>\s*\n?/); if (!m || m.index === undefined) break; t = t.slice(m.index + m[0].length).trimStart(); }
   return t.slice(0, 120);
 }
+// Vellum's parser is a plain indexOf/regex scan for <compaction_result>/<summary>/<key_state>/<tail_start>.
+// A summary that *talks about* those tags derails it (a literal "<tail_start" inside the text wins the
+// regex -> empty attrs -> "unparseable response"). The model wrote the whole block, so re-parse it
+// structurally (real <tail_start is the LAST one, real </summary> is the last one before it), neuter
+// tag-like literals inside the bodies and rebuild.
+const RESULT_TAG_RE = /<(\/?)(compaction_result|summary|key_state|tail_start|retained_images?)\b/gi;
+const neuterResultTags = t => String(t ?? "").replace(RESULT_TAG_RE, "\u2039$1$2");
+function sanitizeCompactionResult(text) {
+  const o = text.indexOf("<compaction_result>"); if (o < 0) return { text, changed: false };
+  const c = text.lastIndexOf("</compaction_result>");
+  const inner = text.slice(o + "<compaction_result>".length, c > o ? c : undefined);
+  const tailIdx = inner.lastIndexOf("<tail_start"); if (tailIdx < 0) return { text, changed: false };
+  const sumOpen = inner.indexOf("<summary>"); if (sumOpen < 0) return { text, changed: false };
+  const ksOpen = inner.lastIndexOf("<key_state>", tailIdx);
+  const sumClose = inner.lastIndexOf("</summary>", ksOpen > sumOpen ? ksOpen : tailIdx); if (sumClose <= sumOpen) return { text, changed: false };
+  const summary = inner.slice(sumOpen + "<summary>".length, sumClose).trim();
+  let keyState = "";
+  if (ksOpen > sumClose) { const ksClose = inner.lastIndexOf("</key_state>", tailIdx); if (ksClose > ksOpen) keyState = inner.slice(ksOpen + "<key_state>".length, ksClose).trim(); }
+  const tailSeg = inner.slice(tailIdx).replace(/<\/compaction_result>[\s\S]*$/, "").trim();
+  const rebuilt = `<compaction_result>\n<summary>\n${neuterResultTags(summary)}\n</summary>\n\n<key_state>\n${neuterResultTags(keyState)}\n</key_state>\n\n${tailSeg}\n</compaction_result>`;
+  return { text: rebuilt, changed: rebuilt !== text, neutered: RESULT_TAG_RE.test(summary + keyState) };
+}
+const COMPACT_DUMP_DIR = `${process.env.HOME}/codex-shim/compact-dumps`;
+function dumpCompaction(tag, text) {
+  try { mkdirSync(COMPACT_DUMP_DIR, { recursive: true }); writeFileSync(`${COMPACT_DUMP_DIR}/${new Date().toISOString().replace(/[:.]/g, "-")}-${tag}.txt`, text); } catch {}
+}
 function fixTailStart(text, blocks) {
   const users = blocks.filter(b => b.kind === "user"); users.pop(); // the instruction itself
   const m = /<tail_start[\s\S]*?timestamp="([^"]*)"[\s\S]*?preview="([^"]*)"[\s\S]*?\/>/.exec(text);
@@ -341,7 +367,11 @@ async function handleCompaction({ req, key, model, blocks, lastUserBlock, effort
       if (!done) throw new Error("fork summary timed out");
       if (turnError) throw new Error(turnError);
       const ok = text.includes("<compaction_result>");
-      if (ok) { const fx = fixTailStart(text, blocks); if (fx.fixed) { log(`[compact] ${tag} tail_start did not resolve (${fx.was}) — substituted second-to-last user turn`); text = fx.text; } }
+      if (ok) {
+        const sz = sanitizeCompactionResult(text); if (sz.changed) { text = sz.text; if (sz.neutered) log(`[compact] ${tag} summary contained result-tag literals — neutered`); }
+        const fx = fixTailStart(text, blocks); if (fx.fixed) { log(`[compact] ${tag} tail_start did not resolve (${fx.was}) — substituted second-to-last user turn`); text = fx.text; }
+        dumpCompaction(tag, text);
+      }
       log(`[compact] ${tag} fork summary ${text.length} chars in ${Date.now() - f0}ms valid=${ok} in=${usage.input} cached=${usage.cached} out=${usage.output}`);
       sse(res, { ...base, choices: [{ index: 0, delta: { role: "assistant", content: text } }] });
       // 2) native compaction of the live thread

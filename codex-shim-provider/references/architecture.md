@@ -96,3 +96,13 @@ codex-shim: `thread/fork` the live thread → run the instruction in the fork (t
 claude-shim: the live CLI (started with `verbatimPrompts`, which disables slash commands) is closed; a one-off process resumes the same session with `verbatimPrompts: false`, sends `/compact` and captures the CLI's own summary via the `PostCompact` hook (`compact_summary`). The shim wraps it as `<compaction_result>` with `tail_start` = second-to-last user turn (timestamp from `<turn_context>`, preview = text after injected tags). The next request resumes the compacted session from disk («Старт: из файла»), then «Компакция: pre→post токенов». Measured: ~22 s; CLI context 7.2K→1.3K tokens in the test; cache fully warm from the second turn after compaction.
 
 Both shims also re-identify rewritten blocks by tail match (last 200 chars, blocks ≥ 300 chars) so Vellum's post-compaction injection strip on the kept tail is not mistaken for new input.
+
+### Compaction: result-tag literals in the summary
+
+Vellum parses `<compaction_result>` with plain `indexOf`/regex scans. If the summary text itself
+*mentions* `<summary>`, `<tail_start …>` etc. (any chat about the shims does), the literal wins the
+regex → empty attrs → "Context compaction skipped — unparseable response". Both shims now neuter such
+literals inside the summary/key_state bodies (`<` → `‹`, `neuterResultTags`); codex-shim re-parses the
+model-written block structurally first (`sanitizeCompactionResult`: real `<tail_start` is the last one,
+real `</summary>` is the last one before `<key_state>`). The final block sent to Vellum is dumped to
+`~/{codex,claude}-shim/compact-dumps/<iso>-<tag>.txt` for forensics.
