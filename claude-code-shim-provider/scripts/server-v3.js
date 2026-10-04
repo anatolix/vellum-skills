@@ -312,6 +312,16 @@ class Chat {
         return res;
       }
     }
+    // unseen blocks BEFORE the last seen block are rewritten history (reload after idle, compaction,
+    // /clean, memory re-injection), not new input: the CLI transcript already holds the originals.
+    // Mark seen, never re-send — re-feeding duplicated history in the CLI session (Oct 4; same rule as codex-shim).
+    let lastSeenIdx0 = -1; for (let i = 0; i < hashes.length; i++) if (prior.has(hashes[i])) lastSeenIdx0 = i;
+    const skippedOld = inputs.filter((b, i) => !prior.has(hashes[i]) && i < lastSeenIdx0 && !(b.role === "tool" && b.consumed));
+    if (skippedOld.length) {
+      const skipSet = new Set(skippedOld);
+      unseen = unseen.filter((b) => !skipSet.has(b));
+      console.log(`[sess] ${short(this.key)} HISTORY-EDIT ${skippedOld.length} rewritten old block(s) (~${skippedOld.reduce((n, b) => n + b.text.length, 0)} chars) NOT re-sent; tail=${unseen.length}`);
+    }
     let why = !this.sent.length ? "new" : unseen.length ? `tail=${unseen.length}` : "repeat";
     if (!unseen.length) unseen = inputs.slice(-1);
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -344,8 +354,7 @@ class Chat {
         const matched = hashes.filter(h => prior.has(h)).length;
         if (unseen.length > FULL_HIST_MIN) diagnostic(onMsg, short(this.key), "Большой контекст", `+${unseen.length} блоков; видено=${matched}/${inputs.length}`);
         let lastSeenIdx = -1; for (let i = 0; i < hashes.length; i++) if (prior.has(hashes[i])) lastSeenIdx = i;
-        const refed = inputs.map((b, i) => i).filter((i) => !prior.has(hashes[i]) && i < lastSeenIdx && !(inputs[i].role === "tool" && inputs[i].consumed));
-        if (refed.length) diagnostic(onMsg, short(this.key), "История изменилась", `+${refed.length} до хвоста; отправляю=${unseen.length}; видено=${matched}/${inputs.length}`);
+        if (skippedOld.length) diagnostic(onMsg, short(this.key), "Не отправлено", `${model}; ${skippedOld.length} старых блоков (~${Math.round(skippedOld.reduce((n, b) => n + b.text.length, 0) / 1000)}K симв.): история переписана, CLI видел исходники`);
         else if (prior.size && lastSeenIdx < 0) diagnostic(onMsg, short(this.key), "История не совпала", `отправляю=${unseen.length}; видено=0/${inputs.length}`);
         const res = await this.cli.send(prompt, (m) => { produced = true; onMsg(m); });
         this.sent = [...seen]; this.sessionId = res.session_id || this.cli.sessionId; this.model = model; this.effort = effort ?? null; this.served++; this.lastUsed = Date.now();
