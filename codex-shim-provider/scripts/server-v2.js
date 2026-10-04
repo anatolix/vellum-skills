@@ -16,6 +16,7 @@
 //   SHIM_SAFE_MODEL_CATALOG (default ~/codex-shim/native-safe-model-catalog.json)
 //   SHIM_DEBUG=1     verbose logging
 
+import { createCompactionTracker, startTurnWithRetry } from "./compaction-turn.js";
 import { spawn } from "bun";
 import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "fs";
@@ -429,15 +430,16 @@ async function handleCompaction({ req, key, model, blocks, lastUserBlock, effort
       if (ok && !parkedNow) {
         const done = (async () => {
           const c0 = Date.now(); let compacted = false, cFailed = null;
+          // Release waiting turns only on the compaction TURN's turn/completed, not on the
+          // earlier item/completed(contextCompaction) — see compaction-turn.js.
+          const tracker = createCompactionTracker();
           const prevHandler = threadHandlers.get(state.threadId);
-          threadHandlers.set(state.threadId, { notif: (method, p) => {
-              if (method === "item/completed" && p.item?.type === "contextCompaction") compacted = true;
-              if (method === "turn/completed") { if (p.turn?.status === "failed" || p.turn?.error) cFailed = p.turn?.error?.message || "compaction turn failed"; else compacted = compacted || true; }
-            }, request: timeFn });
+          threadHandlers.set(state.threadId, { notif: (method, p) => tracker.onNotification(method, p), request: timeFn });
           try {
             await srv.request("thread/compact/start", { threadId: state.threadId });
             const cd = Date.now() + 180000;
-            while (!compacted && !cFailed && Date.now() < cd) await new Promise(r => setTimeout(r, 150));
+            while (!tracker.finished && Date.now() < cd) await new Promise(r => setTimeout(r, 150));
+            compacted = tracker.compacted; cFailed = tracker.state.failed;
             log(`[compact] ${tag} native compaction ${compacted ? "done" : cFailed ? "FAILED: " + cFailed : "TIMEOUT"} in ${Date.now() - c0}ms`);
             const st = loadState(key) || state;
             // Model switching may have created a new thread while this detached compact
@@ -791,12 +793,12 @@ async function handleChat(req) {
           // effort: Vellum sends OpenAI-style reasoning_effort (or reasoning.effort); summary:
           // reasoning summaries must be requested per turn or codex emits empty reasoning items.
           log(`[effort] model=${model} requested=${requestedEffort ?? "default"} effective=${effort}`);
-          await srv.request("turn/start", {
+          await startTurnWithRetry((m, p) => srv.request(m, p), {
             threadId: state.threadId,
             input: [{ type: "text", text: prompt, text_elements: [] }],
             summary: process.env.SHIM_REASONING_SUMMARY || "detailed",
             ...(effort ? { effort: String(effort) } : {}),
-          });
+          }, { log });
         }
         // mark fed
         state.sent = blocks.map(blockHash);
