@@ -26,6 +26,7 @@ import { promptForSession } from "./history-rehydration.js";
 import { codexThreadConfig, codexResumeParams } from "./thread-config.js";
 import { createSseWriter } from "./sse-writer.js";
 import { prepareNativeSafeModelCatalog, failClosedApprovalResponse } from "./native-tool-policy.js";
+import { attachSourceIds, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses } from "./source-id-map.js";
 const noticeTransport = new NoticeTransport();
 const threadOwners = new Map();
 
@@ -171,6 +172,18 @@ function models() {
 function sessPath(key) { return join(SESS_DIR, sha1(key) + ".json"); }
 function loadState(key) { try { return JSON.parse(readFileSync(sessPath(key), "utf8")); } catch { return null; } }
 function saveState(key, st) { writeFileSync(sessPath(key), JSON.stringify(st)); }
+// Vellum row id <-> block hash per chat: one SQLite file next to the session JSON, kept open
+// for the process lifetime. A failure to open degrades that chat to hash-only matching.
+const idMaps = new Map();
+function openIdMap(key) {
+  let m = idMaps.get(key);
+  if (!m) {
+    try { m = new SourceIdMap(join(SESS_DIR, sha1(key) + ".ids.sqlite")); }
+    catch (e) { log(`[ids] open failed key=${key.slice(0, 12)}, hash-only: ${e.message}`); m = NULL_SOURCE_ID_MAP; }
+    idMaps.set(key, m);
+  }
+  return m;
+}
 
 // router-oneuse-<uuid> keys come from shim-router for Vellum internal call sites:
 // one logical task per key. State lives ONLY in memory (never in SESS_DIR, so one-use
@@ -216,10 +229,10 @@ function blocksOf(messages) {
   for (const m of messages || []) {
     if (m.role === "user") {
       const c = typeof m.content === "string" ? m.content : (m.content || []).map(p => p.type === "text" ? p.text : "").join("\n");
-      if (c.trim()) out.push({ kind: "user", text: c });
+      if (c.trim()) out.push({ kind: "user", text: c, sourceIds: m._sourceIds || null });
     } else if (m.role === "tool") {
       const c = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
-      out.push({ kind: "tool", id: m.tool_call_id || "", text: c });
+      out.push({ kind: "tool", id: m.tool_call_id || "", text: c, sourceIds: m._sourceIds || null });
     }
   }
   return out;
@@ -487,6 +500,7 @@ async function handleChat(req) {
   const allToolNames = (tools || []).map(t => t.function?.name);
   const toolNames = stableToolNames(tools); // fingerprint/diff basis — volatile tools excluded
   const knownVolatile = rememberVolatileTools(tools);
+  attachSourceIds(messages, body._vellum);
   const blocks = blocksOf(messages);
 
   // Session key: explicit prompt_cache_key → X-Conversation-Id header (local Vellum
@@ -530,6 +544,7 @@ async function handleChat(req) {
   }
 
   const oneUse = ONEUSE_RE.test(key);
+  const idMap = oneUse ? NULL_SOURCE_ID_MAP : openIdMap(key);
   let state = oneUse ? (oneUseStates.get(key) ?? null) : key ? loadState(key) : null;
   // One-time migration: sessions fingerprinted before volatile tools were excluded. Match on the
   // legacy hash and re-key silently instead of invalidating every live chat after this deploy.
@@ -554,9 +569,24 @@ async function handleChat(req) {
   // are skipped (and marked seen below); only the tail after the last seen block is fed.
   // Exception: a tool result for a call this thread still has parked is always delivered.
   let toFeed = blocks, skipped = [];
+  // Persistent thread without Vellum ids: profile lacks `exportSourceIds` (or the Vellum patch
+  // is not live) — history is matched by text hash only. Surfaced loudly so it gets fixed.
+  let pendingNoIdsNotice = false;
   if (state) {
     const seen = new Set(state.sent);
     const hashes = blocks.map(blockHash);
+    // Vellum row ids (body._vellum, local patch 8): a block whose ids this thread already fed is
+    // seen even when its rendering changed (compaction stripped injections, a card came or went,
+    // a real edit). A result for a still-parked tool call is always delivered regardless.
+    const idCls = idMap.classifyAll(blocks, hashes);
+    idCls.forEach((c, i) => {
+      if (c !== "seen" && c !== "rewritten") return;
+      if (blocks[i].kind === "tool" && state.parked && state.parked[blocks[i].id]) return;
+      seen.add(hashes[i]);
+    });
+    const idSummary = describeClasses(idCls);
+    if (idSummary) log(`[ids] key=${key.slice(0, 12)} ${idSummary}`);
+    if (!oneUse && !blocks.some((b) => b.sourceIds && b.sourceIds.length)) pendingNoIdsNotice = true;
     let lastSeen = -1;
     for (let i = 0; i < blocks.length; i++) if (seen.has(hashes[i])) lastSeen = i;
     // A block whose hash changed but whose last 200 chars match a block this thread already
@@ -663,6 +693,7 @@ async function handleChat(req) {
           if (!oneUse) threadOwners.set(threadId, {key, model});
           notice("Старт", `${model}; с нуля`);
           state = { threadId, sent: [], model, fingerprint, parked: {}, sys, toolNames };
+          idMap.reset(); // fresh thread: nothing has been fed to it yet
           persistState(key, state);
           log("[guard] thread started:", threadId, "model:", model);
         } else if (!liveThreads.has(state.threadId)) {
@@ -688,6 +719,7 @@ async function handleChat(req) {
         if (compactLocks.has(state.threadId)) { await awaitCompactLock(state.threadId, key.slice(0, 12)); const fresh = loadState(key); if (fresh?.pendingCompactNotice) state.pendingCompactNotice = fresh.pendingCompactNotice; }
         if (state.pendingCompactNotice) { notice("Компакция", state.pendingCompactNotice); delete state.pendingCompactNotice; persistState(key, state); }
         else if (skipped.length) notice("Не отправлено", `${model}; ${skipped.length} старых блоков (~${Math.round(skipped.reduce((n, b) => n + b.text.length, 0) / 1000)}K симв.): история переписана, тред видел исходники`);
+        if (pendingNoIdsNotice) notice("⛔ Нет ID сообщений", `${model}; профиль без exportSourceIds — история сверяется только по хэшу`);
         if (feedCount > MAX_FEED) notice("Большой контекст", `${model}; +${feedCount} блоков; видено=${blocks.length-feedCount}/${blocks.length}`);
         // --- run turn (handlers FIRST — answering a parked call resumes the turn immediately) ---
         const parkedCalls = [];
@@ -802,6 +834,7 @@ async function handleChat(req) {
         }
         // mark fed
         state.sent = blocks.map(blockHash);
+        idMap.markFed(blocks, state.sent);
         state.meta = Object.fromEntries(blocks.map(b => [blockHash(b), blockMeta(b)])); // per-block len/head/tail for history-edit forensics
         persistState(key, state);
 

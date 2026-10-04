@@ -17,6 +17,7 @@ import { z } from "zod";
 import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from "./notice-transport.js";
 import { promptForSession } from "./history-rehydration.js";
 import { isOutputOnlyBatch, closeOneUseSession } from './oneuse-cleanup.js';
+import { attachSourceIds, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses } from "./source-id-map.js";
 const noticeTransport = new NoticeTransport();
 const TOOL_MODE = process.env.SHIM_TOOL_MODE || "mcp"; // mcp | text
 const BATCH_IDLE_MS = Number(process.env.SHIM_BATCH_IDLE_MS || 5000);
@@ -271,6 +272,15 @@ class Chat {
     this.lock = Promise.resolve();
   }
   get live() { return !!this.cli?.alive; }
+  // Vellum row id <-> block hash for this chat (one SQLite file next to the session JSON).
+  // One-use chats never touch disk. Opened lazily; a failure degrades to hash-only matching.
+  idMap() {
+    if (this._ids) return this._ids;
+    if (this.oneUse) return (this._ids = NULL_SOURCE_ID_MAP);
+    try { this._ids = new SourceIdMap(`${SESS_DIR}/${sha(this.key)}.ids.sqlite`); }
+    catch (e) { console.error(`[ids] ${short(this.key)} open failed, hash-only: ${e.message}`); this._ids = NULL_SOURCE_ID_MAP; }
+    return this._ids;
+  }
   file() { return `${SESS_DIR}/${sha(this.key)}.json`; }
   save() {
     if (this.oneUse) return; // one-use chats are never persisted
@@ -353,11 +363,21 @@ class Chat {
     if (sysHash !== this.sysHash) {
       if (this.live) this.park("system changed");
       // a recorded (snapshot) prompt is reused verbatim on resume, so a changed prompt needs a fresh session
-      if (SYS_SNAPSHOT && this.sessionId) { console.log(`[sess] ${short(this.key)} system changed under snapshot -> fresh session`); this.sessionId = null; this.sent = []; }
+      if (SYS_SNAPSHOT && this.sessionId) { console.log(`[sess] ${short(this.key)} system changed under snapshot -> fresh session`); this.sessionId = null; this.sent = []; this.idMap().reset(); }
     }
     if (this.live && !(await this.cli.setEffort(effort))) this.park("effort changed");
     const seen = new Set(this.sent);
     const prior = new Set(this.sent);
+    // Vellum row ids (body._vellum, local patch 8): a block whose ids this session already fed is
+    // seen even when its rendering changed (compaction stripped injections, a card came or went,
+    // a real edit). Blocks without ids (no _vellum) fall through to the hash-only rule below.
+    const idCls = this.idMap().classifyAll(inputs, hashes);
+    idCls.forEach((c, i) => { if (c === "seen" || c === "rewritten") { prior.add(hashes[i]); seen.add(hashes[i]); } });
+    const idSummary = describeClasses(idCls);
+    if (idSummary) console.log(`[ids] ${short(this.key)} ${idSummary}`);
+    // A persistent chat without ids means the profile lacks `exportSourceIds` (or the Vellum
+    // patch is not live): history is matched by text hash only — loud, so it gets fixed.
+    if (!this.oneUse && !inputs.some((b) => b.sourceIds && b.sourceIds.length)) diagnostic(onMsg, short(this.key), "⛔ Нет ID сообщений", `${this.model}; профиль без exportSourceIds — история сверяется только по хэшу`);
     let unseen = inputs.filter((_, i) => !seen.has(hashes[i]));
     // mcp mode: the tool results were handed to the CLI natively (resolveToolResults);
     // mark them seen and, if nothing else is new while a run is in flight, attach to that run.
@@ -367,7 +387,7 @@ class Chat {
       if (!unseen.length && this.cli?.done) {
         console.log(`[sess] ${short(this.key)} continuing in-flight run (tool results delivered)`);
         const res = await this.cli.attach(onMsg);
-        this.sent = [...seen]; this.sessionId = res.session_id || this.cli.sessionId; this.served++; this.lastUsed = Date.now(); this.save();
+        this.sent = [...seen]; this.idMap().markFed(inputs, hashes); this.sessionId = res.session_id || this.cli.sessionId; this.served++; this.lastUsed = Date.now(); this.save();
         console.log(`[sess] ${short(this.key)} served #${this.served} model=${model} (continued) in=${res.usage?.input_tokens ?? "?"} cache_read=${res.usage?.cache_read_input_tokens ?? "?"} session=${this.sessionId}`);
         return res;
       }
@@ -408,7 +428,7 @@ class Chat {
         console.log(`[sess] ${short(this.key)} cli${this.cli.id} ${why} blocks=${inputs.length} seen=${this.sent.length}`);
         const tPrep = Date.now() - t0;
         for (const h of hashes) seen.add(h);
-        if (TOOL_MODE === "mcp") { this.sent = [...seen]; this.save(); }
+        if (TOOL_MODE === "mcp") { this.sent = [...seen]; this.idMap().markFed(inputs, hashes); this.save(); }
         // emitted at the point of the actual send so any re-feed path is caught, foreseen or not
         for (const note of this.pendingNotices.splice(0)) shimNotice(onMsg, short(this.key), note);
         this.save();
@@ -423,7 +443,7 @@ class Chat {
         else if (skippedOld.length) diagnostic(onMsg, short(this.key), "Не отправлено", `${model}; ${skippedOld.length} старых блоков (~${Math.round(skippedOld.reduce((n, b) => n + b.text.length, 0) / 1000)}K симв.): история переписана, CLI видел исходники`);
         else if (prior.size && lastSeenIdx < 0) diagnostic(onMsg, short(this.key), "История не совпала", `отправляю=${unseen.length}; видено=0/${inputs.length}`);
         const res = await this.cli.send(prompt, (m) => { produced = true; onMsg(m); });
-        this.sent = [...seen]; this.sessionId = res.session_id || this.cli.sessionId; this.model = model; this.effort = effort ?? null; this.served++; this.lastUsed = Date.now();
+        this.sent = [...seen]; this.idMap().markFed(inputs, hashes); this.sessionId = res.session_id || this.cli.sessionId; this.model = model; this.effort = effort ?? null; this.served++; this.lastUsed = Date.now();
         res.shim_actual_model = this.cli?.actualModel ?? null;
         this.save();
         if (res.subtype && res.subtype !== "success") console.log(`[sess] ${short(this.key)} result subtype=${res.subtype} ${String(res.result || "").slice(0, 120)}`);
@@ -437,7 +457,7 @@ class Chat {
         // Resume failed (session file gone, CLI upgrade, ...): start over with the full history.
         console.log(`[sess] ${short(this.key)} resume failed, starting fresh: ${String(e?.message || e).slice(0, 120)}`);
         diagnostic(onMsg, short(this.key), "Восстановление не удалось", `${model}; с нуля; ${inputs.length} блоков`);
-        this.sessionId = null; this.sent = []; seen.clear(); prior.clear(); unseen = inputs; why = "fresh";
+        this.sessionId = null; this.sent = []; seen.clear(); prior.clear(); unseen = inputs; this.idMap().reset(); why = "fresh";
       }
     }
   }
@@ -843,6 +863,10 @@ function messagesToBlocks(messages, tools) {
       blocks.push({ role, text: `${role}: ${text}` });
     }
   }
+  // Every message above pushes exactly one block, so the tail of `blocks` maps 1:1 onto
+  // `messages`; carry the Vellum row ids (attachSourceIds) onto the rendered block.
+  const off = blocks.length - messages.length;
+  messages.forEach((m, i) => { if (m._sourceIds && blocks[off + i]) blocks[off + i].sourceIds = m._sourceIds; });
   return blocks;
 }
 
@@ -1173,6 +1197,7 @@ async function handleRequest(req) {
     const mcp = TOOL_MODE === "mcp" && hasTools ? await buildMcp(tools, body.prompt_cache_key) : null;
     const resolved = TOOL_MODE === "mcp" ? resolveToolResults(body.messages || [], typeof body.prompt_cache_key === "string" && body.prompt_cache_key ? body.prompt_cache_key : null) : 0;
     if (resolved) console.log(`[mcp] resolved ${resolved} pending tool result(s)`);
+    attachSourceIds(body.messages || [], body._vellum);
     const blocks = messagesToBlocks(body.messages || [], tools);
     const cacheKey = typeof body.prompt_cache_key === "string" && body.prompt_cache_key ? body.prompt_cache_key : null;
     if (!cacheKey) { console.log(`[req] REJECTED: no prompt_cache_key (full history without a chat id)`); return Response.json({ error: { message: "claude-shim: prompt_cache_key (chat id) is required; keyless requests are rejected" } }, { status: 400 }); }
