@@ -303,16 +303,27 @@ const COMPACT_DUMP_DIR = `${process.env.HOME}/codex-shim/compact-dumps`;
 function dumpCompaction(tag, text) {
   try { mkdirSync(COMPACT_DUMP_DIR, { recursive: true }); writeFileSync(`${COMPACT_DUMP_DIR}/${new Date().toISOString().replace(/[:.]/g, "-")}-${tag}.txt`, text); } catch {}
 }
+// Timestamp of a user message exactly the way Vellum's extractTurnContextTimestamp() sees it:
+// `current_time:` inside the <turn_context> block, nothing else. Empty when the message has none
+// ("/compact" slash commands, <system_notice> wrappers, tool-result-only turns).
+function turnContextTime(text) {
+  const i = text.indexOf("<turn_context>"); if (i < 0) return "";
+  const e = text.indexOf("</turn_context>", i);
+  const m = /current_time:\s*([^\n]+)/.exec(text.slice(i, e > 0 ? e : undefined));
+  return m ? m[1].trim() : "";
+}
 function fixTailStart(text, blocks) {
   const users = blocks.filter(b => b.kind === "user"); users.pop(); // the instruction itself
   const m = /<tail_start[\s\S]*?timestamp="([^"]*)"[\s\S]*?preview="([^"]*)"[\s\S]*?\/>/.exec(text);
   if (!m) return { text, fixed: false };
   const ts = m[1].trim(), pv = m[2].trim().replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"');
-  const resolves = users.some(b => (ts && b.text.includes(ts)) || (pv && blockPreview(b.text).startsWith(pv.slice(0, 40))));
+  const resolves = (ts && users.some(b => turnContextTime(b.text) === ts || b.text.includes(ts))) || (pv && blocks.some(b => blockPreview(b.text).startsWith(pv.slice(0, 40))));
   if (resolves) return { text, fixed: false };
-  const tb = users[users.length - 2] ?? users[users.length - 1];
+  // Only messages with a <turn_context> resolve unambiguously on Vellum's side (see claude-shim).
+  const dated = users.filter(b => turnContextTime(b.text));
+  const tb = dated[dated.length - 2] ?? dated[dated.length - 1] ?? users[users.length - 2] ?? users[users.length - 1];
   if (!tb) return { text, fixed: false };
-  const nts = ((/current_time:\s*([^\n]+)/.exec(tb.text) || [])[1] || "").replace(/"/g, "'");
+  const nts = turnContextTime(tb.text).replace(/"/g, "'");
   const npv = blockPreview(tb.text).slice(0, 60).replace(/\s+/g, " ").replace(/"/g, "'");
   return { text: text.replace(m[0], `<tail_start\n  timestamp="${nts}"\n  preview="${npv}" />`), fixed: true, was: `${ts || "-"} / ${pv.slice(0, 40) || "-"}` };
 }
@@ -438,7 +449,7 @@ async function handleChat(req) {
   const derivedKey = process.env.SHIM_ALLOW_KEYLESS && firstUser ? "derived-" + sha1(fingerprint + "|" + firstUser.text) : null;
   const keySrc = body.prompt_cache_key ? "body" : headerKey ? "header" : derivedKey ? "derived" : "-";
   const key = body.prompt_cache_key || headerKey || derivedKey;
-  log(`[req] model=${model} key=${key ? key.slice(0, 12) : "-"}(${keySrc}) msgs=${messages.length} blocks=${blocks.length} tools=${tools ? tools.length : 0}`);
+  log(`[req] model=${model} key=${key ? key.slice(0, 12) : "-"}(${keySrc}) msgs=${messages.length} blocks=${blocks.length} tools=${tools ? tools.length : 0} tc=${typeof body.tool_choice === "string" ? body.tool_choice : body.tool_choice?.type ?? "-"} site=${req.headers.get("x-call-site") || "-"}`);
   if (!key) {
     log("[req] REJECTED: no session key (prompt_cache_key / X-Conversation-Id). Is the Vellum retry.ts patch applied + daemon restarted?");
     return jsonResp({ error: { message: "codex-shim: no session key. Send prompt_cache_key or X-Conversation-Id header (Vellum: apply skills/codex-shim-provider/scripts/patch-vellum-retry.sh and restart the daemon). Refusing to run keyless: it would replay the whole history per request and burn quota.", type: "invalid_request_error", code: "missing_session_key" } }, 400);
@@ -461,7 +472,10 @@ async function handleChat(req) {
   const callSite = req.headers.get("x-call-site") || null;
   const lastUserBlock = [...blocks].reverse().find(b => b.kind === "user") || null;
   const toolChoice = typeof body.tool_choice === "string" ? body.tool_choice : body.tool_choice?.type;
-  if (callSite === "compactionAgent" || (toolChoice === "none" && lastUserBlock && /<(compaction_instructions|emergency_compaction)>/.test(lastUserBlock.text))) {
+  // X-Call-Site never arrives (Vellum's openai-compatible provider ignores requestHeaders) and tool_choice is
+  // omitted for some models (gpt-6.1-sol) — the instruction block opening the trailing user message is the marker.
+  if (callSite === "compactionAgent" || (lastUserBlock && /(^|\n)\s*<(compaction_instructions|emergency_compaction)>/.test(lastUserBlock.text))) {
+    log(`[compact] detected site=${callSite || "-"} tool_choice=${toolChoice ?? "-"}`);
     return handleCompaction({ req, key, model, blocks, lastUserBlock, effort, id });
   }
 

@@ -111,3 +111,21 @@ real `</summary>` is the last one before `<key_state>`). The final block sent to
 compaction arriving first used to hit `manager.chats.get()` → 409 `no_session` → Vellum "provider error"
 (seen 2026-10-04 08:49, three retries). `handleCompaction` now loads the saved state from disk like
 `manager.get()` does. codex-shim was never affected (`loadState()` reads disk).
+
+### Compaction detection and the tail marker (2026-10-04, prod findings)
+
+- `X-Call-Site` **never reaches the shims**: `retry.ts` (local patch) puts it into `config.requestHeaders`,
+  but Vellum's openai-compatible provider does not read `requestHeaders` at all (only Fireworks does).
+  `tool_choice` is also omitted for some models (gpt-6.1-sol sends none, claude-fable sends `"none"`).
+  Both shims therefore detect a compaction call by the trailing user message *opening* with
+  `<compaction_instructions>` / `<emergency_compaction>`. Undetected compaction = a normal turn: codex
+  rebuilt the thread (bigger system prompt → new fingerprint) and answered the instruction inside the
+  live thread; Vellum even accepted that summary once (09:00 UTC) — but no native compact happened.
+- `<tail_start>` is resolved by Vellum by exact `turn_context` timestamp (user messages) or by preview
+  (first message whose head matches — ambiguous). Slash commands (`/compact`) and `<system_notice>`
+  wrappers have no turn_context and an empty stripped preview, so picking "second-to-last user message"
+  blindly produced `timestamp="" preview=""` → "unparseable response". Both shims now pick the
+  second-to-last user message **that carries a `<turn_context>`** (`turnContextTime()`).
+- `[req]` lines now log `tc=<tool_choice> site=<x-call-site>` so this can be checked in production.
+- Request bodies Vellum sent are stored in `workspace/data/db/assistant-logs.db`, table
+  `llm_request_logs` (`call_site='compactionAgent'`) — use that instead of guessing.

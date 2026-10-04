@@ -1046,13 +1046,26 @@ const COMPACT_DUMP_DIR = `${process.env.HOME}/claude-shim/compact-dumps`;
 function dumpCompaction(tag, text) {
   try { mkdirSync(COMPACT_DUMP_DIR, { recursive: true }); writeFileSync(`${COMPACT_DUMP_DIR}/${new Date().toISOString().replace(/[:.]/g, "-")}-${tag}.txt`, text); } catch {}
 }
+// Timestamp of a user message exactly the way Vellum's extractTurnContextTimestamp() sees it:
+// `current_time:` inside the <turn_context> block, nothing else. Empty when the message has none
+// ("/compact" slash commands, <system_notice> wrappers, tool-result-only turns).
+function turnContextTime(text) {
+  const i = text.indexOf("<turn_context>"); if (i < 0) return "";
+  const e = text.indexOf("</turn_context>", i);
+  const m = /current_time:\s*([^\n]+)/.exec(text.slice(i, e > 0 ? e : undefined));
+  return m ? m[1].trim() : "";
+}
+// Vellum resolves <tail_start> by exact turn_context timestamp (user messages) or by message preview
+// (first match wins — ambiguous for "/compact" or tag-only notices, empty for both). So only messages
+// carrying a <turn_context> are candidates; second-to-last keeps the active exchange plus one.
 function buildCompactionResult(summary, blocks) {
   const users = blocks.filter((b) => b.role === "user");
   users.pop(); // the instruction itself
-  const tailBlock = users[users.length - 2] ?? users[users.length - 1] ?? null;
+  const dated = users.filter((b) => turnContextTime(b.text));
+  const tailBlock = dated[dated.length - 2] ?? dated[dated.length - 1] ?? users[users.length - 2] ?? users[users.length - 1] ?? null;
   let ts = "", preview = "";
   if (tailBlock) {
-    ts = (/current_time:\s*([^\n]+)/.exec(tailBlock.text) || [])[1] || "";
+    ts = turnContextTime(tailBlock.text);
     let t = tailBlock.text.replace(/^Human:\s*/, "");
     while (t.startsWith("<") && t.includes("</")) { const m = t.match(/<\/[a-zA-Z_][\w-]*>\s*\n?/); if (!m || m.index === undefined) break; t = t.slice(m.index + m[0].length).trimStart(); }
     preview = t.slice(0, 60).replace(/\s+/g, " ").replace(/"/g, "'");
@@ -1079,6 +1092,7 @@ async function handleCompaction({ model, sdkModel, cacheKey, blocks, id }) {
       if (chat.cli?.sessionId && !chat.sessionId) chat.sessionId = chat.cli.sessionId;
       const { summary } = await chat.compactViaCli(sdkModel, systemText(blocks));
       const text = buildCompactionResult(summary, blocks);
+      console.log(`[compact] ${tag} tail_start ${/timestamp="([^"]*)"/.exec(text)?.[1] || "-"} / ${(/preview="([^"]*)"/.exec(text)?.[1] || "-").slice(0, 40)}`);
       dumpCompaction(tag, text);
       send(sseChunk(id, model, { content: text }));
       send(sseChunk(id, model, {}, "stop"));
@@ -1137,7 +1151,7 @@ async function handleRequest(req) {
       console.log(`[req] REJECTED: unsupported effort ${JSON.stringify(effort)} (allowed: ${KNOWN_EFFORT.join(",")})`);
       return Response.json({ error: { message: `claude-shim: effort ${JSON.stringify(effort)} is not supported; allowed: ${KNOWN_EFFORT.join(", ")}`, type: "invalid_request_error", code: "unsupported_effort" } }, { status: 400 });
     }
-    console.log(`[req] model=${model} msgs=${(body.messages || []).length} tools=${tools.length} effort=${effort ?? "-"} key=${typeof body.prompt_cache_key === "string" ? body.prompt_cache_key.slice(0, 12) : "-"}`);
+    console.log(`[req] model=${model} msgs=${(body.messages || []).length} tools=${tools.length} effort=${effort ?? "-"} tc=${typeof body.tool_choice === "string" ? body.tool_choice : body.tool_choice?.type ?? "-"} site=${req.headers.get("x-call-site") || "-"} key=${typeof body.prompt_cache_key === "string" ? body.prompt_cache_key.slice(0, 12) : "-"}`);
     const sdkModel = model.replace(/^claude-/, ""); // opus | sonnet | haiku | fable
     const maxBudgetUsd = Number(req.headers.get("x-shim-max-budget-usd") || body.max_budget_usd || 0) || null;
     const rf = body.response_format;
@@ -1161,7 +1175,8 @@ async function handleRequest(req) {
       const callSite = req.headers.get("x-call-site") || null;
       const lastUserBlock = [...blocks].reverse().find((b) => b.role === "user") || null;
       const toolChoice = typeof body.tool_choice === "string" ? body.tool_choice : body.tool_choice?.type;
-      if (callSite === "compactionAgent" || (toolChoice === "none" && lastUserBlock && /<(compaction_instructions|emergency_compaction)>/.test(lastUserBlock.text))) {
+      if (callSite === "compactionAgent" || (lastUserBlock && /^Human:\s*<(compaction_instructions|emergency_compaction)>/.test(lastUserBlock.text))) {
+        console.log(`[compact] detected site=${callSite || "-"} tool_choice=${toolChoice ?? "-"}`);
         return handleCompaction({ model, sdkModel, cacheKey, blocks, id });
       }
     }
