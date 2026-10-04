@@ -193,7 +193,25 @@ function blocksOf(messages) {
   return out;
 }
 const blockHash = b => sha1(b.kind + ":" + b.id + ":" + b.text);
-const toolsHash = tools => sha1(JSON.stringify((tools || []).map(t => t.function?.name)));
+// Client-dependent tools (platform/host-proxy tools that Vellum adds or removes depending on
+// which device is connected: request_system_permission, ask_question, host_*) must NOT change
+// the thread fingerprint — a phone<->laptop switch would otherwise kill the codex thread and
+// re-feed the whole history (Oct 4: 224 blocks / 268K chars for one flip). They are still
+// offered to the thread (union of this request + every volatile tool seen before), and a call
+// to one the current request lacks is answered with an error instead of being parked.
+const VOLATILE_TOOLS = new Set((process.env.SHIM_VOLATILE_TOOLS || "request_system_permission,ask_question").split(",").map(x => x.trim()).filter(Boolean));
+const isVolatileTool = n => VOLATILE_TOOLS.has(n) || /^host_/.test(n || "");
+const stableToolNames = tools => (tools || []).map(t => t.function?.name).filter(n => !isVolatileTool(n));
+const toolsHash = tools => sha1(JSON.stringify(stableToolNames(tools)));
+const legacyToolsHash = tools => sha1(JSON.stringify((tools || []).map(t => t.function?.name))); // pre-Oct-4 fingerprint, for one-time state migration
+const VOLATILE_FILE = join(SESS_DIR, "volatile-tools.json");
+function rememberVolatileTools(tools) {
+  let seen = {}; try { seen = JSON.parse(readFileSync(VOLATILE_FILE, "utf8")); } catch {}
+  let changed = false;
+  for (const t of tools || []) { const n = t.function?.name; if (isVolatileTool(n) && !seen[n]) { seen[n] = t; changed = true; } }
+  if (changed) { try { writeFileSync(VOLATILE_FILE, JSON.stringify(seen)); } catch (e) { log("[tools] volatile save failed", String(e).slice(0, 100)); } }
+  return seen;
+}
 // What exactly broke the fingerprint: short text for the red notice + full record on disk.
 const FP_DIR = process.env.SHIM_FP_DIR || join(HOME, "codex-shim/fp-changes");
 function fpDiff(prev, sys, names, key) {
@@ -246,7 +264,10 @@ async function handleChat(req) {
 
   const sys = systemText(messages);
   const fingerprint = sha1(sys + "|" + toolsHash(tools));
-  const toolNames = (tools || []).map(t => t.function?.name);
+  const legacyFingerprint = sha1(sys + "|" + legacyToolsHash(tools));
+  const allToolNames = (tools || []).map(t => t.function?.name);
+  const toolNames = stableToolNames(tools); // fingerprint/diff basis — volatile tools excluded
+  const knownVolatile = rememberVolatileTools(tools);
   const blocks = blocksOf(messages);
 
   // Session key: explicit prompt_cache_key → X-Conversation-Id header (local Vellum
@@ -279,6 +300,12 @@ async function handleChat(req) {
 
   const oneUse = ONEUSE_RE.test(key);
   let state = oneUse ? (oneUseStates.get(key) ?? null) : key ? loadState(key) : null;
+  // One-time migration: sessions fingerprinted before volatile tools were excluded. Match on the
+  // legacy hash and re-key silently instead of invalidating every live chat after this deploy.
+  if (state && state.model === model && state.fingerprint !== fingerprint && state.fingerprint === legacyFingerprint) {
+    log(`[fp] migrated legacy fingerprint key=${key.slice(0, 12)} ${String(state.fingerprint).slice(0, 8)} -> ${fingerprint.slice(0, 8)}`);
+    state.fingerprint = fingerprint; state.toolNames = toolNames; persistState(key, state);
+  }
   let prevState = null, invalidReason = null;
   if (state && (state.model !== model || state.fingerprint !== fingerprint)) {
     prevState = state;
@@ -289,11 +316,24 @@ async function handleChat(req) {
     state = null;
   }
 
-  // blocks the thread hasn't seen yet
-  let toFeed = blocks;
+  // blocks the thread hasn't seen yet. Unseen blocks positioned BEFORE the last seen block are
+  // not new input — Vellum rewrote old history (reload after idle, compaction summary, /clean,
+  // memory re-injection). The thread already saw the originals, so feeding them again would
+  // duplicate history inside the model's context (Oct 4: 36 blocks / 59K chars re-fed). They
+  // are skipped (and marked seen below); only the tail after the last seen block is fed.
+  // Exception: a tool result for a call this thread still has parked is always delivered.
+  let toFeed = blocks, skipped = [];
   if (state) {
     const seen = new Set(state.sent);
-    toFeed = blocks.filter(b => !seen.has(blockHash(b)));
+    const hashes = blocks.map(blockHash);
+    let lastSeen = -1;
+    for (let i = 0; i < blocks.length; i++) if (seen.has(hashes[i])) lastSeen = i;
+    toFeed = [];
+    blocks.forEach((b, i) => {
+      if (seen.has(hashes[i])) return;
+      if (i < lastSeen && !(b.kind === "tool" && state.parked && state.parked[b.id])) skipped.push(b); else toFeed.push(b);
+    });
+    if (skipped.length) log(`[guard] HISTORY-EDIT key=${key.slice(0, 12)} ${skipped.length} unseen block(s) before last seen #${lastSeen} (~${skipped.reduce((n, b) => n + b.text.length, 0)} chars) — rewritten history, NOT fed; tail=${toFeed.length}`);
   }
 
   // guard: many UNSEEN blocks at once == probable full-history replay (the Oct 1 quota
@@ -354,8 +394,12 @@ async function handleChat(req) {
           log(`[guard] NEW THREAD key=${key.slice(0, 12)} reason=${invalidReason ? "state invalidated: " + invalidReason : "no prior state"} feed=${feedCount} blocks (~${feedChars} chars) sys=${sys.length} chars tools=${tools ? tools.length : 0}`);
           if (prevState) log(`[guard] DIFF prev: thread=${prevState.threadId} model=${prevState.model} sent=${(prevState.sent || []).length} blocks fp=${String(prevState.fingerprint).slice(0, 8)}`);
           if (prevState) notice("Сессия заменена", [prevState.model !== model ? `${prevState.model} → ${model}` : null, prevState.fingerprint !== fingerprint ? fpDiff(prevState, sys, toolNames, key) : null].filter(Boolean).join("; "));
-          const dynTools = (tools || []).map(t => ({ type: "function", name: t.function.name,
-            description: t.function.description || "", inputSchema: t.function.parameters || { type: "object" } }));
+          const toDyn = t => ({ type: "function", name: t.function.name,
+            description: t.function.description || "", inputSchema: t.function.parameters || { type: "object" } });
+          // offer every volatile tool ever seen, not just this request's — the thread can't gain tools later
+          const extraVolatile = Object.values(knownVolatile).filter(t => t?.function?.name && !allToolNames.includes(t.function.name));
+          const dynTools = [...(tools || []), ...extraVolatile].map(toDyn);
+          if (extraVolatile.length) log(`[tools] offering ${extraVolatile.length} volatile tool(s) absent from this request: ${extraVolatile.map(t => t.function.name).join(",")}`);
           const r = await srv.request("thread/start", {
             model, cwd: WORKDIR, approvalPolicy: "never", sandbox: SANDBOX,
             baseInstructions: sys || undefined,
@@ -396,6 +440,7 @@ async function handleChat(req) {
         }
 
         if (!oneUse) threadOwners.set(state.threadId, {key, model});
+        if (skipped.length) notice("Не отправлено", `${model}; ${skipped.length} старых блоков (~${Math.round(skipped.reduce((n, b) => n + b.text.length, 0) / 1000)}K симв.): история переписана, тред видел исходники`);
         if (feedCount > MAX_FEED) notice("Большой контекст", `${model}; +${feedCount} блоков; видено=${blocks.length-feedCount}/${blocks.length}`);
         // --- run turn (handlers FIRST — answering a parked call resumes the turn immediately) ---
         const parkedCalls = [];
@@ -460,6 +505,12 @@ async function handleChat(req) {
           },
           request: async m => {
             if (m.method === "item/tool/call") {
+              if (isVolatileTool(m.params.tool) && !allToolNames.includes(m.params.tool)) {
+                // tool exists in the thread but not for the client currently connected — don't park
+                // (Vellum would reject an unknown tool call); tell the model and let the turn continue
+                log(`[tool] ${m.params.tool} unavailable for the current client — error returned, not parked`);
+                return { contentItems: [{ type: "inputText", text: `Tool ${m.params.tool} is not available right now: the user's current device/client does not support it. Continue without it (for example, ask the user in plain text).` }], success: false };
+              }
               // park: ends this HTTP response as tool_calls; answered by a later request
               const callId = "call_" + Math.random().toString(36).slice(2);
               state.parked[callId] = { rpcId: m.id, name: m.params.tool };

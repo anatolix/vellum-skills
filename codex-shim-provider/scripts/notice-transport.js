@@ -5,6 +5,17 @@ import { randomUUID } from 'node:crypto';
 export const NOTICE_TOOL = '__shim_notice__';
 const PREFIX = 'call_shim_notice_';
 const SEP = '\n\n-------------------\n\n';
+// Channels that never render a failed tool's activity label (Telegram etc. deliver only the
+// assistant text): notices go out as a plain "⚠ ..." text line instead of the fake tool call.
+// Detected from the per-turn <turn_context> interface: / <channel_capabilities> channel: lines
+// in the latest user block. SHIM_NOTICE_TEXT_INTERFACES overrides the list; "" disables.
+const TEXT_INTERFACES = new Set((process.env.SHIM_NOTICE_TEXT_INTERFACES ?? 'telegram,whatsapp,slack,email,discord,phone,a2a').split(',').map(s => s.trim()).filter(Boolean));
+export function turnInterface(messages = []) {
+  const last = [...messages].reverse().find(m => m.role === 'user');
+  const txt = typeof last?.content === 'string' ? last.content : (last?.content || []).map(p => p?.text || '').join('\n');
+  const m = /<turn_context>[\s\S]*?^interface:\s*(\S+)/m.exec(txt) || /<channel_capabilities>[\s\S]*?^channel:\s*(\S+)/m.exec(txt);
+  return m ? m[1] : null;
+}
 const enc = new TextEncoder();
 export function cleanNotices(messages = []) {
   const ids = new Set();
@@ -34,7 +45,9 @@ export class NoticeTransport {
     if (req.method !== 'POST' || new URL(req.url).pathname !== '/v1/chat/completions') return handler(req);
     let body; try { body = await req.clone().json(); } catch { return handler(req); }
     const key = body.prompt_cache_key || req.headers.get('x-conversation-id');
-    const enabled = this.mode === 'tool' && !!key && !String(key).startsWith('router-oneuse-') && body.tools?.length > 0
+    const iface = turnInterface(body.messages);
+    const textMode = !!key && !String(key).startsWith('router-oneuse-') && TEXT_INTERFACES.has(iface);
+    const enabled = !textMode && this.mode === 'tool' && !!key && !String(key).startsWith('router-oneuse-') && body.tools?.length > 0
       && body.tool_choice !== 'none' && !body.response_format;
     const pending = this.pending.get(key);
     if (pending) {
@@ -52,7 +65,7 @@ export class NoticeTransport {
     let upstream; try { upstream = await handler(inner); } catch(e) { abort.abort(); throw e; }
     if (!upstream.ok || !upstream.headers.get('content-type')?.includes('text/event-stream')) return upstream;
     const st = {key, model:body.model, reader:upstream.body.getReader(), decoder:new TextDecoder(), buf:'',
-      queue:this.later.get(key) || [], enabled, active:true, abort, visible:false, id:'chatcmpl-shim-'+randomUUID()};
+      queue:this.later.get(key) || [], enabled, textMode, iface, active:true, abort, visible:false, id:'chatcmpl-shim-'+randomUUID()};
     this.later.delete(key);
     return this.resume(st, false);
   }
@@ -92,6 +105,12 @@ export class NoticeTransport {
             if(f===null)break;
             let o;try{o=f.startsWith('data: ') ? JSON.parse(f.slice(6).trim()) : null;}catch{}
             if(o?.shim_notice){
+              if(st.textMode){
+                // text channel: one plain warning line before the answer, never a tool call
+                console.log('[shim-notice]',`(text:${st.iface})`,o.shim_notice);
+                emit(`data: ${JSON.stringify({id:st.id,object:'chat.completion.chunk',model:st.model,choices:[{index:0,delta:{content:`⚠ ${o.shim_notice}\n\n`},finish_reason:null}]})}\n\n`);
+                continue;
+              }
               if(st.enabled && !visible){
                 self.park(st,o.shim_notice);
                 emit(await self.single(st).text());
