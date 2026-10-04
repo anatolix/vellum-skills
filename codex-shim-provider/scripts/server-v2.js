@@ -22,6 +22,7 @@ import { join } from "path";
 import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from "./notice-transport.js";
 import { promptForSession } from "./history-rehydration.js";
 import { codexThreadConfig } from "./thread-config.js";
+import { createSseWriter } from "./sse-writer.js";
 const noticeTransport = new NoticeTransport();
 const threadOwners = new Map();
 
@@ -372,10 +373,9 @@ async function handleCompaction({ req, key, model, blocks, lastUserBlock, effort
   }
   log(`[compact] ${tag} thread=${state.threadId} model=${model} instruction=${lastUserBlock.text.length} chars blocks=${blocks.length}`);
   const base = { id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model };
-  const enc = new TextEncoder();
+  let res;
   const stream = new ReadableStream({ async start(controller) {
-    let closed = false;
-    const res = { write: s => { if (!closed) controller.enqueue(enc.encode(s)); }, close: () => { if (!closed) { closed = true; controller.close(); } } };
+    res = createSseWriter(controller);
     const ka = setInterval(() => res.write(": keepalive\n\n"), 15000);
     const usage = { input: 0, output: 0, cached: 0 };
     const timeFn = async m => (m.method === "currentTime/read" ? { currentTimeAt: Math.floor(Date.now() / 1000) } : {});
@@ -452,7 +452,7 @@ async function handleCompaction({ req, key, model, blocks, lastUserBlock, effort
       sse(res, { ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
       res.write("data: [DONE]\n\n");
     } finally { clearInterval(ka); res.close(); }
-  } });
+  }, cancel() { res?.cancel(); } });
   return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" } });
 }
 
@@ -607,12 +607,12 @@ async function handleChat(req) {
 
   const headers = { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" };
   const base = { id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model };
-  const enc = new TextEncoder();
+  let res;
 
   const stream = new ReadableStream({
+    cancel() { res?.cancel(); },
     async start(controller) {
-      let closed = false;
-      const res = { write: s => { if (!closed) controller.enqueue(enc.encode(s)); }, close: () => { if (!closed) controller.close(); } };
+      res = createSseWriter(controller);
       const fail = msg => {
         sse(res, { ...base, choices: [{ index: 0, delta: { content: "⚠ codex: " + String(msg).slice(0, 500) } }] });
         sse(res, { ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
@@ -848,7 +848,6 @@ async function handleChat(req) {
         }
         res.write("data: [DONE]\n\n");
         res.close();
-        closed = true;
         threadHandlers.delete(state.threadId);
         if (oneUse) {
           if (parkedCalls.length) {

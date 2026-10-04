@@ -27,3 +27,18 @@ assistant conversations export <conversation-id> --format json
 ```
 
 Exports, journal content and `/chats` metadata may be private; use them locally, not as commit artifacts. Do not use `pkill -f server-v2` from a shell whose own command line contains that string: it can kill the calling shell. Prefer a planned `systemctl --user restart codex-shim.service` after the active turn.
+
+## Client interruption / closed SSE controller (Oct 4)
+
+A client abort used to close the ReadableStream controller while late app-server
+reasoning deltas still called `enqueue()`. The exception escaped the JSON-RPC
+notification reader and killed the entire shim (`ERR_INVALID_STATE`,
+`Controller is already closed`), affecting unrelated conversations.
+
+Chat and compaction now use `sse-writer.js`: cancellation marks the writer closed,
+close is idempotent, and the closed-controller TypeError is safely discarded.
+Other errors still propagate. Upstream turns, parked tool RPCs, persistence and
+other chats are not interrupted or deleted by an HTTP disconnect.
+
+Quota-free regressions: `bun test scripts/sse-writer.test.js` and
+`python3 tests/test-disconnect.py` (fake app-server; same-process recovery).
