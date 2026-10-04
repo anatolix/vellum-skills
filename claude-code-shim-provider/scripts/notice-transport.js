@@ -45,6 +45,11 @@ export class NoticeTransport {
     if (req.method !== 'POST' || new URL(req.url).pathname !== '/v1/chat/completions') return handler(req);
     let body; try { body = await req.clone().json(); } catch { return handler(req); }
     const key = body.prompt_cache_key || req.headers.get('x-conversation-id');
+    if (req.headers.get('x-call-site') === 'compactionAgent') {
+      // Vellum's summary call must come back as plain parseable text: no notice frames, no parking.
+      body.messages = cleanNotices(body.messages);
+      return handler(new Request(req.url, {method:req.method, headers:req.headers, body:JSON.stringify(body)}));
+    }
     const iface = turnInterface(body.messages);
     const textMode = !!key && !String(key).startsWith('router-oneuse-') && TEXT_INTERFACES.has(iface);
     const enabled = !textMode && this.mode === 'tool' && !!key && !String(key).startsWith('router-oneuse-') && body.tools?.length > 0

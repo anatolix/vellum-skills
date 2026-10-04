@@ -65,3 +65,7 @@ Monitor: `tail ~/codex-shim/fp-changes/changes.jsonl`.
 ## Text mode for channels without a tool-activity label (Oct 4)
 
 Telegram, Slack, WhatsApp, email, Discord, phone and a2a turns deliver only the assistant text, so the red failed-tool label never reaches the user. `notice-transport.js` reads the turn's channel from the latest user block — the `interface:` line of Vellum's per-turn `<turn_context>` (fallback: `channel:` in `<channel_capabilities>`); neither is stored in the DB or the system prompt. For interfaces in `SHIM_NOTICE_TEXT_INTERFACES` (default `telegram,whatsapp,slack,email,discord,phone,a2a`; empty disables) every notice is emitted as one plain `⚠ [shim] …` content line before the answer instead of the `__shim_notice__` tool call. Web/native clients are unchanged.
+
+## «Компакция» (Oct 4)
+
+Emitted once on the first request after a shim-side compaction: codex `«Компакция: <model>; summary N симв.; тред сжат за S с»`, claude `«Компакция: <model>; pre→post токенов; summary N симв.; за S с»`. It replaces the «Не отправлено» notice that the replaced history head would otherwise trigger.

@@ -255,6 +255,7 @@ class Chat {
     this.sessionId = saved?.sessionId ?? null;
     this.sent = saved?.sent ?? [];        // sha1 of every input block already fed to the session
     this.meta = saved?.meta ?? {};        // hash -> {len, head, tail} of fed blocks, for history-edit forensics
+    this.pendingCompactNotice = saved?.pendingCompactNotice ?? null;
     this.model = saved?.model ?? DEFAULT_MODEL;
     this.lastUsed = saved?.lastUsed ?? Date.now();
     this.served = saved?.served ?? 0;
@@ -272,8 +273,44 @@ class Chat {
   save() {
     if (this.oneUse) return; // one-use chats are never persisted
     try {
-      writeFileSync(this.file(), JSON.stringify({ key: this.key, sessionId: this.sessionId, model: this.model, sent: this.sent, meta: this.meta, sysHash: this.sysHash, effort: this.effort, lastUsed: this.lastUsed, served: this.served, savedAt: Date.now(), pendingNotices: this.pendingNotices, parkedWhy: this.parkedWhy }));
+      writeFileSync(this.file(), JSON.stringify({ key: this.key, sessionId: this.sessionId, model: this.model, sent: this.sent, meta: this.meta, pendingCompactNotice: this.pendingCompactNotice, sysHash: this.sysHash, effort: this.effort, lastUsed: this.lastUsed, served: this.served, savedAt: Date.now(), pendingNotices: this.pendingNotices, parkedWhy: this.parkedWhy }));
     } catch (e) { console.error(`[sess] save failed ${short(this.key)}: ${e.message}`); }
+  }
+  // Vellum compaction for this chat: the CLI compacts itself. The live process (started with
+  // verbatimPrompts, which disables slash commands) is parked; a one-off process resumes the
+  // same session with slash commands enabled, sends /compact and captures the CLI's own summary
+  // via the PostCompact hook. The next request resumes the compacted session from disk.
+  async compactViaCli(sdkModel, sys) {
+    if (this.live) { console.log(`[sess] ${short(this.key)} closing cli${this.cli.id} for compaction`); this.cli.close(); this.cli = null; this.parkedWhy = "compaction"; }
+    const sid = this.sessionId;
+    if (!sid) throw new Error("no session to compact");
+    let summary = null, boundary = null, result = null, alive = true, wake = null;
+    const inbox = ["/compact"];
+    async function* input() { while (alive) { if (!inbox.length) await new Promise((r) => (wake = r)); while (inbox.length) yield { type: "user", message: { role: "user", content: inbox.shift() }, parent_tool_use_id: null, session_id: sid }; } }
+    const q = query({ prompt: input(), options: {
+      model: sdkModel, resume: sid,
+      ...(sys ? { systemPrompt: { type: "custom", prompt: sys, snapshot: SYS_SNAPSHOT } } : {}),
+      verbatimPrompts: false,
+      env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN },
+      tools: [], allowedTools: [], permissionMode: "bypassPermissions", settingSources: [], includePartialMessages: false,
+      thinking: { type: "disabled" },
+      hooks: { PostCompact: [{ hooks: [async (inp) => { summary = inp.compact_summary || null; return {}; }] }] },
+    } });
+    const t0 = Date.now();
+    let finish; const done = new Promise((r) => (finish = r));
+    const timer = setTimeout(() => { alive = false; wake?.(); finish(); }, 240000);
+    (async () => { try { for await (const m of q) {
+        if (m.type === "system" && m.subtype === "compact_boundary") boundary = m.compact_metadata || null;
+        if (m.type === "result") { result = m; alive = false; wake?.(); finish(); }
+      } } catch (e) { console.log(`[compact] ${short(this.key)} stream error ${String(e?.message || e).slice(0, 120)}`); } finally { alive = false; wake?.(); finish(); } })();
+    await done; clearTimeout(timer);
+    try { await q.interrupt?.(); } catch {}
+    if (!summary) throw new Error(result && result.subtype !== "success" ? `compact failed: ${result.subtype}` : "compact produced no summary");
+    this.sessionId = result?.session_id || sid; this.lastUsed = Date.now();
+    this.pendingCompactNotice = `${sdkModel}; ${boundary?.pre_tokens ?? "?"}→${boundary?.post_tokens ?? "?"} токенов; summary ${summary.length} симв.; за ${Math.round((Date.now() - t0) / 1000)} с`;
+    this.save();
+    console.log(`[compact] ${short(this.key)} /compact done in ${Date.now() - t0}ms summary=${summary.length} chars pre=${boundary?.pre_tokens ?? "?"} post=${boundary?.post_tokens ?? "?"} tokens`);
+    return { summary, boundary, ms: Date.now() - t0 };
   }
   park(reason) {
     this.parkedWhy = reason;
@@ -378,7 +415,8 @@ class Chat {
         const matched = hashes.filter(h => prior.has(h)).length;
         if (unseen.length > FULL_HIST_MIN) diagnostic(onMsg, short(this.key), "Большой контекст", `+${unseen.length} блоков; видено=${matched}/${inputs.length}`);
         let lastSeenIdx = -1; for (let i = 0; i < hashes.length; i++) if (prior.has(hashes[i])) lastSeenIdx = i;
-        if (skippedOld.length) diagnostic(onMsg, short(this.key), "Не отправлено", `${model}; ${skippedOld.length} старых блоков (~${Math.round(skippedOld.reduce((n, b) => n + b.text.length, 0) / 1000)}K симв.): история переписана, CLI видел исходники`);
+        if (this.pendingCompactNotice) { diagnostic(onMsg, short(this.key), "Компакция", this.pendingCompactNotice); this.pendingCompactNotice = null; this.save(); }
+        else if (skippedOld.length) diagnostic(onMsg, short(this.key), "Не отправлено", `${model}; ${skippedOld.length} старых блоков (~${Math.round(skippedOld.reduce((n, b) => n + b.text.length, 0) / 1000)}K симв.): история переписана, CLI видел исходники`);
         else if (prior.size && lastSeenIdx < 0) diagnostic(onMsg, short(this.key), "История не совпала", `отправляю=${unseen.length}; видено=0/${inputs.length}`);
         const res = await this.cli.send(prompt, (m) => { produced = true; onMsg(m); });
         this.sent = [...seen]; this.sessionId = res.session_id || this.cli.sessionId; this.model = model; this.effort = effort ?? null; this.served++; this.lastUsed = Date.now();
@@ -995,6 +1033,49 @@ function usageFromResult(res) {
   };
 }
 
+// Build Vellum's <compaction_result> from the CLI's own summary. The verbatim tail starts at
+// the second-to-last real user turn (so the active exchange survives); Vellum resolves it by the
+// turn_context timestamp, falling back to the message preview.
+function buildCompactionResult(summary, blocks) {
+  const users = blocks.filter((b) => b.role === "user");
+  users.pop(); // the instruction itself
+  const tailBlock = users[users.length - 2] ?? users[users.length - 1] ?? null;
+  let ts = "", preview = "";
+  if (tailBlock) {
+    ts = (/current_time:\s*([^\n]+)/.exec(tailBlock.text) || [])[1] || "";
+    let t = tailBlock.text.replace(/^Human:\s*/, "");
+    while (t.startsWith("<") && t.includes("</")) { const m = t.match(/<\/[a-zA-Z_][\w-]*>\s*\n?/); if (!m || m.index === undefined) break; t = t.slice(m.index + m[0].length).trimStart(); }
+    preview = t.slice(0, 60).replace(/\s+/g, " ").replace(/"/g, "'");
+  }
+  let s = summary;
+  const inner = /<summary>([\s\S]*?)<\/summary>/.exec(s); if (inner) s = inner[1].trim();
+  return `<compaction_result>\n<summary>\n${s}\n</summary>\n\n<key_state>\n</key_state>\n\n<tail_start\n  timestamp="${ts.replace(/"/g, "'")}"\n  preview="${preview}" />\n</compaction_result>`;
+}
+async function handleCompaction({ model, sdkModel, cacheKey, blocks, id }) {
+  const tag = short(cacheKey);
+  const chat = manager.chats.get(cacheKey);
+  if (!chat || !(chat.sessionId || chat.cli?.sessionId)) { console.log(`[compact] ${tag} REJECTED: no session for this chat yet`); return Response.json({ error: { message: "claude-shim: nothing to compact — no session for this chat yet", type: "invalid_request_error", code: "no_session" } }, { status: 409 }); }
+  if (chat.busy) { console.log(`[compact] ${tag} REJECTED: chat busy`); return Response.json({ error: { message: "claude-shim: compaction deferred — a turn is in flight", type: "invalid_request_error", code: "busy" } }, { status: 409 }); }
+  console.log(`[compact] ${tag} session=${chat.sessionId || chat.cli?.sessionId} model=${sdkModel} blocks=${blocks.length}`);
+  const enc = new TextEncoder();
+  const stream = new ReadableStream({ async start(controller) {
+    let closed = false; const send = (s) => { if (closed) return; try { controller.enqueue(enc.encode(s)); } catch { closed = true; } };
+    const ka = setInterval(() => send(": keepalive\n\n"), 15000);
+    try {
+      send(sseChunk(id, model, { role: "assistant" }));
+      if (chat.cli?.sessionId && !chat.sessionId) chat.sessionId = chat.cli.sessionId;
+      const { summary } = await chat.compactViaCli(sdkModel, systemText(blocks));
+      const text = buildCompactionResult(summary, blocks);
+      send(sseChunk(id, model, { content: text }));
+      send(sseChunk(id, model, {}, "stop"));
+    } catch (e) {
+      console.log(`[compact] ${tag} ERROR ${String(e?.message || e).slice(0, 200)}`);
+      send(sseChunk(id, model, { content: "⚠ claude-shim compaction failed: " + String(e?.message || e).slice(0, 200) }));
+      send(sseChunk(id, model, {}, "stop"));
+    } finally { clearInterval(ka); send("data: [DONE]\n\n"); closed = true; try { controller.close(); } catch {} }
+  } });
+  return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" } });
+}
 function sseChunk(id, model, delta, finish = null) {
   return `data: ${JSON.stringify({
     id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model,
@@ -1058,6 +1139,18 @@ async function handleRequest(req) {
     const cacheKey = typeof body.prompt_cache_key === "string" && body.prompt_cache_key ? body.prompt_cache_key : null;
     if (!cacheKey) { console.log(`[req] REJECTED: no prompt_cache_key (full history without a chat id)`); return Response.json({ error: { message: "claude-shim: prompt_cache_key (chat id) is required; keyless requests are rejected" } }, { status: 400 }); }
     const id = "chatcmpl-" + Math.random().toString(36).slice(2);
+
+    // Vellum's compaction (summary) call — marked by X-Call-Site (local retry.ts patch) or
+    // recognisable by tool_choice=none + the <compaction_instructions> block. Handled by the
+    // CLI's own /compact, never as a normal turn.
+    {
+      const callSite = req.headers.get("x-call-site") || null;
+      const lastUserBlock = [...blocks].reverse().find((b) => b.role === "user") || null;
+      const toolChoice = typeof body.tool_choice === "string" ? body.tool_choice : body.tool_choice?.type;
+      if (callSite === "compactionAgent" || (toolChoice === "none" && lastUserBlock && /<(compaction_instructions|emergency_compaction)>/.test(lastUserBlock.text))) {
+        return handleCompaction({ model, sdkModel, cacheKey, blocks, id });
+      }
+    }
 
     const stream = new ReadableStream({
       cancel() { ac.abort?.(); },

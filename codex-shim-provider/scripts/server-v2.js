@@ -267,6 +267,114 @@ function fpDiff(prev, sys, names, key) {
   return parts.join("; ") || "настройки изменились";
 }
 
+// ---------- compaction ----------
+// The fork's model sometimes anchors <tail_start> on codex's own injected messages
+// (<environment_context>), which Vellum's history does not contain. Validate the marker against
+// the user blocks Vellum sent; if it resolves to nothing, substitute the second-to-last real
+// user turn (timestamp from its <turn_context>, preview = text after the injected tags).
+function blockPreview(text) {
+  let t = text;
+  while (t.startsWith("<") && t.includes("</")) { const m = t.match(/<\/[a-zA-Z_][\w-]*>\s*\n?/); if (!m || m.index === undefined) break; t = t.slice(m.index + m[0].length).trimStart(); }
+  return t.slice(0, 120);
+}
+function fixTailStart(text, blocks) {
+  const users = blocks.filter(b => b.kind === "user"); users.pop(); // the instruction itself
+  const m = /<tail_start[\s\S]*?timestamp="([^"]*)"[\s\S]*?preview="([^"]*)"[\s\S]*?\/>/.exec(text);
+  if (!m) return { text, fixed: false };
+  const ts = m[1].trim(), pv = m[2].trim().replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"');
+  const resolves = users.some(b => (ts && b.text.includes(ts)) || (pv && blockPreview(b.text).startsWith(pv.slice(0, 40))));
+  if (resolves) return { text, fixed: false };
+  const tb = users[users.length - 2] ?? users[users.length - 1];
+  if (!tb) return { text, fixed: false };
+  const nts = ((/current_time:\s*([^\n]+)/.exec(tb.text) || [])[1] || "").replace(/"/g, "'");
+  const npv = blockPreview(tb.text).slice(0, 60).replace(/\s+/g, " ").replace(/"/g, "'");
+  return { text: text.replace(m[0], `<tail_start\n  timestamp="${nts}"\n  preview="${npv}" />`), fixed: true, was: `${ts || "-"} / ${pv.slice(0, 40) || "-"}` };
+}
+// Vellum asks the chat's own model to summarise the history (<compaction_instructions> as the
+// trailing user message, tool_choice=none, expects <compaction_result>). Feeding that into the
+// live thread would leave a "summarise yourself" turn in its history forever. Instead:
+//   1) thread/fork the live thread (server-side copy, cached), run the instruction there,
+//      stream the model's <compaction_result> back to Vellum, delete the fork;
+//   2) thread/compact/start on the live thread so codex's own context shrinks too.
+// Nothing is fed to the live thread and no block is marked seen. Vellum then replaces its
+// history head with the summary; the rewritten tail is re-identified by tail match.
+async function handleCompaction({ req, key, model, blocks, lastUserBlock, effort, id }) {
+  const tag = key.slice(0, 12);
+  const state = ONEUSE_RE.test(key) ? (oneUseStates.get(key) ?? null) : loadState(key);
+  if (!state || !lastUserBlock) { log(`[compact] ${tag} REJECTED: no thread for this chat yet`); return jsonResp({ error: { message: "codex-shim: nothing to compact — no thread for this chat yet", type: "invalid_request_error", code: "no_thread" } }, 409); }
+  if (Object.keys(state.parked || {}).length) { log(`[compact] ${tag} REJECTED: tool call in flight`); return jsonResp({ error: { message: "codex-shim: compaction deferred — a tool call is in flight", type: "invalid_request_error", code: "busy" } }, 409); }
+  if (!liveThreads.has(state.threadId)) {
+    try { await srv.request("thread/resume", { threadId: state.threadId, excludeTurns: true }); liveThreads.add(state.threadId); }
+    catch (e) { log(`[compact] ${tag} resume failed: ${String(e).slice(0, 120)}`); return jsonResp({ error: { message: "codex-shim: thread could not be resumed for compaction", type: "server_error" } }, 503); }
+  }
+  log(`[compact] ${tag} thread=${state.threadId} model=${model} instruction=${lastUserBlock.text.length} chars blocks=${blocks.length}`);
+  const base = { id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model };
+  const enc = new TextEncoder();
+  const stream = new ReadableStream({ async start(controller) {
+    let closed = false;
+    const res = { write: s => { if (!closed) controller.enqueue(enc.encode(s)); }, close: () => { if (!closed) { closed = true; controller.close(); } } };
+    const ka = setInterval(() => res.write(": keepalive\n\n"), 15000);
+    const usage = { input: 0, output: 0, cached: 0 };
+    const timeFn = async m => (m.method === "currentTime/read" ? { currentTimeAt: Math.floor(Date.now() / 1000) } : {});
+    try {
+      // 1) side summary in a fork
+      const fork = await srv.request("thread/fork", { threadId: state.threadId });
+      const fid = fork.thread.id; liveThreads.add(fid);
+      let text = "", done = false, turnError = null;
+      threadHandlers.set(fid, {
+        notif: (method, p) => {
+          if (method === "item/agentMessage/delta") text += p.delta || "";
+          else if (method === "thread/tokenUsage/updated") { const u = p.tokenUsage?.last || {}; usage.input = u.inputTokens || 0; usage.output = u.outputTokens || 0; usage.cached = u.cachedInputTokens || 0; }
+          else if (method === "turn/completed") { done = true; if (p.turn?.status === "failed" || p.turn?.error) turnError = p.turn?.error?.message || JSON.stringify(p.turn?.error || "turn failed"); }
+        },
+        request: async m => {
+          if (m.method === "item/tool/call") { log(`[compact] ${tag} fork tried tool ${m.params?.tool} — refused`); return { contentItems: [{ type: "inputText", text: "Tools are disabled during compaction. Answer in text only, in the requested format." }], success: false }; }
+          return timeFn(m);
+        },
+      });
+      const f0 = Date.now();
+      await srv.request("turn/start", { threadId: fid, input: [{ type: "text", text: lastUserBlock.text, text_elements: [] }], summary: "concise", ...(effort ? { effort: String(effort) } : {}) });
+      const deadline = Date.now() + 240000;
+      while (!done && Date.now() < deadline) await new Promise(r => setTimeout(r, 150));
+      threadHandlers.delete(fid); liveThreads.delete(fid);
+      try { await srv.request("thread/delete", { threadId: fid }); } catch (e) { log(`[compact] ${tag} fork delete failed: ${String(e).slice(0, 100)}`); }
+      if (!done) throw new Error("fork summary timed out");
+      if (turnError) throw new Error(turnError);
+      const ok = text.includes("<compaction_result>");
+      if (ok) { const fx = fixTailStart(text, blocks); if (fx.fixed) { log(`[compact] ${tag} tail_start did not resolve (${fx.was}) — substituted second-to-last user turn`); text = fx.text; } }
+      log(`[compact] ${tag} fork summary ${text.length} chars in ${Date.now() - f0}ms valid=${ok} in=${usage.input} cached=${usage.cached} out=${usage.output}`);
+      sse(res, { ...base, choices: [{ index: 0, delta: { role: "assistant", content: text } }] });
+      // 2) native compaction of the live thread
+      if (ok) {
+        const c0 = Date.now(); let compacted = false, cFailed = null;
+        threadHandlers.set(state.threadId, { notif: (method, p) => {
+            if (method === "item/completed" && p.item?.type === "contextCompaction") compacted = true;
+            if (method === "turn/completed" && (p.turn?.status === "failed" || p.turn?.error)) cFailed = p.turn?.error?.message || "compaction turn failed";
+          }, request: timeFn });
+        try {
+          await srv.request("thread/compact/start", { threadId: state.threadId });
+          const cd = Date.now() + 180000;
+          while (!compacted && !cFailed && Date.now() < cd) await new Promise(r => setTimeout(r, 150));
+          log(`[compact] ${tag} native compaction ${compacted ? "done" : cFailed ? "FAILED: " + cFailed : "TIMEOUT"} in ${Date.now() - c0}ms`);
+          if (compacted) { state.compactedAt = Date.now(); state.compactions = (state.compactions || 0) + 1; }
+          state.pendingCompactNotice = `${model}; summary ${text.length} симв.; тред ${compacted ? "сжат" : "НЕ сжат"} за ${Math.round((Date.now() - c0) / 1000)} с`;
+          persistState(key, state);
+        } catch (e) { log(`[compact] ${tag} native compaction error: ${String(e).slice(0, 120)}`); }
+        finally { threadHandlers.delete(state.threadId); }
+      }
+      sse(res, { ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+      sse(res, { ...base, choices: [], usage: { prompt_tokens: usage.input, completion_tokens: usage.output, total_tokens: usage.input + usage.output, prompt_tokens_details: { cached_tokens: usage.cached } } });
+      res.write("data: [DONE]\n\n");
+    } catch (e) {
+      log(`[compact] ${tag} ERROR ${String(e).slice(0, 200)}`);
+      sse(res, { ...base, choices: [{ index: 0, delta: { content: "⚠ codex-shim compaction failed: " + String(e).slice(0, 200) } }] });
+      sse(res, { ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+      res.write("data: [DONE]\n\n");
+    } finally { clearInterval(ka); res.close(); }
+  } });
+  return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" } });
+}
+
 // ---------- HTTP ----------
 function sse(res, obj) { res.write(`data: ${JSON.stringify(obj)}\n\n`); }
 const cid = () => "chatcmpl-" + Math.random().toString(36).slice(2);
@@ -318,6 +426,15 @@ async function handleChat(req) {
   }
   const effort = requestedEffort ?? process.env.SHIM_DEFAULT_EFFORT ?? "high";
 
+  // --- Vellum's compaction (summary) call: never a normal turn. Marked by X-Call-Site (local
+  // retry.ts patch) or recognisable by tool_choice=none + the <compaction_instructions> block.
+  const callSite = req.headers.get("x-call-site") || null;
+  const lastUserBlock = [...blocks].reverse().find(b => b.kind === "user") || null;
+  const toolChoice = typeof body.tool_choice === "string" ? body.tool_choice : body.tool_choice?.type;
+  if (callSite === "compactionAgent" || (toolChoice === "none" && lastUserBlock && /<(compaction_instructions|emergency_compaction)>/.test(lastUserBlock.text))) {
+    return handleCompaction({ req, key, model, blocks, lastUserBlock, effort, id });
+  }
+
   const oneUse = ONEUSE_RE.test(key);
   let state = oneUse ? (oneUseStates.get(key) ?? null) : key ? loadState(key) : null;
   // One-time migration: sessions fingerprinted before volatile tools were excluded. Match on the
@@ -348,11 +465,22 @@ async function handleChat(req) {
     const hashes = blocks.map(blockHash);
     let lastSeen = -1;
     for (let i = 0; i < blocks.length; i++) if (seen.has(hashes[i])) lastSeen = i;
-    toFeed = []; const skippedIdx = [];
+    // A block whose hash changed but whose last 200 chars match a block this thread already
+    // received is the same block with rewritten injections (Vellum strips <memory>/<channel_
+    // capabilities>/... from the kept tail on compaction) — count it as seen wherever it sits.
+    const tailIndex = new Map();
+    for (const [h, m] of Object.entries(state.meta || {})) if (m && m.len >= 300 && m.tail) tailIndex.set(m.tail, h);
+    const seenNow = blocks.map((b, i) => seen.has(hashes[i]) || (b.text.length >= 300 && tailIndex.has(b.text.slice(-200))));
+    lastSeen = -1; for (let i = 0; i < blocks.length; i++) if (seenNow[i]) lastSeen = i;
+    toFeed = []; const skippedIdx = []; let tailMatched = 0;
     blocks.forEach((b, i) => {
       if (seen.has(hashes[i])) return;
-      if (i < lastSeen && !(b.kind === "tool" && state.parked && state.parked[b.id])) { skipped.push(b); skippedIdx.push(i); } else toFeed.push(b);
+      const parkedTool = b.kind === "tool" && state.parked && state.parked[b.id];
+      if (parkedTool) { toFeed.push(b); return; }
+      if (seenNow[i]) { tailMatched++; skipped.push(b); skippedIdx.push(i); return; }
+      if (i < lastSeen) { skipped.push(b); skippedIdx.push(i); } else toFeed.push(b);
     });
+    if (tailMatched) log(`[guard] ${tailMatched} rewritten block(s) re-identified by tail match key=${key.slice(0, 12)}`);
     if (skipped.length) {
       log(`[guard] HISTORY-EDIT key=${key.slice(0, 12)} ${skipped.length} unseen block(s) before last seen #${lastSeen} (~${skipped.reduce((n, b) => n + b.text.length, 0)} chars) — rewritten history, NOT fed; tail=${toFeed.length}`);
       dumpHistoryEdit(key.slice(0, 12), { key: key.slice(0, 12), thread: state.threadId, model: state.model }, blocks, hashes, skippedIdx, lastSeen, state.sent || [], state.meta || {});
@@ -463,7 +591,8 @@ async function handleChat(req) {
         }
 
         if (!oneUse) threadOwners.set(state.threadId, {key, model});
-        if (skipped.length) notice("Не отправлено", `${model}; ${skipped.length} старых блоков (~${Math.round(skipped.reduce((n, b) => n + b.text.length, 0) / 1000)}K симв.): история переписана, тред видел исходники`);
+        if (state.pendingCompactNotice) { notice("Компакция", state.pendingCompactNotice); delete state.pendingCompactNotice; persistState(key, state); }
+        else if (skipped.length) notice("Не отправлено", `${model}; ${skipped.length} старых блоков (~${Math.round(skipped.reduce((n, b) => n + b.text.length, 0) / 1000)}K симв.): история переписана, тред видел исходники`);
         if (feedCount > MAX_FEED) notice("Большой контекст", `${model}; +${feedCount} блоков; видено=${blocks.length-feedCount}/${blocks.length}`);
         // --- run turn (handlers FIRST — answering a parked call resumes the turn immediately) ---
         const parkedCalls = [];
