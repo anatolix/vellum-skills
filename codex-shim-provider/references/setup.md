@@ -114,3 +114,24 @@ The shim applies the same policy to every thread start/resume through
 `thread-config.js`; `SHIM_NATIVE_TOOLS` does not re-enable native agents.
 Existing threads may retain historical developer text; verify on a fresh thread.
 Sandbox and approval settings are unchanged.
+
+## Native web search and image generation
+
+Native OpenAI web/image tools do not pass through Vellum tool approval gates.
+Keep them disabled globally in `~/.codex/config.toml`:
+
+```toml
+web_search = "disabled" # top-level, before any table
+
+[features]
+image_generation = false
+```
+
+`thread-config.js` also pins `web_search: "disabled"` and
+`features.image_generation: false` on every thread/start and thread/resume.
+These settings stay off even with `SHIM_NATIVE_TOOLS=1`. Vellum's own
+`web_search`, `web_fetch`, and image generation integration are unaffected.
+After changing the helper, restart only codex-shim when idle and verify a
+fresh thread by inspecting its actual `ALL_TOOLS`; neither `web__run` nor
+`image_gen__imagegen` should be offered. Existing sessions may retain old
+textual descriptions until a new turn/thread refreshes their tools.
