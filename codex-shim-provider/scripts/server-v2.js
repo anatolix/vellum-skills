@@ -110,6 +110,13 @@ srv.start();
 // per-thread handler registry (multiple concurrent conversations)
 const threadHandlers = new Map(); // threadId -> { notif(method,p), request(m) }
 const liveThreads = new Set();    // threads loaded in the current app-server process
+const compactLocks = new Map();   // threadId -> Promise: native compaction in flight; turns wait for it
+async function awaitCompactLock(threadId, tag) {
+  const p = compactLocks.get(threadId); if (!p) return;
+  const t0 = Date.now(); log(`[compact] ${tag} turn waits for native compaction`);
+  await Promise.race([p, new Promise(r => setTimeout(r, 200000))]);
+  log(`[compact] ${tag} wait over after ${Date.now() - t0}ms`);
+}
 srv.onExit = code => {
   for (const [tid, owner] of threadOwners) {
     noticeTransport.queue(owner.key, noticeText("codex-shim", "CLI завершён", `${owner.model}; код=${code}`));
@@ -339,7 +346,11 @@ async function handleCompaction({ req, key, model, blocks, lastUserBlock, effort
   const tag = key.slice(0, 12);
   const state = ONEUSE_RE.test(key) ? (oneUseStates.get(key) ?? null) : loadState(key);
   if (!state || !lastUserBlock) { log(`[compact] ${tag} REJECTED: no thread for this chat yet`); return jsonResp({ error: { message: "codex-shim: nothing to compact — no thread for this chat yet", type: "invalid_request_error", code: "no_thread" } }, 409); }
-  if (Object.keys(state.parked || {}).length) { log(`[compact] ${tag} REJECTED: tool call in flight`); return jsonResp({ error: { message: "codex-shim: compaction deferred — a tool call is in flight", type: "invalid_request_error", code: "busy" } }, 409); }
+  // A parked tool call means the live turn is still open: fork for the summary anyway (fork copies
+  // history server-side), skip the native compaction — it would fail on an active turn.
+  const parkedNow = Object.keys(state.parked || {}).length;
+  if (parkedNow) log(`[compact] ${tag} tool call in flight (${parkedNow}) — summary only, native compaction skipped`);
+  if (compactLocks.has(state.threadId)) { log(`[compact] ${tag} REJECTED: compaction already running`); return jsonResp({ error: { message: "codex-shim: compaction already in progress", type: "invalid_request_error", code: "busy" } }, 409); }
   if (!liveThreads.has(state.threadId)) {
     try { await srv.request("thread/resume", { threadId: state.threadId, excludeTurns: true }); liveThreads.add(state.threadId); }
     catch (e) { log(`[compact] ${tag} resume failed: ${String(e).slice(0, 120)}`); return jsonResp({ error: { message: "codex-shim: thread could not be resumed for compaction", type: "server_error" } }, 503); }
@@ -385,27 +396,38 @@ async function handleCompaction({ req, key, model, blocks, lastUserBlock, effort
       }
       log(`[compact] ${tag} fork summary ${text.length} chars in ${Date.now() - f0}ms valid=${ok} in=${usage.input} cached=${usage.cached} out=${usage.output}`);
       sse(res, { ...base, choices: [{ index: 0, delta: { role: "assistant", content: text } }] });
-      // 2) native compaction of the live thread
-      if (ok) {
-        const c0 = Date.now(); let compacted = false, cFailed = null;
-        threadHandlers.set(state.threadId, { notif: (method, p) => {
-            if (method === "item/completed" && p.item?.type === "contextCompaction") compacted = true;
-            if (method === "turn/completed" && (p.turn?.status === "failed" || p.turn?.error)) cFailed = p.turn?.error?.message || "compaction turn failed";
-          }, request: timeFn });
-        try {
-          await srv.request("thread/compact/start", { threadId: state.threadId });
-          const cd = Date.now() + 180000;
-          while (!compacted && !cFailed && Date.now() < cd) await new Promise(r => setTimeout(r, 150));
-          log(`[compact] ${tag} native compaction ${compacted ? "done" : cFailed ? "FAILED: " + cFailed : "TIMEOUT"} in ${Date.now() - c0}ms`);
-          if (compacted) { state.compactedAt = Date.now(); state.compactions = (state.compactions || 0) + 1; }
-          state.pendingCompactNotice = `${model}; summary ${text.length} симв.; тред ${compacted ? "сжат" : "НЕ сжат"} за ${Math.round((Date.now() - c0) / 1000)} с`;
-          persistState(key, state);
-        } catch (e) { log(`[compact] ${tag} native compaction error: ${String(e).slice(0, 120)}`); }
-        finally { threadHandlers.delete(state.threadId); }
-      }
       sse(res, { ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
       sse(res, { ...base, choices: [], usage: { prompt_tokens: usage.input, completion_tokens: usage.output, total_tokens: usage.input + usage.output, prompt_tokens_details: { cached_tokens: usage.cached } } });
       res.write("data: [DONE]\n\n");
+      res.close();
+      // 2) native compaction of the live thread — detached from Vellum's stream (it already has the
+      // summary); the next turn on this thread waits on compactLocks instead of hitting
+      // ActiveTurnNotSteerable. Skipped while a tool call is parked (turn still open).
+      if (ok && !parkedNow) {
+        const done = (async () => {
+          const c0 = Date.now(); let compacted = false, cFailed = null;
+          const prevHandler = threadHandlers.get(state.threadId);
+          threadHandlers.set(state.threadId, { notif: (method, p) => {
+              if (method === "item/completed" && p.item?.type === "contextCompaction") compacted = true;
+              if (method === "turn/completed") { if (p.turn?.status === "failed" || p.turn?.error) cFailed = p.turn?.error?.message || "compaction turn failed"; else compacted = compacted || true; }
+            }, request: timeFn });
+          try {
+            await srv.request("thread/compact/start", { threadId: state.threadId });
+            const cd = Date.now() + 180000;
+            while (!compacted && !cFailed && Date.now() < cd) await new Promise(r => setTimeout(r, 150));
+            log(`[compact] ${tag} native compaction ${compacted ? "done" : cFailed ? "FAILED: " + cFailed : "TIMEOUT"} in ${Date.now() - c0}ms`);
+            const st = loadState(key) || state;
+            if (compacted) { st.compactedAt = Date.now(); st.compactions = (st.compactions || 0) + 1; }
+            st.pendingCompactNotice = `${model}; summary ${text.length} симв.; тред ${compacted ? "сжат" : "НЕ сжат"} за ${Math.round((Date.now() - c0) / 1000)} с`;
+            persistState(key, st);
+          } catch (e) { log(`[compact] ${tag} native compaction error: ${String(e).slice(0, 120)}`); }
+          finally { if (prevHandler) threadHandlers.set(state.threadId, prevHandler); else threadHandlers.delete(state.threadId); }
+        })();
+        compactLocks.set(state.threadId, done);
+        done.finally(() => { if (compactLocks.get(state.threadId) === done) compactLocks.delete(state.threadId); });
+      } else if (ok) {
+        state.pendingCompactNotice = `${model}; summary ${text.length} симв.; тред НЕ сжат (tool call в полёте)`; persistState(key, state);
+      }
     } catch (e) {
       log(`[compact] ${tag} ERROR ${String(e).slice(0, 200)}`);
       sse(res, { ...base, choices: [{ index: 0, delta: { content: "⚠ codex-shim compaction failed: " + String(e).slice(0, 200) } }] });
@@ -635,6 +657,7 @@ async function handleChat(req) {
         }
 
         if (!oneUse) threadOwners.set(state.threadId, {key, model});
+        if (compactLocks.has(state.threadId)) { await awaitCompactLock(state.threadId, key.slice(0, 12)); const fresh = loadState(key); if (fresh?.pendingCompactNotice) state.pendingCompactNotice = fresh.pendingCompactNotice; }
         if (state.pendingCompactNotice) { notice("Компакция", state.pendingCompactNotice); delete state.pendingCompactNotice; persistState(key, state); }
         else if (skipped.length) notice("Не отправлено", `${model}; ${skipped.length} старых блоков (~${Math.round(skipped.reduce((n, b) => n + b.text.length, 0) / 1000)}K симв.): история переписана, тред видел исходники`);
         if (feedCount > MAX_FEED) notice("Большой контекст", `${model}; +${feedCount} блоков; видено=${blocks.length-feedCount}/${blocks.length}`);
