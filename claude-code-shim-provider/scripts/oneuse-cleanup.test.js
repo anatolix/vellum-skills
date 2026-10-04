@@ -1,0 +1,43 @@
+import {test, expect} from 'bun:test';
+import {readFileSync} from 'node:fs';
+import {isOutputOnlyBatch,closeOneUseSession} from './oneuse-cleanup.js';
+const key='router-oneuse-test';
+const tools=(...names)=>names.map(name=>({type:'function',function:{name}}));
+const batch=(...names)=>names.map(name=>({name:'mcp__vellum__'+name}));
+for(const name of ['record_conversation_title','select_pages','select_pages_to_inject','search_sources','inspect_workspace_paths','finish_recall'])
+ test('output protocol '+name,()=>expect(isOutputOnlyBatch(key,tools(name),batch(name))).toBe(true));
+test('recall round with multiple independent searches',()=>expect(isOutputOnlyBatch(key,tools('search_sources','inspect_workspace_paths','finish_recall'),batch('search_sources','search_sources'))).toBe(true));
+test('recall inspection and finish',()=>expect(isOutputOnlyBatch(key,tools('search_sources','inspect_workspace_paths','finish_recall'),batch('inspect_workspace_paths','finish_recall'))).toBe(true));
+test('persistent chat never closed',()=>expect(isOutputOnlyBatch('conversation-123',tools('finish_recall'),batch('finish_recall'))).toBe(false));
+test('keyless never closed',()=>expect(isOutputOnlyBatch(null,tools('finish_recall'),batch('finish_recall'))).toBe(false));
+test('memory worker remains a real tool round trip',()=>expect(isOutputOnlyBatch(key,tools('bash','file_read','file_write','recall','delete_memory_page'),batch('bash'))).toBe(false));
+test('mixed main-agent registry remains alive even for finish_recall',()=>expect(isOutputOnlyBatch(key,tools('bash','finish_recall'),batch('finish_recall'))).toBe(false));
+test('unknown tool in batch is not terminal',()=>expect(isOutputOnlyBatch(key,tools('finish_recall'),batch('bash'))).toBe(false));
+test('empty tools or batch not terminal',()=>{expect(isOutputOnlyBatch(key,[],batch('finish_recall'))).toBe(false);expect(isOutputOnlyBatch(key,tools('finish_recall'),[])).toBe(false)});
+test('unknown definitions are not terminal',()=>expect(isOutputOnlyBatch(key,[{type:'custom'}],batch('finish_recall'))).toBe(false));
+test('unprefixed tool name works',()=>expect(isOutputOnlyBatch(key,tools('finish_recall'),[{name:'finish_recall'}])).toBe(true));
+test('closes CLI before resolving, clears owned timers only, wakes waiter once',async()=>{
+ const events=[];let timerFired=false;
+ const ownedTimer=setTimeout(()=>{timerFired=true},5);const otherTimer=setTimeout(()=>{},10000);
+ const own={chatKey:key,timer:ownedTimer,resolve:()=>events.push('resolve')};
+ const other={chatKey:'other',timer:otherTimer,resolve:()=>events.push('wrong')};
+ const pending=new Map([['own',own],['other',other]]);const early=new Map([['own',{}],['other',{}]]);
+ const emitted=new Set(['own','other']),consumed=new Set(['own','other']);
+ const chat={cli:{close:()=>events.push('close')},busy:false};const sessions=new Map([[key,chat],['other',{}]]);
+ const waiters=[()=>events.push('wake')];const args={key,sessions,pending,early,emitted,consumed,waiters,reason:'output batch'};
+ expect(closeOneUseSession(args)).toBe(true);expect(chat.outputComplete).toBe(true);expect(chat.cli).toBe(null);
+ expect(events).toEqual(['close','resolve','wake']);expect(pending.has('other')).toBe(true);
+ expect(sessions.has('other')).toBe(true);expect(early.has('own')).toBe(false);expect(emitted.has('own')).toBe(false);expect(consumed.has('own')).toBe(false);
+ expect(closeOneUseSession(args)).toBe(false);expect(events.length).toBe(3);
+ await Bun.sleep(15);expect(timerFired).toBe(false);clearTimeout(otherTimer);
+});
+test('idle close does not mark output complete',()=>{const c={cli:{close(){}}};const sessions=new Map([[key,c]]);closeOneUseSession({key,sessions,pending:new Map(),reason:'idle'});expect(c.outputComplete).toBeUndefined()});
+test('handler wires terminal detection AFTER response snapshot and before exit',()=>{
+ const s=readFileSync(new URL('./server-v3.js',import.meta.url),'utf8');
+ expect(s).toContain("from './oneuse-cleanup.js'");
+ expect(s).toContain('isOutputOnlyBatch(cacheKey, tools, toolUses)');
+ expect(s).toContain('(manager.oneuse.get(cacheKey) || manager.chats.get(cacheKey))?.cli?.markObserved()');
+ expect(s).toContain('if (this.outputComplete) throw e;');
+ expect(s).toContain("ONEUSE_RE.test(chatKey) && !manager.oneuse.has(chatKey)");
+ expect(s.indexOf('manager.destroyOneUse(cacheKey, "output batch")')).toBeGreaterThan(s.indexOf('closed = true; // anything the CLI emits'));
+});

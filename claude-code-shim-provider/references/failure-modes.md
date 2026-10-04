@@ -72,3 +72,18 @@ Expected — the redirect goes to a loopback listener. Copy the full redirect UR
 **Cause:** Vellum sends `<context_summary>` as assistant-role history. `inputBlocks` excluded all assistant messages because a warm CLI already owns them. A fresh CLI does not.
 **Fix:** `promptForSession(extra.historyMessages, tail, freshSession)` rehydrates all non-system OpenAI messages (summary, user/assistant tail, tool-call/result text) only when no resumable session/live CLI exists. The ephemeral and resume-failure paths use the same reconstruction. Warm/resumed CLI sessions continue to receive only new inputs; changing Claude models in the same live session does NOT itself require reconstruction.
 **Regression:** force a genuinely fresh session key with ONLY assistant summary + kept user tail. A normal in-session Claude model switch can falsely appear to pass even if summary reconstruction remains broken. Full UI history remains unchanged; the source is the incoming compacted request, not a second archive.
+
+## Internal output-tool CLI retention (Oct 4, 2026)
+
+Vellum title generation, page selection and agentic recall consume a tool batch
+as the whole response. Recall also executes search/inspection locally and
+reconstructs the next prompt; it does not send a native tool_result back.
+Previously each router-oneuse CLI waited until the 15-minute idle reaper.
+`oneuse-cleanup.js` recognises only exclusively allowlisted internal output-tool
+registries and closes them after snapshotting their SSE tool_calls. It closes
+inference before resolving/discarding owned pending MCP handlers and timers.
+Persistent chats, mixed tool registries and memory workers keep real tool
+roundtrips. The SDK child can take about 2–3 seconds to exit after close.
+Oneuse batches also need markObserved, otherwise attach replays an already
+answered old batch; the handler now marks both oneuse and normal chats.
+Tests: `bun test claude-code-shim-provider/scripts/oneuse-cleanup.test.js`.

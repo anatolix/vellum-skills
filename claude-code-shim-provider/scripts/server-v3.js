@@ -16,6 +16,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from "./notice-transport.js";
 import { promptForSession } from "./history-rehydration.js";
+import { isOutputOnlyBatch, closeOneUseSession } from './oneuse-cleanup.js';
 const noticeTransport = new NoticeTransport();
 const TOOL_MODE = process.env.SHIM_TOOL_MODE || "mcp"; // mcp | text
 const BATCH_IDLE_MS = Number(process.env.SHIM_BATCH_IDLE_MS || 5000);
@@ -429,6 +430,7 @@ class Chat {
         console.log(`[sess] ${short(this.key)} served #${this.served} model=${model} prep=${tPrep}ms total=${Date.now() - t0}ms in=${res.usage?.input_tokens ?? "?"} cache_read=${res.usage?.cache_read_input_tokens ?? "?"} session=${this.sessionId}`);
         return res;
       } catch (e) {
+        if (this.outputComplete) throw e; // intentional terminal-output cancellation, not a CLI failure
         diagnostic(onMsg, short(this.key), "Ошибка CLI", `${model}; ${String(e?.message || e).slice(0, 120)}`);
         this.cli?.die(e); this.cli = null;
         if (produced || attempt) throw e;
@@ -466,10 +468,13 @@ const manager = {
     const c = this.oneuse.get(key);
     if (!c || c.busy) return;
     for (const p of pendingToolUses.values()) if (p.chatKey === key) return; // tool round trip still in flight
-    console.log(`[sess] ${short(key)} oneuse turn done — cli closed, nothing persisted`);
-    if (c.cli) { c.cli.close(); c.cli = null; }
-    this.oneuse.delete(key);
-    const w = this.oneuseWaiters.shift(); if (w) w();
+    this.destroyOneUse(key, "turn done");
+  },
+  destroyOneUse(key, reason) {
+    console.log(`[sess] ${short(key)} oneuse ${reason} — cli closed, pending cleared`);
+    return closeOneUseSession({ key, sessions: this.oneuse, pending: pendingToolUses,
+      early: earlyResults, emitted: emittedToolIds, consumed: consumedToolIds,
+      waiters: this.oneuseWaiters, reason });
   },
   get(key) {
     let c = this.chats.get(key);
@@ -498,10 +503,7 @@ const manager = {
     const now = Date.now();
     for (const c of this.oneuse.values()) {
       if (!c.busy && now - c.lastUsed > ONEUSE_IDLE_MS) {
-        console.log(`[sess] ${short(c.key)} oneuse idle reaped`);
-        if (c.cli) { c.cli.close(); c.cli = null; }
-        this.oneuse.delete(c.key);
-        const w = this.oneuseWaiters.shift(); if (w) w();
+        this.destroyOneUse(c.key, "idle reaped");
       }
     }
     for (const c of this.chats.values()) {
@@ -576,8 +578,9 @@ const manager = {
   status() {
     return {
       version: SHIM_VERSION, verbatim: VERBATIM, fallbackModel: FALLBACK_MODEL || null, rateLimits: this.rateLimits?.info ?? null, maxLive: MAX_LIVE, maxOneshot: MAX_ONESHOT, idleTtlSec: IDLE_TTL_MS / 1000, live: this.liveCount(), oneshot: [...this.ephemeral].map((c) => ({ cli: c.id, label: c.label, model: c.model })), waiters: this.waiters.length, oneshotWaiters: this.oneshotWaiters.length,
-      maxOneuse: MAX_ONEUSE,
-      oneuseChats: [...this.oneuse.values()].map((c) => ({ key: short(c.key), live: c.live, busy: c.busy, cli: c.cli?.id ?? null, model: c.model, served: c.served, idleSec: Math.round((Date.now() - c.lastUsed) / 1000) })),
+      maxOneuse: MAX_ONEUSE, liveOneuse: this.liveOneUse(), pendingToolCount: pendingToolUses.size,
+      pendingTools: [...pendingToolUses.values()].map(p => ({ keyHash: p.chatKey ? sha(p.chatKey).slice(0, 12) : null, name: p.name, ageSec: Math.round((Date.now() - p.at) / 1000) })),
+      oneuseChats: [...this.oneuse.values()].map((c) => ({ key: short(c.key), keyHash: sha(c.key).slice(0, 12), live: c.live, busy: c.busy, cli: c.cli?.id ?? null, model: c.model, served: c.served, idleSec: Math.round((Date.now() - c.lastUsed) / 1000) })),
       chats: [...this.chats.values()].map((c) => ({ key: short(c.key), live: c.live, busy: c.busy, cli: c.cli?.id ?? null, model: c.model, actual: c.cli?.actualModel ?? null, served: c.served, sent: c.sent.length, session: c.sessionId, idleSec: Math.round((Date.now() - c.lastUsed) / 1000) })),
     };
   },
@@ -702,6 +705,10 @@ function rekeyPending(tu, chatKey) {
 const earlyResults = new Map();
 const emittedToolIds = new Set(); // tool_use ids this process forwarded to Vellum
 function waitForVellum(name, id, args, signal, chatKey, real = false) {
+  // Queued SDK handlers can arrive after a terminal batch closed its CLI.
+  // They must not recreate pending entries (and 1-hour timers) for dead sessions.
+  if (chatKey && ONEUSE_RE.test(chatKey) && !manager.oneuse.has(chatKey))
+    return Promise.resolve({ content: [{ type: "text", text: "[shim] one-use session already closed" }], isError: true });
   const early = earlyResults.get(id);
   if (early) { earlyResults.delete(id); console.log(`[mcp] ${id} (${name}) served from early result`); return Promise.resolve(early); }
   return new Promise((resolve, reject) => {
@@ -1258,7 +1265,7 @@ async function handleRequest(req) {
               // the handler registered under a provisional id; re-key it to the real tool_use id
               for (const tu of toolUses) { rekeyPending(tu, cacheKey); emittedToolIds.add(tu.id); }
               if (emittedToolIds.size > 5000) emittedToolIds.delete(emittedToolIds.values().next().value);
-              if (cacheKey) manager.chats.get(cacheKey)?.cli?.markObserved();
+              if (cacheKey) (manager.oneuse.get(cacheKey) || manager.chats.get(cacheKey))?.cli?.markObserved();
               send(sseChunk(id, model, { tool_calls }));
               send(sseChunk(id, model, {}, "tool_calls"));
               console.log(`[res] tool_calls(mcp)=${toolUses.map((t) => t.name).join(",")} pending=${pendingToolUses.size}`);
@@ -1268,6 +1275,12 @@ async function handleRequest(req) {
               send("data: [DONE]\n\n");
               closed = true; // anything the CLI emits before Vellum's next request attaches is dropped, not written here
               if (ac.rel) ac.rel(); else if (cacheKey) manager.chats.get(cacheKey)?.releaseForTools?.();
+              // Structured-output protocols consume the batch and never send tool_result.
+              // Only allowlisted, exclusively output-tool oneuse registries qualify.
+              if (isOutputOnlyBatch(cacheKey, tools, toolUses)) {
+                for (const tu of toolUses) { emittedToolIds.delete(tu.id); earlyResults.delete(tu.id); consumedToolIds.delete(tu.id); }
+                manager.destroyOneUse(cacheKey, "output batch");
+              }
               return;
             }
             result = await runPromise;
