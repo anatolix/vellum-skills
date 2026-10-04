@@ -19,3 +19,9 @@ export function codexThreadConfig({ nativeTools = !!process.env.SHIM_NATIVE_TOOL
     },
   };
 }
+
+// thread/resume must restate sandbox + approval policy: without them Codex keeps whatever
+// the thread was started with (old threads were created under workspace-write).
+export function codexResumeParams(threadId, { sandbox = "read-only", nativeTools } = {}) {
+  return { threadId, excludeTurns: true, approvalPolicy: "never", sandbox, config: codexThreadConfig({ nativeTools }) };
+}

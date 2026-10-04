@@ -23,7 +23,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "
 import { join } from "path";
 import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from "./notice-transport.js";
 import { promptForSession } from "./history-rehydration.js";
-import { codexThreadConfig } from "./thread-config.js";
+import { codexThreadConfig, codexResumeParams } from "./thread-config.js";
 import { createSseWriter } from "./sse-writer.js";
 import { prepareNativeSafeModelCatalog, failClosedApprovalResponse } from "./native-tool-policy.js";
 const noticeTransport = new NoticeTransport();
@@ -377,7 +377,7 @@ async function handleCompaction({ req, key, model, blocks, lastUserBlock, effort
   if (parkedNow) log(`[compact] ${tag} tool call in flight (${parkedNow}) — summary only, native compaction skipped`);
   if (compactLocks.has(state.threadId)) { log(`[compact] ${tag} REJECTED: compaction already running`); return jsonResp({ error: { message: "codex-shim: compaction already in progress", type: "invalid_request_error", code: "busy" } }, 409); }
   if (!liveThreads.has(state.threadId)) {
-    try { await srv.request("thread/resume", { threadId: state.threadId, excludeTurns: true, config: codexThreadConfig() }); liveThreads.add(state.threadId); }
+    try { await srv.request("thread/resume", codexResumeParams(state.threadId, { sandbox: SANDBOX })); liveThreads.add(state.threadId); }
     catch (e) { log(`[compact] ${tag} resume failed: ${String(e).slice(0, 120)}`); return jsonResp({ error: { message: "codex-shim: thread could not be resumed for compaction", type: "server_error" } }, 503); }
   }
   log(`[compact] ${tag} thread=${state.threadId} model=${model} instruction=${lastUserBlock.text.length} chars blocks=${blocks.length}`);
@@ -670,7 +670,7 @@ async function handleChat(req) {
           log(`[guard] RESUME thread=${state.threadId} key=${key.slice(0, 12)} alreadyFed=${(state.sent || []).length} new=${feedCount} (${userBlocks.length} user + ${toolResults.length} tool) parked=${Object.keys(state.parked || {}).length}`);
 
           try {
-            await srv.request("thread/resume", { threadId: state.threadId, excludeTurns: true, config: codexThreadConfig() });
+            await srv.request("thread/resume", codexResumeParams(state.threadId, { sandbox: SANDBOX }));
             liveThreads.add(state.threadId);
             if (!oneUse) threadOwners.set(state.threadId, {key, model});
             notice("Старт", `${model}; из файла; видено=${state.sent?.length || 0}`);

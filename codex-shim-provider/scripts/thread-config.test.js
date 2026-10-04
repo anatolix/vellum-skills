@@ -1,6 +1,6 @@
 import { test, expect } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { codexThreadConfig } from './thread-config.js';
+import { codexThreadConfig, codexResumeParams } from './thread-config.js';
 for (const nativeTools of [false, true]) {
   test(`native agents stay disabled (nativeTools=${nativeTools})`, () => {
     const c=codexThreadConfig({ nativeTools });
@@ -17,6 +17,19 @@ for (const nativeTools of [false, true]) {
 }
 test('all start/resume paths use the same native-agent policy', () => {
   const s=readFileSync(new URL('./server-v2.js',import.meta.url),'utf8');
-  expect((s.match(/config: codexThreadConfig\(\)/g)||[]).length).toBe(2);
+  expect((s.match(/codexResumeParams\(state\.threadId, \{ sandbox: SANDBOX \}\)/g)||[]).length).toBe(2);
   expect((s.match(/config: \{ \.\.\.codexThreadConfig\(\)/g)||[]).length).toBe(1);
+});
+
+test('resume params restate sandbox and approval policy', () => {
+  const p = codexResumeParams('t1', { sandbox: 'read-only' });
+  expect(p).toMatchObject({ threadId: 't1', excludeTurns: true, approvalPolicy: 'never', sandbox: 'read-only' });
+  expect(p.config.features.view_image).toBe(false);
+});
+
+test('server-v2 uses codexResumeParams for every thread/resume', () => {
+  const src = readFileSync(new URL('./server-v2.js', import.meta.url), 'utf8');
+  const resumes = src.match(/srv\.request\("thread\/resume"[^\n]*/g) || [];
+  expect(resumes.length).toBeGreaterThan(0);
+  for (const r of resumes) expect(r).toContain('codexResumeParams(state.threadId, { sandbox: SANDBOX })');
 });
