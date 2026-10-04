@@ -3,7 +3,8 @@
 #  1) context/compactor.ts: the compaction summary call carries selectionSeed+conversationId, so
 #     openai-compatible providers get prompt_cache_key = conversation id (session affinity).
 #  2) providers/retry.ts: openai-compatible requests carry X-Call-Site (and X-Conversation-Id) headers,
-#     so a shim can recognise compactionAgent calls and compact its own session instead of a normal turn.
+#     for session affinity/diagnostics. X-Call-Site remains mainAgent for cache/profile routing.
+#  3) compactor.ts: X-Shim-Operation: compact explicitly identifies internal compaction calls.
 # Restart the Vellum daemon afterwards (only when no turn is active).
 set -euo pipefail
 SRC="${1:-$HOME/.local/share/vellum/assistants/juno/.vellum/runtime/0.12.6/node_modules/@vellumai/assistant/src}"
@@ -60,4 +61,12 @@ apply(src / "providers/retry.ts",
     }
   }
 ''', 1)
+# Explicit intent survives reasoning adapters dropping tool_choice and keeps mainAgent routing.
+apply(src / "context/compactor.ts",
+'''        callSite: COMPACTION_CALL_SITE,
+''',
+'''        callSite: COMPACTION_CALL_SITE,
+        // [local patch: codex-shim] operation intent independent of mainAgent routing.
+        requestHeaders: { "X-Shim-Operation": "compact" },
+''', 2)
 PYCODE

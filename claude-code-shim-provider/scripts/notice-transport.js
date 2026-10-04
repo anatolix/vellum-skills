@@ -31,12 +31,18 @@ export function cleanNotices(messages = []) {
 }
 export function noticeText(source, event, detail) { return `[${source}] ${event}: ${detail}`; }
 export function noticeFrame(text) { return `data: ${JSON.stringify({shim_notice: String(text)})}\n\n`; }
-function isCompactionBody(body) {
+// One predicate for the transport and BOTH handlers, before diagnostic continuation.
+// Routing stays mainAgent; compaction intent is separate from profile/cache selection.
+export function isCompactionRequest(req, body) {
+  if (req.headers.get('x-shim-operation') === 'compact' ||
+      req.headers.get('x-call-site') === 'compactionAgent') return true;
+  // Compatibility with older Vellum daemons. Only the final user's opening tag counts:
+  // a quoted tag in earlier history or ordinary prose must never trigger compaction.
   const last = [...(body?.messages || [])].reverse().find(m => m.role === 'user');
   if (!last) return false;
   const text = typeof last.content === 'string' ? last.content
     : Array.isArray(last.content) ? last.content.map(p => p?.text || '').join('\n') : '';
-  return /(^|\n)\s*<(compaction_instructions|emergency_compaction)>/.test(text);
+  return /^\s*<(compaction_instructions|emergency_compaction)>/.test(text);
 }
 
 export class NoticeTransport {
@@ -55,7 +61,7 @@ export class NoticeTransport {
     const key = body.prompt_cache_key || req.headers.get('x-conversation-id');
     // Vellum sends X-Call-Site: mainAgent even for compaction (COMPACTION_CALL_SITE='mainAgent' in
     // compactor.ts; 'compactionAgent' is only the log label) — recognise the instruction block instead.
-    if (req.headers.get('x-call-site') === 'compactionAgent' || isCompactionBody(body)) {
+    if (isCompactionRequest(req, body)) {
       // Vellum's summary call must come back as plain parseable text: no notice frames, no parking.
       body.messages = cleanNotices(body.messages);
       return handler(new Request(req.url, {method:req.method, headers:req.headers, body:JSON.stringify(body)}));

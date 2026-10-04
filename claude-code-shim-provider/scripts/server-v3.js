@@ -14,7 +14,7 @@ import { mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 
 import { z } from "zod";
-import { NoticeTransport, noticeText, noticeFrame } from "./notice-transport.js";
+import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from "./notice-transport.js";
 const noticeTransport = new NoticeTransport();
 const TOOL_MODE = process.env.SHIM_TOOL_MODE || "mcp"; // mcp | text
 const BATCH_IDLE_MS = Number(process.env.SHIM_BATCH_IDLE_MS || 5000);
@@ -1175,8 +1175,8 @@ async function handleRequest(req) {
       const callSite = req.headers.get("x-call-site") || null;
       const lastUserBlock = [...blocks].reverse().find((b) => b.role === "user") || null;
       const toolChoice = typeof body.tool_choice === "string" ? body.tool_choice : body.tool_choice?.type;
-      if (callSite === "compactionAgent" || (lastUserBlock && /^Human:\s*<(compaction_instructions|emergency_compaction)>/.test(lastUserBlock.text))) {
-        console.log(`[compact] detected site=${callSite || "-"} tool_choice=${toolChoice ?? "-"}`);
+      if (isCompactionRequest(req, body)) {
+        console.log(`[compact] detected operation=${req.headers.get("x-shim-operation") || "instruction"} site=${callSite || "-"} tool_choice=${toolChoice ?? "-"}`);
         return handleCompaction({ model, sdkModel, cacheKey, blocks, id });
       }
     }

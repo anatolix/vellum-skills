@@ -129,3 +129,25 @@ compaction arriving first used to hit `manager.chats.get()` → 409 `no_session`
 - `[req]` lines now log `tc=<tool_choice> site=<x-call-site>` so this can be checked in production.
 - Request bodies Vellum sent are stored in `workspace/data/db/assistant-logs.db`, table
   `llm_request_logs` (`call_site='compactionAgent'`) — use that instead of guessing.
+
+
+### Explicit compaction intent (2026-10-04)
+
+Vellum resolves compaction through `mainAgent` to preserve the active profile/cache;
+`compactionAgent` is only the request-log label. Generic reasoning adapters can omit
+`tool_choice=none`. Neither is a reliable operation marker. The runtime patch now adds
+`X-Shim-Operation: compact` to both normal and emergency compactor requests without
+changing routing. Both handlers and NoticeTransport use one `isCompactionRequest`
+predicate before any pending-notice continuation. Older daemons are recognized only
+when the latest user's text STARTS with the compaction instruction tag (not quoted
+tags in prior history or ordinary prose). No diagnostics are parked in the summary path.
+
+The previous failure returned only a synthetic diagnostic tool to the compactor, then
+resumed its old summary stream on the next normal Test message. This caused both an
+unparseable summary and raw XML in ordinary chat.
+
+Regression: `bun test scripts/compaction-routing.test.js` (14 tests). Isolated live Codex
+test with `mainAgent`, high reasoning, tools present, explicit operation and NO tool_choice:
+valid summary, native thread compaction, secret code and document count retained, next
+ordinary turns answered correctly with ~98% cache. Claude live smoke was blocked by
+subscription quota; no end-to-end success is claimed for that run.

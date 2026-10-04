@@ -19,7 +19,7 @@ import { spawn } from "bun";
 import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { join } from "path";
-import { NoticeTransport, noticeText, noticeFrame } from "./notice-transport.js";
+import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from "./notice-transport.js";
 const noticeTransport = new NoticeTransport();
 const threadOwners = new Map();
 
@@ -474,8 +474,8 @@ async function handleChat(req) {
   const toolChoice = typeof body.tool_choice === "string" ? body.tool_choice : body.tool_choice?.type;
   // X-Call-Site arrives as "mainAgent" even here (COMPACTION_CALL_SITE=mainAgent in compactor.ts) and tool_choice is
   // omitted for some models (gpt-6.1-sol) — the instruction block opening the trailing user message is the marker.
-  if (callSite === "compactionAgent" || (lastUserBlock && /(^|\n)\s*<(compaction_instructions|emergency_compaction)>/.test(lastUserBlock.text))) {
-    log(`[compact] detected site=${callSite || "-"} tool_choice=${toolChoice ?? "-"}`);
+  if (isCompactionRequest(req, body)) {
+    log(`[compact] detected operation=${req.headers.get("x-shim-operation") || "instruction"} site=${callSite || "-"} tool_choice=${toolChoice ?? "-"}`);
     return handleCompaction({ req, key, model, blocks, lastUserBlock, effort, id });
   }
 
