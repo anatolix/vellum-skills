@@ -31,6 +31,14 @@ export function cleanNotices(messages = []) {
 }
 export function noticeText(source, event, detail) { return `[${source}] ${event}: ${detail}`; }
 export function noticeFrame(text) { return `data: ${JSON.stringify({shim_notice: String(text)})}\n\n`; }
+function isCompactionBody(body) {
+  const last = [...(body?.messages || [])].reverse().find(m => m.role === 'user');
+  if (!last) return false;
+  const text = typeof last.content === 'string' ? last.content
+    : Array.isArray(last.content) ? last.content.map(p => p?.text || '').join('\n') : '';
+  return /(^|\n)\s*<(compaction_instructions|emergency_compaction)>/.test(text);
+}
+
 export class NoticeTransport {
   constructor({ttlMs = 900000, mode = process.env.SHIM_NOTICE_FMT || 'tool'} = {}) {
     this.pending = new Map(); this.later = new Map(); this.ttlMs = ttlMs; this.mode = mode;
@@ -45,7 +53,9 @@ export class NoticeTransport {
     if (req.method !== 'POST' || new URL(req.url).pathname !== '/v1/chat/completions') return handler(req);
     let body; try { body = await req.clone().json(); } catch { return handler(req); }
     const key = body.prompt_cache_key || req.headers.get('x-conversation-id');
-    if (req.headers.get('x-call-site') === 'compactionAgent') {
+    // Vellum sends X-Call-Site: mainAgent even for compaction (COMPACTION_CALL_SITE='mainAgent' in
+    // compactor.ts; 'compactionAgent' is only the log label) — recognise the instruction block instead.
+    if (req.headers.get('x-call-site') === 'compactionAgent' || isCompactionBody(body)) {
       // Vellum's summary call must come back as plain parseable text: no notice frames, no parking.
       body.messages = cleanNotices(body.messages);
       return handler(new Request(req.url, {method:req.method, headers:req.headers, body:JSON.stringify(body)}));

@@ -472,7 +472,7 @@ async function handleChat(req) {
   const callSite = req.headers.get("x-call-site") || null;
   const lastUserBlock = [...blocks].reverse().find(b => b.kind === "user") || null;
   const toolChoice = typeof body.tool_choice === "string" ? body.tool_choice : body.tool_choice?.type;
-  // X-Call-Site never arrives (Vellum's openai-compatible provider ignores requestHeaders) and tool_choice is
+  // X-Call-Site arrives as "mainAgent" even here (COMPACTION_CALL_SITE=mainAgent in compactor.ts) and tool_choice is
   // omitted for some models (gpt-6.1-sol) — the instruction block opening the trailing user message is the marker.
   if (callSite === "compactionAgent" || (lastUserBlock && /(^|\n)\s*<(compaction_instructions|emergency_compaction)>/.test(lastUserBlock.text))) {
     log(`[compact] detected site=${callSite || "-"} tool_choice=${toolChoice ?? "-"}`);
