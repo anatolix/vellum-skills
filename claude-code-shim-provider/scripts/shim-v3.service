@@ -1,0 +1,24 @@
+# Live unit: ~/.config/systemd/user/shim-v3.service — token redacted here. Sessions MUST live under
+# ~/claude-shim/sessions (durable); /tmp was wrong: a reboot wiped every parked session.
+[Unit]
+Description=claude-shim v3 (OpenAI-compatible, :8320)
+After=network-online.target
+
+[Service]
+Type=simple
+Environment="PATH=/home/vellum/.bun/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="SHIM_PORT=8320"
+Environment="SHIM_TOOL_MODE=mcp"
+Environment="SHIM_SESSIONS_DIR=/home/vellum/claude-shim/sessions"
+Environment="SHIM_FALLBACK_MODEL=sonnet"
+Environment="SHIM_VERBATIM=1"
+Environment="SHIM_CONTEXT_USAGE=1"
+Environment="SHIM_PRECOMPUTE_COMPACT=1"
+Environment="CLAUDE_CODE_OAUTH_TOKEN=<sk-ant-oat01-… from `claude setup-token`>"
+WorkingDirectory=/home/vellum/claude-shim
+ExecStart=/home/vellum/.bun/bin/bun run /home/vellum/claude-shim/server-v3.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
