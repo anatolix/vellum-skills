@@ -12,7 +12,8 @@
 //   CODEX_WORKDIR    (default ~/codex-shim/workdir)
 //   SHIM_SESSIONS_DIR(default ~/codex-shim/sessions) — key→threadId state
 //   SHIM_MODELS      (comma list override; default from model/list)
-//   SHIM_SANDBOX     read-only | workspace-write (default) | danger-full-access
+//   SHIM_SANDBOX     read-only (default) | workspace-write | danger-full-access
+//   SHIM_SAFE_MODEL_CATALOG (default ~/codex-shim/native-safe-model-catalog.json)
 //   SHIM_DEBUG=1     verbose logging
 
 import { spawn } from "bun";
@@ -23,6 +24,7 @@ import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from ".
 import { promptForSession } from "./history-rehydration.js";
 import { codexThreadConfig } from "./thread-config.js";
 import { createSseWriter } from "./sse-writer.js";
+import { prepareNativeSafeModelCatalog, failClosedApprovalResponse } from "./native-tool-policy.js";
 const noticeTransport = new NoticeTransport();
 const threadOwners = new Map();
 
@@ -31,11 +33,17 @@ const HOME = process.env.HOME;
 const CODEX_BIN = process.env.CODEX_BIN || join(HOME, ".local/bin/codex");
 const WORKDIR = process.env.CODEX_WORKDIR || join(HOME, "codex-shim/workdir");
 const SESS_DIR = process.env.SHIM_SESSIONS_DIR || join(HOME, "codex-shim/sessions");
-const SANDBOX = process.env.SHIM_SANDBOX || "workspace-write";
+const SANDBOX = process.env.SHIM_SANDBOX || "read-only";
+const CODEX_HOME = process.env.SHIM_CODEX_HOME || join(HOME, ".codex");
+const SAFE_MODEL_CATALOG = process.env.SHIM_SAFE_MODEL_CATALOG || join(HOME, "codex-shim/native-safe-model-catalog.json");
 const DEBUG = !!process.env.SHIM_DEBUG;
 
 mkdirSync(SESS_DIR, { recursive: true });
 mkdirSync(WORKDIR, { recursive: true });
+prepareNativeSafeModelCatalog({
+  sourcePath: join(CODEX_HOME, "models_cache.json"),
+  targetPath: SAFE_MODEL_CATALOG,
+});
 
 const sha1 = s => createHash("sha1").update(s).digest("hex");
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -45,9 +53,9 @@ const dbg = (...a) => DEBUG && log(...a);
 class AppServer {
   constructor() { this.proc = null; this.idc = 0; this.pending = new Map(); this.onServerRequest = null; this.onNotification = null; this.modelList = []; }
   start() {
-    log("[appserver] starting", CODEX_BIN);
-    this.proc = spawn({ cmd: [CODEX_BIN, "app-server"], stdin: "pipe", stdout: "pipe", stderr: "pipe",
-      env: { ...process.env, CODEX_HOME: process.env.SHIM_CODEX_HOME || join(HOME, ".codex") } });
+    log("[appserver] starting", CODEX_BIN, `(sandbox=${SANDBOX}, safe-model-catalog=${SAFE_MODEL_CATALOG})`);
+    this.proc = spawn({ cmd: [CODEX_BIN, "-c", `model_catalog_json=${JSON.stringify(SAFE_MODEL_CATALOG)}`, "app-server"], stdin: "pipe", stdout: "pipe", stderr: "pipe",
+      env: { ...process.env, CODEX_HOME } });
     this.readLoop();
     this.proc.exited.then(code => {
       log("[appserver] exited", code, "— failing pending and restarting");
@@ -757,9 +765,10 @@ async function handleChat(req) {
               return new Promise(() => {}); // never resolved here; answered via srv.respond later
             }
             if (m.method === "currentTime/read") return { currentTimeAt: Math.floor(Date.now() / 1000) };
-            if (m.method.endsWith("requestApproval") || m.method === "applyPatchApproval" || m.method === "execCommandApproval") {
-              dbg("[approval auto-accept]", m.method);
-              return { decision: "accept" };
+            const deniedApproval = failClosedApprovalResponse(m.method);
+            if (deniedApproval !== undefined) {
+              log("[approval denied]", m.method);
+              return deniedApproval;
             }
             return {};
           },

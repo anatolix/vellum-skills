@@ -14,6 +14,7 @@ export function codexThreadConfig({ nativeTools = !!process.env.SHIM_NATIVE_TOOL
       multi_agent: false,
       multi_agent_v2: false,
       image_generation: false,
+      view_image: false,
       ...(nativeTools ? {} : { shell_tool: false, unified_exec: false, plugins: false, apps: false }),
     },
   };

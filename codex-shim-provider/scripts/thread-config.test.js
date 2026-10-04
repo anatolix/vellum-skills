@@ -9,6 +9,7 @@ for (const nativeTools of [false, true]) {
     expect(c.features.multi_agent_v2).toBe(false);
     expect(c.web_search).toBe("disabled");
     expect(c.features.image_generation).toBe(false);
+    expect(c.features.view_image).toBe(false);
     for (const flag of ['include_permissions_instructions','include_environment_context','include_collaboration_mode_instructions','include_apps_instructions']) expect(c[flag]).toBe(false);
     if (!nativeTools) for (const flag of ['shell_tool','unified_exec','plugins','apps']) expect(c.features[flag]).toBe(false);
     expect(c.sandbox).toBeUndefined();expect(c.approvalPolicy).toBeUndefined();

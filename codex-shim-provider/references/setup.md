@@ -113,7 +113,29 @@ still select V2. An explicitly enabled V2 feature overrides `agents.enabled`.
 The shim applies the same policy to every thread start/resume through
 `thread-config.js`; `SHIM_NATIVE_TOOLS` does not re-enable native agents.
 Existing threads may retain historical developer text; verify on a fresh thread.
-Sandbox and approval settings are unchanged.
+
+## Native filesystem tools and approvals
+
+Codex-native `apply_patch` and `view_image` bypass Vellum's tool gate. The v2
+shim removes `apply_patch` from the model catalog, pins
+`features.view_image=false` on every start/resume, and defaults Codex's own
+tool sandbox to `read-only`. At process start, `native-tool-policy.js` copies
+the current Codex model cache to `~/codex-shim/native-safe-model-catalog.json`
+with every `apply_patch_tool_type` set to null; startup fails closed if the
+source catalog is missing or empty.
+
+Keep `view_image` disabled globally as defense in depth:
+
+```toml
+[features]
+view_image = false
+```
+
+Native approval RPCs are never auto-accepted. v2 command/file requests return
+`decline`, permission requests receive an empty grant, legacy requests receive
+a `ReviewDecision::Denied`, and unknown approval RPCs fail with an error.
+Vellum dynamic tools still use Vellum's own approval pipeline and are not
+affected by Codex's read-only sandbox.
 
 ## Native web search and image generation
 
