@@ -1036,6 +1036,16 @@ function usageFromResult(res) {
 // Build Vellum's <compaction_result> from the CLI's own summary. The verbatim tail starts at
 // the second-to-last real user turn (so the active exchange survives); Vellum resolves it by the
 // turn_context timestamp, falling back to the message preview.
+// Vellum's parser is a plain indexOf/regex scan for <compaction_result>/<summary>/<key_state>/<tail_start>.
+// A summary that *talks about* those tags (as this very project does) derails it: a literal "<tail_start"
+// inside the text wins the regex and yields empty attrs -> "unparseable response". Swap the angle bracket
+// of such literals for a lookalike so only our structural tags remain.
+const RESULT_TAG_RE = /<(\/?)(compaction_result|summary|key_state|tail_start|retained_images?)\b/gi;
+const neuterResultTags = (t) => String(t ?? "").replace(RESULT_TAG_RE, "\u2039$1$2");
+const COMPACT_DUMP_DIR = `${process.env.HOME}/claude-shim/compact-dumps`;
+function dumpCompaction(tag, text) {
+  try { mkdirSync(COMPACT_DUMP_DIR, { recursive: true }); writeFileSync(`${COMPACT_DUMP_DIR}/${new Date().toISOString().replace(/[:.]/g, "-")}-${tag}.txt`, text); } catch {}
+}
 function buildCompactionResult(summary, blocks) {
   const users = blocks.filter((b) => b.role === "user");
   users.pop(); // the instruction itself
@@ -1048,7 +1058,8 @@ function buildCompactionResult(summary, blocks) {
     preview = t.slice(0, 60).replace(/\s+/g, " ").replace(/"/g, "'");
   }
   let s = summary;
-  const inner = /<summary>([\s\S]*?)<\/summary>/.exec(s); if (inner) s = inner[1].trim();
+  const inner = /^\s*<summary>([\s\S]*?)<\/summary>\s*$/.exec(s); if (inner) s = inner[1].trim();
+  s = neuterResultTags(s);
   return `<compaction_result>\n<summary>\n${s}\n</summary>\n\n<key_state>\n</key_state>\n\n<tail_start\n  timestamp="${ts.replace(/"/g, "'")}"\n  preview="${preview}" />\n</compaction_result>`;
 }
 async function handleCompaction({ model, sdkModel, cacheKey, blocks, id }) {
@@ -1066,6 +1077,7 @@ async function handleCompaction({ model, sdkModel, cacheKey, blocks, id }) {
       if (chat.cli?.sessionId && !chat.sessionId) chat.sessionId = chat.cli.sessionId;
       const { summary } = await chat.compactViaCli(sdkModel, systemText(blocks));
       const text = buildCompactionResult(summary, blocks);
+      dumpCompaction(tag, text);
       send(sseChunk(id, model, { content: text }));
       send(sseChunk(id, model, {}, "stop"));
     } catch (e) {
