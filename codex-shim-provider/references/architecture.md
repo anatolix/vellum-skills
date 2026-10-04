@@ -82,3 +82,7 @@ Counts arrive **after a model step**, not continuously during silent generation.
 | `SHIM_SERVER` | launch script chooses `server-v2.js`; optional legacy `server.js` |
 
 These flags use nonempty/truthy values; `SHIM_NATIVE_TOOLS=0` / `SHIM_ALLOW_KEYLESS=0` still enable their respective overrides. Unset them to disable. Do not expose the listener publicly without separate authentication: the shim itself has no bearer-auth layer, and `/chats` contains session metadata.
+
+## History-edit forensics (Oct 4)
+
+Every rewritten-history event (`HISTORY-EDIT`, notice «Не отправлено») is dumped to `~/codex-shim/history-edits/` (override `SHIM_HISTEDIT_DIR`): one `<timestamp>-<key>.json` per event with the full new text of every skipped block, its position, and what the thread previously had at that index (hash, length, first 300 / last 200 chars — kept per fed block in the session state as `meta`), plus an `index.jsonl` summary line (`kinds` = `user#12(4100->4350),…`). `aligned:false` means the block count changed, so the positional "previous" is only a hint.

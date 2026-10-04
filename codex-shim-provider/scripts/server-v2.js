@@ -193,6 +193,26 @@ function blocksOf(messages) {
   return out;
 }
 const blockHash = b => sha1(b.kind + ":" + b.id + ":" + b.text);
+// When rewritten history is detected, dump the skipped blocks (full new text + what the
+// thread had at that position: hash/len/head/tail) so the cause of the rewrite can be
+// analysed later. One JSON per event + index.jsonl summary.
+const HE_DIR = process.env.SHIM_HISTEDIT_DIR || join(HOME, "codex-shim/history-edits");
+const blockMeta = b => ({ len: b.text.length, head: b.text.slice(0, 300), tail: b.text.slice(-200) });
+function dumpHistoryEdit(tag, info, blocks, hashes, skippedIdx, lastSeen, prevSent, prevMeta) {
+  try {
+    mkdirSync(HE_DIR, { recursive: true });
+    const at = new Date().toISOString();
+    const rec = { at, ...info, blocks: blocks.length, prevBlocks: prevSent.length, aligned: blocks.length === prevSent.length, lastSeen,
+      skipped: skippedIdx.map(i => { const b = blocks[i], ph = prevSent[i] ?? null; return { index: i, kind: b.kind || b.role, id: b.id || null, hash: hashes[i].slice(0, 12), len: b.text.length, text: b.text,
+        prevAtIndex: ph ? { hash: ph.slice(0, 12), ...(prevMeta[ph] || {}) } : null }; }) };
+    const stamp = at.replace(/[:.]/g, "-") + "-" + tag;
+    writeFileSync(join(HE_DIR, stamp + ".json"), JSON.stringify(rec, null, 1));
+    const kinds = rec.skipped.map(s => s.kind + "#" + s.index + (s.prevAtIndex?.len != null ? `(${s.prevAtIndex.len}->${s.len})` : "(?)")).join(",");
+    writeFileSync(join(HE_DIR, "index.jsonl"), JSON.stringify({ at, ...info, skipped: skippedIdx.length, chars: rec.skipped.reduce((n, s) => n + s.len, 0), aligned: rec.aligned, kinds, file: stamp + ".json" }) + "\n", { flag: "a" });
+    log(`[guard] HISTORY-EDIT dump ${stamp}.json ${kinds}`);
+  } catch (e) { log("[guard] history-edit dump failed", String(e).slice(0, 120)); }
+}
+
 // Client-dependent tools (platform/host-proxy tools that Vellum adds or removes depending on
 // which device is connected: request_system_permission, ask_question, host_*) must NOT change
 // the thread fingerprint — a phone<->laptop switch would otherwise kill the codex thread and
@@ -328,12 +348,15 @@ async function handleChat(req) {
     const hashes = blocks.map(blockHash);
     let lastSeen = -1;
     for (let i = 0; i < blocks.length; i++) if (seen.has(hashes[i])) lastSeen = i;
-    toFeed = [];
+    toFeed = []; const skippedIdx = [];
     blocks.forEach((b, i) => {
       if (seen.has(hashes[i])) return;
-      if (i < lastSeen && !(b.kind === "tool" && state.parked && state.parked[b.id])) skipped.push(b); else toFeed.push(b);
+      if (i < lastSeen && !(b.kind === "tool" && state.parked && state.parked[b.id])) { skipped.push(b); skippedIdx.push(i); } else toFeed.push(b);
     });
-    if (skipped.length) log(`[guard] HISTORY-EDIT key=${key.slice(0, 12)} ${skipped.length} unseen block(s) before last seen #${lastSeen} (~${skipped.reduce((n, b) => n + b.text.length, 0)} chars) — rewritten history, NOT fed; tail=${toFeed.length}`);
+    if (skipped.length) {
+      log(`[guard] HISTORY-EDIT key=${key.slice(0, 12)} ${skipped.length} unseen block(s) before last seen #${lastSeen} (~${skipped.reduce((n, b) => n + b.text.length, 0)} chars) — rewritten history, NOT fed; tail=${toFeed.length}`);
+      dumpHistoryEdit(key.slice(0, 12), { key: key.slice(0, 12), thread: state.threadId, model: state.model }, blocks, hashes, skippedIdx, lastSeen, state.sent || [], state.meta || {});
+    }
   }
 
   // guard: many UNSEEN blocks at once == probable full-history replay (the Oct 1 quota
@@ -554,6 +577,7 @@ async function handleChat(req) {
         }
         // mark fed
         state.sent = blocks.map(blockHash);
+        state.meta = Object.fromEntries(blocks.map(b => [blockHash(b), blockMeta(b)])); // per-block len/head/tail for history-edit forensics
         persistState(key, state);
 
         // wait for turn completion (or first parked tool call); heartbeat every 15s so a

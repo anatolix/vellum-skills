@@ -20,6 +20,26 @@ const TOOL_MODE = process.env.SHIM_TOOL_MODE || "mcp"; // mcp | text
 const BATCH_IDLE_MS = Number(process.env.SHIM_BATCH_IDLE_MS || 5000);
 const TOOL_WAIT_MS = Number(process.env.SHIM_TOOL_WAIT_SEC || 3600) * 1000; // how long a tool_use may wait for Vellum's result (approvals)
 const FULL_HIST_MIN = Number(process.env.SHIM_FULL_HIST_MIN || 8); // feeding >= this many unseen blocks = full-history re-feed, warn in chat
+
+// When rewritten history is detected, dump the skipped blocks (full new text + what the
+// thread had at that position: hash/len/head/tail) so the cause of the rewrite can be
+// analysed later. One JSON per event + index.jsonl summary.
+const HE_DIR = process.env.SHIM_HISTEDIT_DIR || `${process.env.HOME}/claude-shim/history-edits`;
+const blockMeta = b => ({ len: b.text.length, head: b.text.slice(0, 300), tail: b.text.slice(-200) });
+function dumpHistoryEdit(tag, info, blocks, hashes, skippedIdx, lastSeen, prevSent, prevMeta) {
+  try {
+    mkdirSync(HE_DIR, { recursive: true });
+    const at = new Date().toISOString();
+    const rec = { at, ...info, blocks: blocks.length, prevBlocks: prevSent.length, aligned: blocks.length === prevSent.length, lastSeen,
+      skipped: skippedIdx.map(i => { const b = blocks[i], ph = prevSent[i] ?? null; return { index: i, kind: b.kind || b.role, id: b.id || null, hash: hashes[i].slice(0, 12), len: b.text.length, text: b.text,
+        prevAtIndex: ph ? { hash: ph.slice(0, 12), ...(prevMeta[ph] || {}) } : null }; }) };
+    const stamp = at.replace(/[:.]/g, "-") + "-" + tag;
+    writeFileSync(`${HE_DIR}/${stamp}.json`, JSON.stringify(rec, null, 1));
+    const kinds = rec.skipped.map(s => s.kind + "#" + s.index + (s.prevAtIndex?.len != null ? `(${s.prevAtIndex.len}->${s.len})` : "(?)")).join(",");
+    writeFileSync(`${HE_DIR}/index.jsonl`, JSON.stringify({ at, ...info, skipped: skippedIdx.length, chars: rec.skipped.reduce((n, s) => n + s.len, 0), aligned: rec.aligned, kinds, file: stamp + ".json" }) + "\n", { flag: "a" });
+    console.log(`[guard] HISTORY-EDIT dump ${stamp}.json ${kinds}`);
+  } catch (e) { console.log("[guard] history-edit dump failed", String(e).slice(0, 120)); }
+}
 // Diagnostics use their own transport, never model prose or reasoning.
 function shimNotice(onMsg, tag, text) {
   console.log(`[notice ${tag}] ${text}`);
@@ -234,6 +254,7 @@ class Chat {
     this.key = key;
     this.sessionId = saved?.sessionId ?? null;
     this.sent = saved?.sent ?? [];        // sha1 of every input block already fed to the session
+    this.meta = saved?.meta ?? {};        // hash -> {len, head, tail} of fed blocks, for history-edit forensics
     this.model = saved?.model ?? DEFAULT_MODEL;
     this.lastUsed = saved?.lastUsed ?? Date.now();
     this.served = saved?.served ?? 0;
@@ -251,7 +272,7 @@ class Chat {
   save() {
     if (this.oneUse) return; // one-use chats are never persisted
     try {
-      writeFileSync(this.file(), JSON.stringify({ key: this.key, sessionId: this.sessionId, model: this.model, sent: this.sent, sysHash: this.sysHash, effort: this.effort, lastUsed: this.lastUsed, served: this.served, savedAt: Date.now(), pendingNotices: this.pendingNotices, parkedWhy: this.parkedWhy }));
+      writeFileSync(this.file(), JSON.stringify({ key: this.key, sessionId: this.sessionId, model: this.model, sent: this.sent, meta: this.meta, sysHash: this.sysHash, effort: this.effort, lastUsed: this.lastUsed, served: this.served, savedAt: Date.now(), pendingNotices: this.pendingNotices, parkedWhy: this.parkedWhy }));
     } catch (e) { console.error(`[sess] save failed ${short(this.key)}: ${e.message}`); }
   }
   park(reason) {
@@ -316,12 +337,15 @@ class Chat {
     // /clean, memory re-injection), not new input: the CLI transcript already holds the originals.
     // Mark seen, never re-send — re-feeding duplicated history in the CLI session (Oct 4; same rule as codex-shim).
     let lastSeenIdx0 = -1; for (let i = 0; i < hashes.length; i++) if (prior.has(hashes[i])) lastSeenIdx0 = i;
-    const skippedOld = inputs.filter((b, i) => !prior.has(hashes[i]) && i < lastSeenIdx0 && !(b.role === "tool" && b.consumed));
+    const skippedIdx = inputs.map((b, i) => i).filter((i) => !prior.has(hashes[i]) && i < lastSeenIdx0 && !(inputs[i].role === "tool" && inputs[i].consumed));
+    const skippedOld = skippedIdx.map((i) => inputs[i]);
     if (skippedOld.length) {
       const skipSet = new Set(skippedOld);
       unseen = unseen.filter((b) => !skipSet.has(b));
       console.log(`[sess] ${short(this.key)} HISTORY-EDIT ${skippedOld.length} rewritten old block(s) (~${skippedOld.reduce((n, b) => n + b.text.length, 0)} chars) NOT re-sent; tail=${unseen.length}`);
+      dumpHistoryEdit(short(this.key), { key: short(this.key), session: this.sessionId, model: this.model }, inputs, hashes, skippedIdx, lastSeenIdx0, this.sent, this.meta);
     }
+    this.meta = Object.fromEntries(inputs.map((b, i) => [hashes[i], blockMeta(b)]));
     let why = !this.sent.length ? "new" : unseen.length ? `tail=${unseen.length}` : "repeat";
     if (!unseen.length) unseen = inputs.slice(-1);
     for (let attempt = 0; attempt < 2; attempt++) {
