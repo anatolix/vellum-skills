@@ -151,3 +151,8 @@ test with `mainAgent`, high reasoning, tools present, explicit operation and NO 
 valid summary, native thread compaction, secret code and document count retained, next
 ordinary turns answered correctly with ~98% cache. Claude live smoke was blocked by
 subscription quota; no end-to-end success is claimed for that run.
+
+
+## Permission description versus enforcement
+
+`include_permissions_instructions = false` suppresses Codex's `<permissions instructions>` developer text without altering the sandbox policy. The shim sets it on both `thread/start` and `thread/resume`; the local Codex config also sets it at the top level. Invisible native tools remain disabled. Already-recorded instructions in old thread history are not erased; a fresh thread is needed to guarantee a clean history. Real isolated Codex 0.159.3 smoke: effective flag false, readOnly/networkAccess false returned by thread/start, answer OK, zero permission developer blocks in rollout.

@@ -358,7 +358,8 @@ def run_tests():
                 assert starts
                 for params in starts:
                     assert params["config"]["features"] == {
-                        "shell_tool": False, "unified_exec": False, "multi_agent": False}, params
+                        "shell_tool": False, "unified_exec": False, "multi_agent": False, "plugins": False, "apps": False}, params
+                    assert params["config"]["include_permissions_instructions"] is False, params
                 turns = [m["params"] for m in captured() if m.get("method") == "turn/start"]
                 assert all(x["summary"] == "detailed" and x["effort"] == "high" for x in turns), turns
             check("native-tools-off-and-per-turn-summary-effort", native_disabled)
@@ -428,6 +429,7 @@ def run_tests():
                 assert "из файла" in log_text(), log_text()
                 calls = captured()[before:]
                 assert sum(m.get("method") == "thread/resume" for m in calls) == 1, calls
+                assert all(m["params"]["config"]["include_permissions_instructions"] is False for m in calls if m.get("method") == "thread/resume"), calls
                 assert not any(m.get("method") == "thread/start" for m in calls), calls
             check("disk-resume-notice-and-no-fresh-thread", disk_resume)
             print(str(passed) + " tests passed; 0 real model calls.", flush=True)
