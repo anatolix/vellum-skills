@@ -93,6 +93,19 @@ class AppServer {
     await this.request("initialize", { clientInfo: { name: "codex-shim", version: "2.0.0" },
       capabilities: { experimentalApi: true, requestAttestation: false } });
     try {
+      const sl0 = await this.request("skills/list", {});
+      const found = [];
+      const walk = o => { if (!o) return; if (Array.isArray(o)) return o.forEach(walk);
+        if (typeof o === "object") { if (o.name && (o.path || o.enabled !== undefined)) found.push({ name: o.name, path: o.path || null });
+          Object.values(o).forEach(walk); } };
+      walk(sl0);
+      for (const sk of found) {
+        try { await this.request("skills/config/write", { ...(sk.path ? { path: sk.path } : { name: sk.name }), enabled: false }); }
+        catch (e) { log("[skills] disable", sk.name, "failed:", String(e).slice(0, 120)); }
+      }
+      if (found.length) log(`[skills] disabled ${found.length} codex skill(s): ${found.map(x => x.name).join(",")}`);
+    } catch (e) { log("[skills] list/disable skipped:", String(e).slice(0, 120)); }
+    try {
       const r = await this.request("model/list", {});
       const arr = r?.data || r?.models || r?.items || [];
       this.modelList = arr.filter(m => !m.hidden).map(m => m.id || m.model || m.slug).filter(Boolean);
@@ -626,7 +639,7 @@ async function handleChat(req) {
             // caller's dynamic tools (Vellum `bash` etc.) which we park + log.
             // SHIM_NATIVE_TOOLS=1 re-enables them.
             config: { model_reasoning_summary: "detailed", show_raw_agent_reasoning: true,
-              ...(process.env.SHIM_NATIVE_TOOLS ? {} : { features: { shell_tool: false, unified_exec: false, multi_agent: false } }) },
+              ...(process.env.SHIM_NATIVE_TOOLS ? {} : { features: { shell_tool: false, unified_exec: false, multi_agent: false, plugins: false, apps: false } }) },
             dynamicTools: dynTools.length ? dynTools : undefined,
             ephemeral: key ? undefined : true,
           });
