@@ -358,7 +358,8 @@ def run_tests():
                 assert starts
                 for params in starts:
                     assert params["config"]["features"] == {
-                        "shell_tool": False, "unified_exec": False, "multi_agent": False, "plugins": False, "apps": False}, params
+                        "shell_tool": False, "unified_exec": False, "multi_agent": False, "multi_agent_v2": False, "plugins": False, "apps": False}, params
+                    assert params["config"]["agents"]["enabled"] is False, params
                     assert params["config"]["include_permissions_instructions"] is False, params
                 turns = [m["params"] for m in captured() if m.get("method") == "turn/start"]
                 assert all(x["summary"] == "detailed" and x["effort"] == "high" for x in turns), turns

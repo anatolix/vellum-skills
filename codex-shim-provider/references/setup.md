@@ -93,3 +93,24 @@ assistant inference profiles create "codex-$MODEL" --provider openai-compatible 
 Send a chat request with a stable session key, a user prompt and an OpenAI function definition. Expect `finish_reason: "tool_calls"`. Send the complete subsequent conversation, including its assistant tool-call block and matching `role: "tool"` result, under the same key and unchanged tool definitions. Expect the paused turn to resume without another `thread/start` or `thread/resume`. Tests cover this with a fake app-server; use a real model only for an authorized smoke test.
 
 v1 fallback: set `SHIM_SERVER=server.js` in a drop-in and restart the Codex unit deliberately. v1 has no v2 streaming/dynamic-tools/strict-key/guard/thinking-fallback guarantees; it is not an automatic failover.
+
+## Native agent isolation (Codex 0.159.3+)
+
+Vellum subagents use `skill_execute` → `subagent_spawn`, not Codex's native
+`collaboration.*` tools. Disable native agents with both settings below:
+
+```toml
+[agents]
+enabled = false
+
+[features]
+multi_agent = false
+multi_agent_v2 = false
+```
+
+`multi_agent=false` alone disables the V1 fallback, but model metadata can
+still select V2. An explicitly enabled V2 feature overrides `agents.enabled`.
+The shim applies the same policy to every thread start/resume through
+`thread-config.js`; `SHIM_NATIVE_TOOLS` does not re-enable native agents.
+Existing threads may retain historical developer text; verify on a fresh thread.
+Sandbox and approval settings are unchanged.
