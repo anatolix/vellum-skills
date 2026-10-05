@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test';
-import { historyToPrompt, promptForSession } from './history-rehydration.js';
+import { historyToPrompt, promptForSession, foreignReplyText, FOREIGN_REPLY_FRAME, recordedCallLine} from './history-rehydration.js';
 import { readFileSync } from 'node:fs';
 const here=import.meta.dir;
 const summary={role:'assistant',content:'<context_summary>CANARY_ONLY_IN_SUMMARY</context_summary>'};
@@ -46,3 +46,10 @@ test('Claude fresh, resume-failure and ephemeral paths are wired to raw history'
 });
 
 test('detached old-thread compact cannot mark a replacement thread compacted',()=>{const s=readFileSync(here+'/server-v2.js','utf8');expect(s).toContain('if (st.threadId !== state.threadId)');expect(s.indexOf('if (st.threadId !== state.threadId)')).toBeLessThan(s.indexOf('st.compactedAt = Date.now()'));});
+
+test('foreign reply text: frame, trimmed text, recorded tool calls; empty parts dropped',()=>{
+  const t=foreignReplyText('  hello  ',[{id:'call_1',function:{name:'bash',arguments:'{"command":"ls"}'}},{id:'call_2',function:{name:'file_read',arguments:{path:'/x'}}}]);
+  expect(t.split('\n')).toEqual([FOREIGN_REPLY_FRAME,'hello','[Recorded tool call bash id=call_1] {"command":"ls"}','[Recorded tool call file_read id=call_2] {"path":"/x"}']);
+  expect(foreignReplyText('',[])).toBe(FOREIGN_REPLY_FRAME);
+  expect(recordedCallLine({})).toBe('[Recorded tool call tool id=] {}');
+});

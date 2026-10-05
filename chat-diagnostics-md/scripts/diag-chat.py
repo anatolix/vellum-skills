@@ -239,110 +239,161 @@ def main():
     out.append("")
 
     out.append("---\n\n## Сообщения\n")
-    out.append("| ID | Тип | Детали |")
+    out.append("| vellum_id | cli_id / tool_id | Сообщение и атрибуты |")
     out.append("|:---|:---|:---|")
-    warn_total = 0
+    vellum_warn_total = 0
+    cli_warn_total = 0
 
-    import zlib
-    def crc(u): return format(zlib.crc32(u.encode()) & 0xFFFFFFFF, "08x")
-    def cell(s):
-        s = str(s).replace("`", "'").replace("\r", " ").replace("\n", "<br>")
-        return s.replace("|", "\\|")
-    def detail_cell(text, limit=1200):
-        text = text or ""
-        if len(text) <= limit: return cell(text)
-        head, tail = text[:limit], text[limit:]
-        return (cell(head) + f"<br><details><summary>…ещё {len(tail)} зн.</summary><br>" +
-                cell(tail) + "</details>")
+    import html
+    def esc(value):
+        return html.escape(str(value), quote=False).replace("|", "&#124;").replace("\r", " ").replace("\n", "<br>")
 
-    KIND = {"text": None, "thinking": "💭 thinking", "tool_use": "🔧 вызов", "tool_result": "📥 результат",
-            "ui_surface": "🖼 ui_surface", "raw": "⚙️ raw"}
+    def folded(value, limit=1200):
+        text = "" if value is None else str(value)
+        if len(text) <= limit:
+            return esc(text)
+        return (
+            esc(text[:limit])
+            + f"<br><details><summary>…ещё {len(text) - limit} зн.</summary>"
+            + esc(text[limit:])
+            + "</details>"
+        )
+
+    def exact_or_transcript_ids(message, blocks, text, synthetic):
+        """All usable CLI-side identifiers for one Vellum message.
+
+        Exact shim cli_ids win. If an old row has no exact pair, retain the
+        explicitly labelled transcript match. Tool call/result IDs are valid
+        CLI-side identifiers too and are always shown in this column.
+        """
+        lines = []
+        nt = norm(text)
+
+        for name, shim in shims.items():
+            pairs = (shim.get("cli_ids") or {}).get(message.get("id")) or []
+            if pairs:
+                for pair in pairs:
+                    label = pair["kind"] + (f" · {pair['part']}" if pair["part"] else "")
+                    cid = pair["cli_id"]
+                    if cid:
+                        lines.append(f"<b>{name}</b> · {esc(label)}: <code>{esc(cid)}</code>")
+                    else:
+                        lines.append(f"⚠ <b>{name}</b> · {esc(label)}: cli_id пустой")
+                continue
+
+            # Old sessions may predate exact cli_ids. Keep the fallback, but
+            # never pretend a text match is authoritative.
+            uuids = transcripts[name].get(nt) if nt else None
+            if not uuids and len(nt) >= 20:
+                for transcript_text, candidates in transcripts[name].items():
+                    if len(transcript_text) >= 20 and (nt in transcript_text or transcript_text in nt):
+                        uuids = candidates
+                        break
+            if uuids:
+                for candidate in uuids:
+                    lines.append(f"<b>{name}</b> · по тексту: <code>{esc(candidate)}</code>")
+
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("id"):
+                lines.append(f"<b>tool_id</b> · вызов: <code>{esc(block['id'])}</code>")
+            elif block.get("type") == "tool_result" and block.get("tool_use_id"):
+                lines.append(f"<b>tool_id</b> · результат: <code>{esc(block['tool_use_id'])}</code>")
+
+        # Deduplicate without losing source/kind information or ordering.
+        unique = []
+        seen = set()
+        for line in lines:
+            if line not in seen:
+                seen.add(line)
+                unique.append(line)
+        if unique:
+            return "<br>".join(unique), False
+        if synthetic:
+            return f"— synthetic: <code>{esc(synthetic)}</code>", False
+        return "⚠ <b>НЕТ cli_id / tool_id</b>", True
+
+    def message_details(index, message, blocks, synthetic):
+        role = message.get("role") or "?"
+        header = (
+            f"<b>#{index} · {esc(role)}</b>"
+            f"<br>created: <code>{esc(ts(message.get('created_at')))}</code>"
+            f"<br>finalized: <code>{esc(message.get('finalized'))}</code>"
+        )
+        if message.get("client_message_id"):
+            header += f"<br>client_message_id: <code>{esc(message['client_message_id'])}</code>"
+        if synthetic:
+            header += f"<br>synthetic: <code>{esc(synthetic)}</code>"
+
+        meta = {k: v for k, v in message.items() if k != "content"}
+        parts = [
+            header,
+            "<details><summary>Все атрибуты строки messages</summary>"
+            + folded(json.dumps(meta, ensure_ascii=False, indent=1), 800)
+            + "</details>",
+        ]
+
+        if not blocks:
+            parts.append("⚠ пустой content")
+            return "<br>".join(parts)
+
+        for block_index, block in enumerate(blocks, 1):
+            if not isinstance(block, dict):
+                block = {"type": "raw", "content": block}
+            block_type = block.get("type", "?")
+            if block_type == "text":
+                body = folded(block.get("text") or "")
+                extras = {k: v for k, v in block.items() if k not in ("type", "text")}
+                if extras:
+                    body += (
+                        "<br><details><summary>Атрибуты text-блока</summary>"
+                        + folded(json.dumps(extras, ensure_ascii=False, indent=1), 800)
+                        + "</details>"
+                    )
+            else:
+                body = folded(json.dumps(block, ensure_ascii=False, indent=1), 1000)
+            parts.append(
+                f"<details open><summary>Блок {block_index}: <code>{esc(block_type)}</code></summary>"
+                + body
+                + "</details>"
+            )
+        return "<br>".join(parts)
 
     for i, m in enumerate(msgs, 1):
-        try: blocks = json.loads(m["content"])
-        except Exception: blocks = [{"type": "raw", "content": m["content"]}]
-        if not isinstance(blocks, list): blocks = [blocks]
+        try:
+            blocks = json.loads(m["content"])
+        except Exception:
+            blocks = [{"type": "raw", "content": m["content"]}]
+        if not isinstance(blocks, list):
+            blocks = [blocks]
+
         text = msg_text(blocks)
-        syn = synthetic_kind(text) or (None if blocks else None)
-        if m["role"] == "assistant" and not blocks: syn = syn or "empty-assistant"
+        synthetic = synthetic_kind(text)
+        if m.get("role") == "assistant" and not blocks:
+            synthetic = synthetic or "empty-assistant"
 
-        nt = norm(text)
-        # --- correlate once per message ---
-        id_lines = [f"<b>#{i}</b> · {ts(m['created_at'])}", f"vellum: <code>{m['id']}</code>"]
-        if m.get('client_message_id'):
-            id_lines.append(f"client: <code>{m['client_message_id']}</code>")
-        for name, s in shims.items():
-            ids = s.get("map_ids")
-            in_map = ids is not None and m["id"] in ids
-            # patch 9: exact pairs from the shim's own cli_ids table win over text matching
-            # (tool rows have no text, but they do have pairs — check pairs first)
-            pairs = (s.get("cli_ids") or {}).get(m["id"])
-            if not pairs and not nt:
-                id_lines.append(f"{name}: — (нет текста)" + ("" if s.get("cli_ids") is None or in_map else " · ⚠ НЕТ в map"))
-                continue
-            if pairs:
-                for e in pairs:
-                    tag = e["kind"] + (f" {e['part']}" if e["part"] else "")
-                    cid = e["cli_id"] or "∅"
-                    fed = " · fed" if e["fed"] else ("" if e["kind"] == "reply" else " · not fed")
-                    id_lines.append(f"{name} {tag}: <code>{crc(cid) if e['cli_id'] else '—'}</code> ({cid[:13]}…){fed}" if e["cli_id"] else f"{name} {tag}: ⚠ cli_id пустой{fed}")
-                continue
-            uuids = transcripts[name].get(nt)
-            if not uuids and len(nt) >= 20:
-                for t, us in transcripts[name].items():
-                    if len(t) >= 20 and (nt in t or t in nt):
-                        uuids = us; break
-            if uuids:
-                u = uuids[0]
-                line = f"{name} crc: <code>{crc(u)}</code> ({u[:13]}…) · по тексту"
-                if len(uuids) > 1: line += f" ×{len(uuids)}"
-                id_lines.append(line if in_map else "⚠ " + line + " · НЕТ в map")
-            elif in_map:
-                id_lines.append(f"{name}: в map · ⚠ нет в транскрипте")
-            else:
-                if syn:
-                    id_lines.append(f"{name}: synthetic ({syn}) — без CLI-пары")
-                else:
-                    id_lines.append(f"{name}: ⚠ НЕТ в map, НЕТ в транскрипте")
-                    warn_total += 1
-        if not shims:
-            id_lines.append("⚠ shim-сессии не найдены")
-        if m.get('finalized') != 1:
-            id_lines.append(f"finalized: {m.get('finalized')}")
-        ids_cell = "<br>".join(id_lines)
+        vellum_id = m.get("id")
+        if vellum_id:
+            vellum_cell = f"<code>{esc(vellum_id)}</code>"
+        else:
+            vellum_cell = "⚠ <b>ПУСТОЙ vellum_id</b>"
+            vellum_warn_total += 1
 
-        role_kind = "👤 пользователь" if m["role"] == "user" else ("🤖 ассистент" if m["role"] == "assistant" else f"⚙️ {m['role']}")
-        if not blocks:
-            out.append(f"| {ids_cell} | {role_kind} (пустое) | — |")
-            continue
-        # One DB row = one table row: blocks glued into the details cell with a
-        # visible separator, kinds stacked in the type cell.
-        kinds, dets = [], []
-        for b in blocks:
-            if not isinstance(b, dict): b = {"type": "raw", "content": b}
-            bt = b.get("type", "?")
-            if bt == "text":
-                kinds.append(role_kind if not syn else f"⚙️ системное ({syn})")
-                dets.append(detail_cell(b.get("text") or ""))
-            elif bt == "thinking":
-                kinds.append("💭 thinking"); dets.append(detail_cell(b.get("thinking") or ""))
-            elif bt == "tool_use":
-                kinds.append(f"🔧 вызов <code>{b.get('name')}</code>")
-                dets.append(f"tool_use_id: <code>{b.get('id')}</code><br>" +
-                            detail_cell(json.dumps(b.get("input"), ensure_ascii=False, indent=1), 800))
-            elif bt == "tool_result":
-                c = b.get("content")
-                if isinstance(c, list):
-                    c = "\\n".join(x.get("text", "") if isinstance(x, dict) else str(x) for x in c)
-                kinds.append("📥 результат" + (" ❗ошибка" if b.get("is_error") else ""))
-                dets.append(f"tool_use_id: <code>{b.get('tool_use_id')}</code><br>" + detail_cell(str(c), 800))
-            else:
-                kinds.append(KIND.get(bt, f"⚙️ {bt}"))
-                dets.append(detail_cell(json.dumps(b, ensure_ascii=False, indent=1), 800))
-        sep = "<br>──────────<br>"
-        out.append(f"| {ids_cell} | {'<br>'.join(kinds)} | {sep.join(dets)} |")
+        cli_cell, missing_cli = exact_or_transcript_ids(m, blocks, text, synthetic)
+        if missing_cli:
+            cli_warn_total += 1
 
-    out.append(f"## Итог\n\n- сообщений: {len(msgs)}, предупреждений о полном отсутствии CLI-связки (не synthetic): **{warn_total}**\n")
+        out.append(
+            f"| {vellum_cell} | {cli_cell} | {message_details(i, m, blocks, synthetic)} |"
+        )
+
+    out.append(
+        "## Итог\n\n"
+        f"- сообщений: {len(msgs)}\n"
+        f"- пустых vellum_id: **{vellum_warn_total}**\n"
+        f"- сообщений без cli_id и без tool_id (не synthetic): **{cli_warn_total}**\n"
+    )
 
     dest = a.output or os.path.join(WS, "scratch", f"diag-{cid[:8]}.md")
     os.makedirs(os.path.dirname(dest), exist_ok=True)

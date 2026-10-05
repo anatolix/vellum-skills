@@ -212,3 +212,45 @@ describe("id coverage fixes (Oct 5)", () => {
     expect([m.missingGrew(2), m.missingGrew(2), m.missingGrew(3), m.missingGrew(1), m.missingGrew(1), m.missingGrew(2)]).toEqual([true, false, true, false, false, true]);
   });
 });
+
+describe("foreign assistant rows (model switch, Oct 5)", () => {
+  const fresh = () => new SourceIdMap(":memory:");
+  const asst = (text, ...ids) => ({ kind: "assistant", text, sourceIds: ids.length ? ids : null });
+  test("own reply (Claude record) and own reply (Codex record) are never foreign", () => {
+    const m = fresh();
+    m.recordClaudeAssistant("r1", { uuid: "u1", session_id: "s", message: { content: [{ type: "tool_use", id: "toolu_1", name: "bash", input: {} }] } });
+    m.recordCli("r2", "item-9", "reply", { part: null });
+    expect(m.isForeignAssistant(asst("Assistant: x", "r1"), "h")).toBe(false);
+    expect(m.isForeignAssistant(asst("Assistant: y", "r2"), "h")).toBe(false);
+    expect(m.isOwnRow("r1")).toBe(true); expect(m.isOwnRow("r2")).toBe(true);
+    m.close();
+  });
+  test("a row with no record and never marked is foreign; once fed it is recorded as kind foreign and stays foreign", () => {
+    const m = fresh();
+    const b = asst("Assistant: from codex", "r3");
+    expect(m.isForeignAssistant(b, "h3")).toBe(true);
+    m.markFed([b], ["h3"]);
+    expect(m.recordUserFed([{ ...b, foreign: true }], "uuid-f", "s")).toBe(1);
+    expect(m.db.query("SELECT kind, fed FROM cli_ids WHERE row_id = 'r3'").get()).toEqual({ kind: "foreign", fed: 1 });
+    expect(m.isForeignRow("r3")).toBe(true);
+    expect(m.isForeignAssistant(b, "h3")).toBe(true); // seen now, but explicitly foreign
+    m.close();
+  });
+  test("pre-patch-9 own rows (marked, no cli_ids) and id-less rows fall back to never-feed", () => {
+    const m = fresh();
+    const old = asst("Assistant: old", "r4");
+    m.markFed([old], ["h4"]);
+    expect(m.isForeignAssistant(old, "h4")).toBe(false);
+    expect(m.isForeignAssistant(asst("Assistant: old (rewritten)", "r4"), "h4b")).toBe(false);
+    expect(m.isForeignAssistant(asst("Assistant: no ids"), "h5")).toBe(false);
+    expect(NULL_SOURCE_ID_MAP.isForeignAssistant(asst("x", "r"), "h")).toBe(false);
+    m.close();
+  });
+  test("composite ids resolve to their row", () => {
+    const m = fresh();
+    m.recordCli("r6/call_1", "item", "tool_use", { part: "call_1" });
+    expect(m.isForeignAssistant(asst("Assistant:", "r6/call_1"), "h")).toBe(false);
+    expect(m.isForeignAssistant(asst("Assistant:", "r7/call_2"), "h")).toBe(true);
+    m.close();
+  });
+});

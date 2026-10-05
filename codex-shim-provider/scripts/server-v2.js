@@ -22,7 +22,7 @@ import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { join } from "path";
 import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from "./notice-transport.js";
-import { promptForSession } from "./history-rehydration.js";
+import { promptForSession, foreignReplyText } from "./history-rehydration.js";
 import { codexThreadConfig, codexResumeParams } from "./thread-config.js";
 import { createSseWriter } from "./sse-writer.js";
 import { prepareNativeSafeModelCatalog, failClosedApprovalResponse } from "./native-tool-policy.js";
@@ -230,10 +230,20 @@ function systemText(messages) {
     .join("\n\n");
 }
 
-function blocksOf(messages) {
+// `idMap` given: assistant rows another model produced while this thread was parked (model switch)
+// are included as kind "assistant" text blocks — the thread never saw them (see
+// SourceIdMap.isForeignAssistant). Own replies, compaction summaries and empty rows stay out.
+function blocksOf(messages, idMap = null) {
   const out = [];
   for (const m of messages || []) {
-    if (m.role === "user") {
+    if (m.role === "assistant" && idMap) {
+      const text = typeof m.content === "string" ? m.content : (m.content || []).map(p => (p && p.type === "text" ? p.text : "")).join("\n");
+      const calls = m.tool_calls || [];
+      if (!text.trim() && !calls.length) continue;
+      if (/^\s*<context_summary>/.test(text)) continue;
+      const probe = { kind: "assistant", id: calls.map(c => `${c.id || ""}:${c.function?.name || ""}`).join(","), text: foreignReplyText(text, calls), sourceIds: m._sourceIds || null };
+      if (idMap.isForeignAssistant(probe, blockHash(probe))) out.push({ ...probe, foreign: true });
+    } else if (m.role === "user") {
       const c = typeof m.content === "string" ? m.content : (m.content || []).map(p => p.type === "text" ? p.text : "").join("\n");
       if (c.trim()) out.push({ kind: "user", text: c, sourceIds: m._sourceIds || null });
     } else if (m.role === "tool") {
@@ -507,8 +517,8 @@ async function handleChat(req) {
   const knownVolatile = rememberVolatileTools(tools);
   attachSourceIds(messages, body._vellum);
   const replyId = replyIdOf(body._vellum); // Vellum row the reply of THIS request will live in (v3)
-  const blocks = blocksOf(messages);
-  const assistantBlocks = assistantBlocksOf(messages); // id tracking only, never fed
+  let blocks = blocksOf(messages); // user/tool only until the id map is open (key needed first)
+  const assistantBlocks = assistantBlocksOf(messages); // id tracking; fed only when foreign (blocksOf with idMap)
   const coverage = idCoverage(messages);
 
   // Session key: explicit prompt_cache_key → X-Conversation-Id header (local Vellum
@@ -553,6 +563,7 @@ async function handleChat(req) {
 
   const oneUse = ONEUSE_RE.test(key);
   const idMap = oneUse ? NULL_SOURCE_ID_MAP : openIdMap(key);
+  blocks = blocksOf(messages, idMap); // + another model's assistant rows, rendered as text
   let state = oneUse ? (oneUseStates.get(key) ?? null) : key ? loadState(key) : null;
   // One-time migration: sessions fingerprinted before volatile tools were excluded. Match on the
   // legacy hash and re-key silently instead of invalidating every live chat after this deploy.
@@ -651,6 +662,8 @@ async function handleChat(req) {
   // fed; retry replays below don't re-trigger this).
   const feedCount = toFeed.length;
   const feedChars = toFeed.reduce((n, b) => n + b.text.length, 0);
+  const foreignFed = toFeed.filter(b => b.foreign);
+  if (foreignFed.length) log(`[sess] key=${key.slice(0, 12)} foreign assistant rows fed as text: ${foreignFed.length} (~${foreignFed.reduce((n, b) => n + b.text.length, 0)} chars) ids=${foreignFed.map(b => (b.sourceIds || [])[0] || "?").join(",")}`);
   const MAX_FEED = Number(process.env.SHIM_MAX_FEED || 8);
   if (feedCount > MAX_FEED) {
     log(`[guard] ⚠ REPLAY-SUSPECT key=${key.slice(0, 12)} feeding ${feedCount} unseen blocks (~${feedChars} chars) at once (limit ${MAX_FEED}) newThread=${!state} model=${model} — full-history replay?`);
@@ -658,7 +671,8 @@ async function handleChat(req) {
 
   // tool results pending from a previous request?
   let toolResults = toFeed.filter(b => b.kind === "tool");
-  let userBlocks = toFeed.filter(b => b.kind === "user");
+  const isPromptBlock = b => b.kind === "user" || b.kind === "assistant"; // assistant here == foreign (blocksOf)
+  let userBlocks = toFeed.filter(isPromptBlock);
   if (!userBlocks.length && !toolResults.length) {
     // Everything was already fed but the caller asks again: the previous answer
     // was lost (shim/app-server restart mid-turn, client retry, dropped stream).
@@ -671,7 +685,7 @@ async function handleChat(req) {
     else if (tailTools.length) {
       // parked call is gone (app-server restart) → hand the results over as plain text
       toolResults = []; userBlocks = [{ kind: "user", text: "Tool results (replayed after restart):\n" + tailTools.map(b => b.text).join("\n\n") }];
-    } else { toolResults = []; userBlocks = tail.filter(b => b.kind === "user"); }
+    } else { toolResults = []; userBlocks = tail.filter(isPromptBlock); }
     log(`[req] retry: nothing unseen, replaying last ${stillParked ? "tool results (parked)" : tailTools.length ? "tool results as text" : "user block"}`);
     if (!userBlocks.length && !toolResults.length) {
       return jsonResp({ error: { message: "nothing new to feed", type: "invalid_request_error" } }, 400);
@@ -700,6 +714,7 @@ async function handleChat(req) {
       };
       try {
         if (feedCount > MAX_FEED) notice("Большая история загружена", `${model}; ${feedCount} блоков; ~${Math.round(feedChars / 1000)}K симв.`);
+        if (foreignFed.length) notice("Ответы другой модели", `${model}; ${foreignFed.length} блоков переданы текстом`);
         // --- ensure thread ---
         if (!state) {
           log(`[guard] NEW THREAD key=${key.slice(0, 12)} reason=${invalidReason ? "state invalidated: " + invalidReason : "no prior state"} feed=${feedCount} blocks (~${feedChars} chars) sys=${sys.length} chars tools=${tools ? tools.length : 0}`);

@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 --              tool result "<result_row>/<tool_call_id>" ("?/<id>" when the result carried no id)
 --   part       the tool_call_id for calls and results; NULL for reply text
 --   cli_id     Claude: CLI message uuid; Codex: item/call id — '' when the CLI exposed none
---   kind       reply | tool_use | tool_result
+--   kind       reply | tool_use | tool_result | user | thinking | foreign
+--              (foreign: an assistant row another model produced, fed to this CLI as text)
 --   fed        1 once the matching result reached the CLI natively (tool_use/tool_result)
 CREATE TABLE IF NOT EXISTS cli_ids (
   vellum_id TEXT NOT NULL,
@@ -106,6 +107,8 @@ export class SourceIdMap {
     this.qCliFed = this.db.query("UPDATE cli_ids SET fed = 1 WHERE part = ?");
     this.qCliIsFed = this.db.query("SELECT 1 FROM cli_ids WHERE part = ? AND fed = 1 LIMIT 1");
     this.qCliCount = this.db.query("SELECT COUNT(*) AS n, SUM(kind = 'tool_use') AS calls, SUM(kind = 'tool_use' AND fed = 1) AS fed FROM cli_ids");
+    this.qCliOwn = this.db.query("SELECT 1 FROM cli_ids WHERE row_id = ? AND kind IN ('reply', 'tool_use', 'thinking') LIMIT 1");
+    this.qCliForeign = this.db.query("SELECT 1 FROM cli_ids WHERE row_id = ? AND kind = 'foreign' LIMIT 1");
     this.markMany = this.db.transaction((blocks, hashes, now) => {
       let n = 0;
       blocks.forEach((b, i) => {
@@ -169,8 +172,31 @@ export class SourceIdMap {
    */
   recordUserFed(blocks, cliId, session = null) {
     let n = 0;
-    for (const b of blocks || []) for (const id of b?.sourceIds || []) n += this.recordCli(id, cliId, "user", { part: partOf(id), fed: 1, session }) ? 1 : 0;
+    for (const b of blocks || []) for (const id of b?.sourceIds || []) n += this.recordCli(id, cliId, b?.foreign ? "foreign" : "user", { part: partOf(id), fed: 1, session }) ? 1 : 0;
     return n;
+  }
+
+  /** This CLI generated the row: reply text, a tool call or thinking was recorded under it. */
+  isOwnRow(rowId) { return !!rowId && !!this.qCliOwn.get(String(rowId)); }
+  /** The row was already handed to this CLI as text — another model's reply (see isForeignAssistant). */
+  isForeignRow(rowId) { return !!rowId && !!this.qCliForeign.get(String(rowId)); }
+  /**
+   * An assistant row this CLI did NOT produce. While a chat is served by another model (model switch,
+   * Kimi/OpenRouter in between) this CLI sits parked: it never sees those replies or their tool calls,
+   * only the user's turns and the tool results come back later — a transcript full of answers to
+   * questions nobody asked. Such rows must be fed as text, once, like any other new block.
+   *   own      a reply/tool_use/thinking record exists under the row       → false
+   *   foreign  already fed as text (kind 'foreign')                        → true (stays in the seen list)
+   *   new      ids never marked in this session and nothing recorded       → true
+   *   seen/rewritten without records (map predates patch 9), or no ids    → false (never-feed rule)
+   */
+  isForeignAssistant(block, hash) {
+    const ids = block?.sourceIds;
+    if (!ids || !ids.length) return false;
+    const rows = [...new Set(ids.map(rowOf))];
+    if (rows.some((r) => this.isOwnRow(r))) return false;
+    if (rows.some((r) => this.isForeignRow(r))) return true;
+    return this.classify(block, hash) === "new";
   }
 
   /** Did a result for this tool call already reach the CLI (any kind, any session restart)? */
@@ -244,6 +270,7 @@ export const NULL_SOURCE_ID_MAP = {
   classify() { return "unknown"; }, classifyAll(blocks) { return blocks.map(() => "unknown"); },
   markFed() { return 0; }, reset() {}, stats() { return { ids: 0, rows: 0, cli: { n: 0, calls: 0, fed: 0 } }; }, close() {},
   recordCli() { return false; }, recordResultFed() {}, isPartFed() { return false; }, recordClaudeAssistant() { return 0; }, recordUserFed() { return 0; }, fillResultCli() { return 0; }, reconcileEmpty() { return null; }, missingGrew() { return false; },
+  isOwnRow() { return false; }, isForeignRow() { return false; }, isForeignAssistant() { return false; },
 };
 
 /** Summarise a classification array for a log line; null when nothing had ids. */

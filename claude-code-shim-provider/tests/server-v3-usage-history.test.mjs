@@ -23,3 +23,11 @@ test('full-history restore notice is emitted only for fresh multi-block history'
   assert.match(source, /sendUsage\(finalStepUsage\(\)\);/);
   assert.match(source, /stepCount <= 1 \? usageFromResult\(result\) : null/);
 });
+
+test('another model\'s assistant rows are fed as text, own rows never (model switch fix)', () => {
+  assert.match(source, /function inputBlocks\(blocks\) \{\n  return blocks\.filter\(\(b\) => \(b\.role !== "assistant" \|\| b\.foreign\)/);
+  assert.match(source, /this\.idMap\(\)\.isForeignAssistant\(b, sha\(b\.text\)\)/);
+  assert.match(source, /if \(\/\^<context_summary>\/\.test\(plain\)\) continue;/);
+  assert.match(source, /const fedUser = unseen\.filter\(\(b\) => \(b\.role === "user" \|\| b\.foreign\) && b\.sourceIds\?\.length\);/);
+  assert.match(source, /diagnostic\(onMsg, short\(this\.key\), "Ответы другой модели"/);
+});

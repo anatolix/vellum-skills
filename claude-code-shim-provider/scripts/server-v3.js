@@ -16,7 +16,7 @@ import { createHash } from "node:crypto";
 
 import { z } from "zod";
 import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from "./notice-transport.js";
-import { promptForSession } from "./history-rehydration.js";
+import { promptForSession, foreignReplyText } from "./history-rehydration.js";
 import { isOutputOnlyBatch, closeOneUseSession } from './oneuse-cleanup.js';
 import { attachSourceIds, replyIdOf, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, idCoverage, describeMissing, describeReconcile } from "./source-id-map.js";
 const noticeTransport = new NoticeTransport({ source: "claude-shim" });
@@ -353,6 +353,7 @@ class Chat {
   // Dry run (header X-Shim-Dry-Run: 1): the same seen/rewritten/new classification _run applies,
   // reported per block and nothing else — no CLI, no markFed, no save. Mirrors codex-shim.
   dryRun(blocks) {
+    this.tagForeign(blocks);
     const inputs = inputBlocks(blocks);
     const hashes = inputs.map((b) => sha(b.text));
     const asst = blocks.filter((b) => b.role === "assistant");
@@ -363,7 +364,7 @@ class Chat {
     const report = inputs.map((b, i) => {
       const consumed = b.role === "tool" && !!b.consumed;
       const decision = prior.has(hashes[i]) ? "already-fed" : consumed ? "already-fed-natively" : i < lastSeenIdx0 ? "skip-rewritten-history" : "feed";
-      return { index: i, kind: b.role, source_ids: b.sourceIds || null, len: b.text.length, id_class: idCls[i], hash_known: this.sent.includes(hashes[i]), decision, head: b.text.replace(/\s+/g, " ").slice(0, 60) };
+      return { index: i, kind: b.role, foreign: !!b.foreign || undefined, source_ids: b.sourceIds || null, len: b.text.length, id_class: idCls[i], hash_known: this.sent.includes(hashes[i]), decision, head: b.text.replace(/\s+/g, " ").slice(0, 60) };
     });
     const feed = report.filter((r) => r.decision === "feed").length;
     console.log(`[ids] ${short(this.key)} DRY RUN session=${this.sessionId || "none"} blocks=${inputs.length} feed=${feed}`);
@@ -379,7 +380,26 @@ class Chat {
   // the head) therefore sends just the summary; a retried identical history
   // re-sends the last user block. A fresh process is spawned only when there is
   // no live one, with `resume` when a session id exists.
+  // Assistant rows produced by another model while this CLI was parked (model switch): the CLI has
+  // never seen them, so they join the fed blocks as text — `Assistant:` frame, reply text, tool calls
+  // as recorded lines (their results arrive as the usual <tool_result> text, matched by id). Own rows
+  // stay out (the CLI holds them); so do compaction summaries and empty rows.
+  tagForeign(blocks) {
+    let n = 0;
+    for (const b of blocks) {
+      if (b.role !== "assistant" || b.foreign) continue;
+      const plain = (b.plain || "").trim();
+      if (!plain && !(b.calls || []).length) continue;
+      if (/^<context_summary>/.test(plain)) continue;
+      if (!this.idMap().isForeignAssistant(b, sha(b.text))) continue;
+      b.text = `Assistant: ${foreignReplyText(plain, b.calls)}`;
+      b.foreign = true; n++;
+    }
+    return n;
+  }
+
   async _run(model, blocks, onMsg, effort = null, mcp = null, extra = {}) {
+    this.tagForeign(blocks);
     const inputs = inputBlocks(blocks);
     const hashes = inputs.map((b) => sha(b.text));
     // Assistant turns are never fed (the CLI holds its own replies) but their Vellum ids are
@@ -489,6 +509,11 @@ class Chat {
         }
         const matched = hashes.filter(h => prior.has(h)).length;
         if (unseen.length > FULL_HIST_MIN) diagnostic(onMsg, short(this.key), "Большой контекст", `+${unseen.length} блоков; видено=${matched}/${inputs.length}`);
+        const foreignFed = unseen.filter((b) => b.foreign);
+        if (foreignFed.length) {
+          console.log(`[sess] ${short(this.key)} foreign assistant rows fed as text: ${foreignFed.length} (~${foreignFed.reduce((s, b) => s + b.text.length, 0)} chars) ids=${foreignFed.map((b) => (b.sourceIds || [])[0] || "?").join(",")}`);
+          diagnostic(onMsg, short(this.key), "Ответы другой модели", `${model}; ${foreignFed.length} блоков переданы текстом`);
+        }
         let lastSeenIdx = -1; for (let i = 0; i < hashes.length; i++) if (prior.has(hashes[i])) lastSeenIdx = i;
         if (this.pendingCompactNotice) { diagnostic(onMsg, short(this.key), "Компакция", this.pendingCompactNotice); this.pendingCompactNotice = null; this.save(); }
         else if (skippedOld.length) diagnostic(onMsg, short(this.key), "Не отправлено", `${model}; ${skippedOld.length} старых блоков (~${Math.round(skippedOld.reduce((n, b) => n + b.text.length, 0) / 1000)}K симв.): история переписана, CLI видел исходники`);
@@ -499,7 +524,7 @@ class Chat {
         const res = await this.cli.send(prompt, (m) => { produced = true; if (!firstAsstUuid && m?.type === "assistant" && m.uuid) firstAsstUuid = m.uuid; onMsg(m); });
         this.sent = [...seen]; markFed();
         try {
-          const fedUser = unseen.filter((b) => b.role === "user" && b.sourceIds?.length);
+          const fedUser = unseen.filter((b) => (b.role === "user" || b.foreign) && b.sourceIds?.length);
           if (fedUser.length) {
             const sid = res.session_id || this.cli.sessionId;
             const uuid = transcriptUserUuid(sid, firstAsstUuid);
@@ -922,7 +947,7 @@ function messagesToBlocks(messages, tools, idMap = null) {
       const lines = [];
       if (text) lines.push(text);
       if (TOOL_MODE !== "mcp") for (const tc of m.tool_calls || []) lines.push(`TOOL_CALL: ${tcToJson(tc)}`);
-      blocks.push({ role, text: `Assistant: ${lines.join("\n")}` });
+      blocks.push({ role, text: `Assistant: ${lines.join("\n")}`, plain: text, calls: m.tool_calls || [] });
     } else if (role === "tool") {
       const label = m.name || m.tool_call_id || "tool";
       // mcp mode: a result whose tool_use is still pending was consumed by
@@ -1014,8 +1039,9 @@ function transcriptToolResultUuids(sessionId) {
   return out;
 }
 
+// Fed to the CLI: user/tool blocks plus assistant rows another model produced (tagForeign).
 function inputBlocks(blocks) {
-  return blocks.filter((b) => b.role !== "assistant" && b.role !== "system" && b.role !== "tools");
+  return blocks.filter((b) => (b.role !== "assistant" || b.foreign) && b.role !== "system" && b.role !== "tools");
 }
 
 // Extract TOOL_CALL lines; return { calls, restText }.

@@ -12,14 +12,24 @@ export function messageText(content) {
     return "";
   }).filter(Boolean).join("\n");
 }
+// One historical tool call as text, for history the CLI never executed itself.
+export function recordedCallLine(call) {
+  const args = call?.function?.arguments;
+  return `[Recorded tool call ${call?.function?.name || "tool"} id=${call?.id || ""}] ${typeof args === "string" ? args : JSON.stringify(args ?? {})}`;
+}
+// An assistant reply another model produced (model switch mid-chat), rendered for the warm CLI
+// that never saw it: a one-line frame, the text, then its tool calls as recorded lines. The
+// results follow as ordinary tool-result blocks and match by id.
+export const FOREIGN_REPLY_FRAME = "[Earlier assistant reply by another model in this conversation — saved history, not your output]";
+export function foreignReplyText(text, toolCalls) {
+  return [FOREIGN_REPLY_FRAME, (text || "").trim(), ...(toolCalls || []).map(recordedCallLine)].filter(Boolean).join("\n");
+}
 export function historyToPrompt(messages) {
   const records = [];
   for (const m of messages || []) {
     if (["system", "developer"].includes(m.role)) continue;
     const lines = [messageText(m.content)];
-    for (const call of m.tool_calls || []) {
-      lines.push(`[Recorded tool call ${call.function?.name || "tool"} id=${call.id || ""}] ${typeof call.function?.arguments === "string" ? call.function.arguments : JSON.stringify(call.function?.arguments ?? {})}`);
-    }
+    for (const call of m.tool_calls || []) lines.push(recordedCallLine(call));
     const text = lines.filter(Boolean).join("\n");
     if (!text.trim()) continue;
     const label = m.role === "tool" ? `tool result ${m.name || m.tool_call_id || "tool"}` : m.role || "unknown";
