@@ -17,7 +17,7 @@ export function turnInterface(messages = []) {
   return m ? m[1] : null;
 }
 const enc = new TextEncoder();
-export function cleanNotices(messages = []) {
+export function cleanNotices(messages = [], vellum = null) {
   const ids = new Set();
   for (const m of messages) for (const t of m.tool_calls || [])
     if (t.function?.name === NOTICE_TOOL && t.id?.startsWith(PREFIX)) ids.add(t.id);
@@ -25,15 +25,27 @@ export function cleanNotices(messages = []) {
   // <system_notice> user message ("This tool call returned an error..."). Both belong
   // to the fake call: drop the notice too, or the model reads a retry hint after each one.
   let afterNotice = false;
-  return messages.flatMap(m => {
+  const kept = []; // original index of every surviving message, in order
+  const out = messages.flatMap((m, i) => {
     if (m.role === 'tool' && ids.has(m.tool_call_id)) { afterNotice = true; return []; }
     const wasAfter = afterNotice; afterNotice = false;
     if (wasAfter && m.role === 'user' && isSystemNoticeOnly(m)) return [];
-    if (m.role !== 'assistant') return [m];
+    if (m.role !== 'assistant') { kept.push(i); return [m]; }
     const tc = m.tool_calls?.filter(t => !ids.has(t.id));
     if (m.tool_calls?.length && !tc.length) return [];
+    kept.push(i);
     return [{ ...m, ...(tc ? {tool_calls: tc} : {}) }];
   });
+  remapSourceIndexes(vellum, kept);
+  return out;
+}
+// Vellum's `_vellum.messages[].index` addresses the ORIGINAL wire list (local patch 8). After
+// dropping notice messages every later index would point past its message, so the row ids
+// would land on the wrong blocks. Renumber in place; entries for dropped messages go away.
+function remapSourceIndexes(vellum, kept) {
+  if (!vellum || !Array.isArray(vellum.messages)) return;
+  const pos = new Map(kept.map((orig, j) => [orig, j]));
+  vellum.messages = vellum.messages.flatMap(e => pos.has(e?.index) ? [{ ...e, index: pos.get(e.index) }] : []);
 }
 function isSystemNoticeOnly(m) {
   const t = (typeof m.content === 'string' ? m.content
@@ -74,7 +86,7 @@ export class NoticeTransport {
     // compactor.ts; 'compactionAgent' is only the log label) — recognise the instruction block instead.
     if (isCompactionRequest(req, body)) {
       // Vellum's summary call must come back as plain parseable text: no notice frames, no parking.
-      body.messages = cleanNotices(body.messages);
+      body.messages = cleanNotices(body.messages, body._vellum);
       return handler(new Request(req.url, {method:req.method, headers:req.headers, body:JSON.stringify(body)}));
     }
     const iface = turnInterface(body.messages);
@@ -89,7 +101,7 @@ export class NoticeTransport {
       clearTimeout(pending.timer); pending.active = true;
       return this.resume(pending, true);
     }
-    body.messages = cleanNotices(body.messages);
+    body.messages = cleanNotices(body.messages, body._vellum);
     // Detached request lifetime: the diagnostic response ends BEFORE inference.
     // A new HTTP request resumes the SAME reader, never another upstream turn.
     const abort = new AbortController();

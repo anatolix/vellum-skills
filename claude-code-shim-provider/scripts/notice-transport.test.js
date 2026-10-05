@@ -13,6 +13,12 @@ describe("cleanNotices", () => {
     ]);
     expect(out.map((m) => m.content)).toEqual(["hi", "ok"]);
   });
+  test("renumbers _vellum indexes after dropping notice messages", () => {
+    const vellum = { version: 1, messages: [{ index: 0, source_ids: ["u0"] }, { index: 1, source_ids: ["a1"] }, { index: 3, source_ids: ["u3"] }] };
+    const out = cleanNotices([{ role: "user", content: "hi" }, call("call_shim_notice_9"), { role: "tool", tool_call_id: "call_shim_notice_9", content: "e" }, { role: "user", content: "next" }], vellum);
+    expect(out.map((m) => m.role)).toEqual(["user", "user"]);
+    expect(vellum.messages).toEqual([{ index: 0, source_ids: ["u0"] }, { index: 1, source_ids: ["u3"] }]);
+  });
   test("keeps a system_notice that follows a real tool error", () => {
     const out = cleanNotices([call("toolu_1", "bash"), { role: "tool", tool_call_id: "toolu_1", content: "[ERROR] boom" }, notice]);
     expect(out.length).toBe(3);
