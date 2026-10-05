@@ -109,3 +109,15 @@ describe("idCoverage", () => {
     expect(c.details.map((d) => d.index)).toEqual([1, 3]);
   });
 });
+
+describe("idCoverage synthetic rows", () => {
+  test("compaction summary is not counted", () => {
+    const c = idCoverage([
+      { role: "assistant", content: "<context_summary>\n…" },
+      { role: "assistant", text: "Assistant: <context_summary> x" },
+      { role: "user", _sourceIds: ["u"] },
+    ]);
+    expect(c.missing).toBe(0);
+    expect(c.summary).toBe(null);
+  });
+});

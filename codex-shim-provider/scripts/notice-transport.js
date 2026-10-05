@@ -21,13 +21,24 @@ export function cleanNotices(messages = []) {
   const ids = new Set();
   for (const m of messages) for (const t of m.tool_calls || [])
     if (t.function?.name === NOTICE_TOOL && t.id?.startsWith(PREFIX)) ids.add(t.id);
+  // Vellum answers every rejected notice call with an error result AND a follow-up
+  // <system_notice> user message ("This tool call returned an error..."). Both belong
+  // to the fake call: drop the notice too, or the model reads a retry hint after each one.
+  let afterNotice = false;
   return messages.flatMap(m => {
-    if (m.role === 'tool' && ids.has(m.tool_call_id)) return [];
+    if (m.role === 'tool' && ids.has(m.tool_call_id)) { afterNotice = true; return []; }
+    const wasAfter = afterNotice; afterNotice = false;
+    if (wasAfter && m.role === 'user' && isSystemNoticeOnly(m)) return [];
     if (m.role !== 'assistant') return [m];
     const tc = m.tool_calls?.filter(t => !ids.has(t.id));
     if (m.tool_calls?.length && !tc.length) return [];
     return [{ ...m, ...(tc ? {tool_calls: tc} : {}) }];
   });
+}
+function isSystemNoticeOnly(m) {
+  const t = (typeof m.content === 'string' ? m.content
+    : (m.content || []).map(p => (p?.type === 'text' ? p.text : '\u0000')).join('\n')).trim();
+  return /^<system_notice>[\s\S]*<\/system_notice>$/.test(t) && !/<\/system_notice>[\s\S]*<system_notice>/.test(t);
 }
 export function noticeText(source, event, detail) { return `[${source}] ${event}: ${detail}`; }
 export function noticeFrame(text) { return `data: ${JSON.stringify({shim_notice: String(text)})}\n\n`; }

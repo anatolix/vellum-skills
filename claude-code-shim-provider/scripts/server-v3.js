@@ -395,6 +395,8 @@ class Chat {
       for (const h of hashes) if (!seen.has(h)) seen.add(h);
       if (!unseen.length && this.cli?.done) {
         console.log(`[sess] ${short(this.key)} continuing in-flight run (tool results delivered)`);
+        // record now: a long run keeps attaching and only returns at its very end
+        this.sent = [...seen]; markFed(); this.save();
         const res = await this.cli.attach(onMsg);
         this.sent = [...seen]; markFed(); this.sessionId = res.session_id || this.cli.sessionId; this.served++; this.lastUsed = Date.now(); this.save();
         console.log(`[sess] ${short(this.key)} served #${this.served} model=${model} (continued) in=${res.usage?.input_tokens ?? "?"} cache_read=${res.usage?.cache_read_input_tokens ?? "?"} session=${this.sessionId}`);

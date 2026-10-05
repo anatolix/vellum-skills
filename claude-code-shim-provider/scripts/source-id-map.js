@@ -133,6 +133,10 @@ export function assistantBlocksOf(messages) {
  * { counts: {role: [withIds, total]}, missing: n, summary } — summary is null when
  * every non-system message carried ids.
  */
+function textOf(m) {
+  const raw = m.content ?? m.text ?? "";
+  return typeof raw === "string" ? raw : (raw || []).map(p => (p && p.type === "text" ? p.text : "")).join("\n");
+}
 export function idCoverage(messages) {
   const counts = {};
   const details = []; // one entry per message without ids: where it sits and what it starts with
@@ -140,6 +144,8 @@ export function idCoverage(messages) {
   (messages || []).forEach((m, index) => {
     const r = m?.role;
     if (!r || r === "system" || r === "developer") return;
+    // Vellum-built, no DB row: the compaction summary that replaces the head.
+    if (r === "assistant" && /^\s*(Assistant:\s*)?<context_summary>/.test(textOf(m))) return;
     const c = counts[r] || (counts[r] = [0, 0]);
     c[1]++; total++;
     if (Array.isArray(m._sourceIds) && m._sourceIds.length) { c[0]++; return; }
