@@ -17,7 +17,7 @@ import { z } from "zod";
 import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from "./notice-transport.js";
 import { promptForSession } from "./history-rehydration.js";
 import { isOutputOnlyBatch, closeOneUseSession } from './oneuse-cleanup.js';
-import { attachSourceIds, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, idCoverage, describeMissing } from "./source-id-map.js";
+import { attachSourceIds, replyIdOf, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, idCoverage, describeMissing } from "./source-id-map.js";
 const noticeTransport = new NoticeTransport();
 const TOOL_MODE = process.env.SHIM_TOOL_MODE || "mcp"; // mcp | text
 const BATCH_IDLE_MS = Number(process.env.SHIM_BATCH_IDLE_MS || 5000);
@@ -501,6 +501,8 @@ const manager = {
     for (const p of pendingToolUses.values()) if (p.chatKey === key) return; // tool round trip still in flight
     this.destroyOneUse(key, "turn done");
   },
+  /** The per-chat id map, if that chat exists yet (one-use or persistent); null before its first run. */
+  idMapFor(key) { const c = key ? (this.oneuse.get(key) || this.chats.get(key)) : null; return c ? c.idMap() : null; },
   destroyOneUse(key, reason) {
     console.log(`[sess] ${short(key)} oneuse ${reason} — cli closed, pending cleared`);
     return closeOneUseSession({ key, sessions: this.oneuse, pending: pendingToolUses,
@@ -765,7 +767,7 @@ function waitForVellum(name, id, args, signal, chatKey, real = false) {
 // Only the request from the SAME chat (prompt_cache_key) may resolve a parked handler.
 // The daemon's compactor re-sends the whole history WITHOUT a key; letting it resolve
 // handlers un-parked the live run into nobody's response and hung the chat (Sep 30 16:00).
-function resolveToolResults(messages, reqKey) {
+function resolveToolResults(messages, reqKey, idMap = null) {
   let n = 0;
   if (!reqKey) return 0;
   for (const m of messages || []) {
@@ -781,13 +783,13 @@ function resolveToolResults(messages, reqKey) {
     const result = { content: [{ type: "text", text: text || "(empty result)" }], ...(isError ? { isError: true } : {}) };
     if (!entry) {
       const tid = m.tool_call_id;
-      if (tid && emittedToolIds.has(tid) && !consumedToolIds.has(tid)) {
-        earlyResults.set(tid, result); consumedToolIds.add(tid); n++;
+      if (tid && emittedToolIds.has(tid) && !consumedToolIds.has(tid) && !idMap?.isPartFed(tid)) {
+        earlyResults.set(tid, result); consumedToolIds.add(tid); idMap?.recordResultFed(m._sourceIds, tid); n++;
         if (earlyResults.size > 500) earlyResults.delete(earlyResults.keys().next().value);
       }
       continue;
     }
-    pendingToolUses.delete(id); clearTimeout(entry.timer); consumedToolIds.add(id);
+    pendingToolUses.delete(id); clearTimeout(entry.timer); consumedToolIds.add(id); idMap?.recordResultFed(m._sourceIds, id);
     if (consumedToolIds.size > 5000) consumedToolIds.delete(consumedToolIds.values().next().value);
     entry.resolve(result);
     n++;
@@ -838,7 +840,7 @@ function tcToJson(tc) {
 // Render OpenAI messages into an ordered list of text blocks. Kept per-message
 // (not pre-joined) so the session layer can diff history against what a warm
 // worker has already seen and send only the tail.
-function messagesToBlocks(messages, tools) {
+function messagesToBlocks(messages, tools, idMap = null) {
   const blocks = [];
   if (TOOL_MODE !== "mcp" && Array.isArray(tools) && tools.length) {
     const defs = tools
@@ -868,7 +870,8 @@ function messagesToBlocks(messages, tools) {
       // resolveToolResults and lives in the CLI transcript as a real
       // tool_result. Only orphaned results (session restarted in between) are
       // rendered as text so the model still sees them.
-      if (TOOL_MODE === "mcp" && m.tool_call_id && consumedToolIds.has(m.tool_call_id)) { blocks.push({ role, text: `<tool_result id="${m.tool_call_id}"/>`, consumed: true }); continue; }
+      // `consumedToolIds` is this process's memory; the per-chat map (cli_ids.fed) is the durable record.
+      if (TOOL_MODE === "mcp" && m.tool_call_id && (consumedToolIds.has(m.tool_call_id) || idMap?.isPartFed(m.tool_call_id))) { blocks.push({ role, text: `<tool_result id="${m.tool_call_id}"/>`, consumed: true }); continue; }
       blocks.push({ role, text: `<tool_result name="${label}">\n${text}\n</tool_result>` });
     } else {
       blocks.push({ role, text: `${role}: ${text}` });
@@ -1206,11 +1209,13 @@ async function handleRequest(req) {
     const extra = { historyMessages: body.messages || [], maxBudgetUsd, outputFormat, signal: req.signal, exposeRel: (r) => { ac.rel = r; } };
     if (process.env.SHIM_DUMP_TOOLS && hasTools) { try { writeFileSync(process.env.SHIM_DUMP_TOOLS, JSON.stringify(tools)); } catch {} }
     const mcp = TOOL_MODE === "mcp" && hasTools ? await buildMcp(tools, body.prompt_cache_key) : null;
-    const resolved = TOOL_MODE === "mcp" ? resolveToolResults(body.messages || [], typeof body.prompt_cache_key === "string" && body.prompt_cache_key ? body.prompt_cache_key : null) : 0;
-    if (resolved) console.log(`[mcp] resolved ${resolved} pending tool result(s)`);
-    attachSourceIds(body.messages || [], body._vellum);
-    const blocks = messagesToBlocks(body.messages || [], tools);
     const cacheKey = typeof body.prompt_cache_key === "string" && body.prompt_cache_key ? body.prompt_cache_key : null;
+    attachSourceIds(body.messages || [], body._vellum);
+    const replyId = replyIdOf(body._vellum); // Vellum row the reply of THIS request will live in (v3)
+    const reqIdMap = manager.idMapFor(cacheKey);
+    const resolved = TOOL_MODE === "mcp" ? resolveToolResults(body.messages || [], cacheKey, reqIdMap) : 0;
+    if (resolved) console.log(`[mcp] resolved ${resolved} pending tool result(s)`);
+    const blocks = messagesToBlocks(body.messages || [], tools, reqIdMap);
     if (!cacheKey) { console.log(`[req] REJECTED: no prompt_cache_key (full history without a chat id)`); return Response.json({ error: { message: "claude-shim: prompt_cache_key (chat id) is required; keyless requests are rejected" } }, { status: 400 }); }
     const id = "chatcmpl-" + Math.random().toString(36).slice(2);
 
@@ -1248,9 +1253,16 @@ async function handleRequest(req) {
           // fallback: close after BATCH_IDLE_MS with no stream activity (message_stop is the primary signal;
           // a fixed window from the first block cut Fable off mid-batch while it was still writing arguments)
           const kickBatchTimer = () => { if (!toolUses.length || batchWhy) return; clearTimeout(batchTimer); batchTimer = setTimeout(() => closeBatch("idle"), BATCH_IDLE_MS); };
+          let recordedCli = 0;
           const runPromise = manager.run(sdkModel, cacheKey, blocks, (msg) => {
             if (msg.type === "shim_notice") { send(noticeFrame(msg.text)); return; }
             if (ac.aborted) return; // dead request: tool batches stay in cli.unobserved for the next one
+            // patch 9: everything the CLI generates for this reply gets its full Vellum id now —
+            // text → reply row, tool_use → reply row/<tool_use_id> — paired with the CLI uuid.
+            if (replyId && msg.type === "assistant") {
+              try { recordedCli += manager.idMapFor(cacheKey)?.recordClaudeAssistant(replyId, msg) || 0; }
+              catch (e) { console.error(`[ids] record reply failed: ${e.message}`); }
+            }
             if (mcpMode && msg.type === "assistant") {
               const tus = (msg.message?.content || []).filter((b) => b.type === "tool_use");
               // the CLI emits one assistant message per content block: collect until message_stop
@@ -1304,7 +1316,7 @@ async function handleRequest(req) {
               if (cacheKey) (manager.oneuse.get(cacheKey) || manager.chats.get(cacheKey))?.cli?.markObserved();
               send(sseChunk(id, model, { tool_calls }));
               send(sseChunk(id, model, {}, "tool_calls"));
-              console.log(`[res] tool_calls(mcp)=${toolUses.map((t) => t.name).join(",")} pending=${pendingToolUses.size}`);
+              console.log(`[res] tool_calls(mcp)=${toolUses.map((t) => t.name).join(",")} pending=${pendingToolUses.size}${replyId ? ` reply=${replyId.slice(0, 13)} cli_ids+${recordedCli}` : " reply=none"}`);
               // the CLI run continues in the background until Vellum's next request resolves the handler;
               // release the per-chat lock now so that request can enter (it only resolves handlers + feeds nothing new)
               runPromise.catch(() => {});

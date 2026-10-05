@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { attachSourceIds, SourceIdMap, describeClasses, assistantBlocksOf, idCoverage } from "./source-id-map.js";
+import { attachSourceIds, replyIdOf, rowOf, partOf, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, assistantBlocksOf, idCoverage } from "./source-id-map.js";
 
 const blk = (text, ...sourceIds) => ({ kind: "user", text, sourceIds: sourceIds.length ? sourceIds : null });
 const h = (b) => "h:" + b.text;
@@ -17,9 +17,19 @@ describe("attachSourceIds", () => {
   test("no-op without _vellum or on wrong version", () => {
     const msgs = [{ role: "user" }];
     expect(attachSourceIds(msgs, undefined)).toBe(0);
-    expect(attachSourceIds(msgs, { version: 3, messages: [{ index: 0, source_ids: ["a"] }] })).toBe(0);
+    expect(attachSourceIds(msgs, { version: 4, messages: [{ index: 0, source_ids: ["a"] }] })).toBe(0);
     expect(attachSourceIds([{ role: "tool" }], { version: 2, messages: [{ index: 0, source_ids: ["row/call_1"] }] })).toBe(1);
+    expect(attachSourceIds([{ role: "tool" }], { version: 3, reply_id: "r9", messages: [{ index: 0, source_ids: ["row/call_1"] }] })).toBe(1);
     expect(msgs[0]._sourceIds).toBeUndefined();
+  });
+
+  test("reply_id only on v3+; row/part split", () => {
+    expect(replyIdOf({ version: 3, reply_id: "r9", messages: [] })).toBe("r9");
+    expect(replyIdOf({ version: 3, messages: [] })).toBe(null);
+    expect(replyIdOf({ version: 2, reply_id: "r9", messages: [] })).toBe(null);
+    expect(replyIdOf(undefined)).toBe(null);
+    expect(rowOf("row/toolu_1")).toBe("row"); expect(partOf("row/toolu_1")).toBe("toolu_1");
+    expect(rowOf("row")).toBe("row"); expect(partOf("row")).toBe(null);
   });
 });
 
@@ -35,7 +45,7 @@ describe("SourceIdMap", () => {
     m.markFed([a2], [h(a2)]);
     expect(m.classify(a2, h(a2))).toBe("seen");
     expect(m.classify(a, h(a))).toBe("seen"); // old rendering still known
-    expect(m.stats()).toEqual({ ids: 2, rows: 3 });
+    expect(m.stats()).toMatchObject({ ids: 2, rows: 3 });
     m.reset();
     expect(m.classify(a, h(a))).toBe("new");
     m.close();
@@ -120,5 +130,38 @@ describe("idCoverage synthetic rows", () => {
     ]);
     expect(c.missing).toBe(0);
     expect(c.summary).toBe(null);
+  });
+});
+
+describe("cli_ids (patch 9)", () => {
+  test("claude reply: text + tool_use recorded under the reply row, result marks the call fed", () => {
+    const m = new SourceIdMap(":memory:");
+    const n = m.recordClaudeAssistant("r1", { uuid: "u1", session_id: "s1", message: { content: [{ type: "text", text: "hi" }, { type: "tool_use", id: "toolu_1", name: "bash", input: {} }] } });
+    expect(n).toBe(2);
+    expect(m.isPartFed("toolu_1")).toBe(false);
+    m.recordResultFed(["res1/toolu_1"], "toolu_1");
+    expect(m.isPartFed("toolu_1")).toBe(true);
+    expect(m.isPartFed("toolu_2")).toBe(false);
+    const rows = m.db.query("SELECT vellum_id, row_id, part, cli_id, kind, fed FROM cli_ids ORDER BY vellum_id").all();
+    expect(rows).toEqual([
+      { vellum_id: "r1", row_id: "r1", part: null, cli_id: "u1", kind: "reply", fed: 0 },
+      { vellum_id: "r1/toolu_1", row_id: "r1", part: "toolu_1", cli_id: "u1", kind: "tool_use", fed: 1 },
+      { vellum_id: "res1/toolu_1", row_id: "res1", part: "toolu_1", cli_id: "", kind: "tool_result", fed: 1 },
+    ]);
+    expect(m.stats().cli).toEqual({ n: 3, calls: 1, fed: 1 });
+    m.close();
+  });
+
+  test("result without ids lands under ?/<id>; reset wipes; null map is inert", () => {
+    const m = new SourceIdMap(":memory:");
+    m.recordCli("r2/call_a", "rpc:7", "tool_use", { part: "call_a" });
+    m.recordResultFed(null, "call_a");
+    expect(m.db.query("SELECT vellum_id FROM cli_ids WHERE kind = 'tool_result'").get()).toEqual({ vellum_id: "?/call_a" });
+    expect(m.isPartFed("call_a")).toBe(true);
+    m.reset();
+    expect(m.isPartFed("call_a")).toBe(false);
+    m.close();
+    expect(NULL_SOURCE_ID_MAP.recordClaudeAssistant("r", {})).toBe(0);
+    expect(NULL_SOURCE_ID_MAP.isPartFed("x")).toBe(false);
   });
 });

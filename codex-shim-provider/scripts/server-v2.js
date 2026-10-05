@@ -26,7 +26,7 @@ import { promptForSession } from "./history-rehydration.js";
 import { codexThreadConfig, codexResumeParams } from "./thread-config.js";
 import { createSseWriter } from "./sse-writer.js";
 import { prepareNativeSafeModelCatalog, failClosedApprovalResponse } from "./native-tool-policy.js";
-import { attachSourceIds, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, assistantBlocksOf, idCoverage, describeMissing } from "./source-id-map.js";
+import { attachSourceIds, replyIdOf, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, assistantBlocksOf, idCoverage, describeMissing } from "./source-id-map.js";
 const noticeTransport = new NoticeTransport();
 const threadOwners = new Map();
 
@@ -175,6 +175,7 @@ function saveState(key, st) { writeFileSync(sessPath(key), JSON.stringify(st)); 
 // Vellum row id <-> block hash per chat: one SQLite file next to the session JSON, kept open
 // for the process lifetime. A failure to open degrades that chat to hash-only matching.
 const idMaps = new Map();
+let loggedToolCallShape = false; // patch 9: log item/tool/call param keys once per process
 function openIdMap(key) {
   let m = idMaps.get(key);
   if (!m) {
@@ -501,6 +502,7 @@ async function handleChat(req) {
   const toolNames = stableToolNames(tools); // fingerprint/diff basis — volatile tools excluded
   const knownVolatile = rememberVolatileTools(tools);
   attachSourceIds(messages, body._vellum);
+  const replyId = replyIdOf(body._vellum); // Vellum row the reply of THIS request will live in (v3)
   const blocks = blocksOf(messages);
   const assistantBlocks = assistantBlocksOf(messages); // id tracking only, never fed
   const coverage = idCoverage(messages);
@@ -765,6 +767,9 @@ async function handleChat(req) {
               if (summaryBuf.trim()) log(`[turn] ${elapsed()} summary: ${summaryBuf.trim().slice(0, 120)}`);
               summaryBuf = "";
               sse(res, { ...base, choices: [{ index: 0, delta: { reasoning_content: "\n\n" } }] });
+            } else if (method === "item/completed" && p.item?.type === "agentMessage") {
+              // patch 9: the reply text's Codex item id, keyed by the Vellum row reserved for it
+              if (replyId) { try { idMap.recordCli(replyId, p.item.id || "", "reply", { part: null, session: state.threadId }); } catch (e) { log(`[ids] record reply failed: ${e.message}`); } }
             } else if (method === "item/completed" && p.item?.type === "reasoning") {
               // Some transports deliver only a final item, without summary deltas.
               // Don't duplicate a summary/raw text that was already streamed.
@@ -797,6 +802,13 @@ async function handleChat(req) {
               }
               // park: ends this HTTP response as tool_calls; answered by a later request
               const callId = "call_" + Math.random().toString(36).slice(2);
+              // patch 9: the call's full Vellum id is known now (reply row/<call id>); the Codex-side
+              // id is whatever the app-server exposes for the item (logged once so the shape is on record).
+              if (replyId) {
+                const cliId = m.params.callId || m.params.itemId || m.params.id || `rpc:${m.id}`;
+                if (!loggedToolCallShape) { loggedToolCallShape = true; log(`[ids] item/tool/call params keys: ${Object.keys(m.params || {}).join(",")}`); }
+                try { idMap.recordCli(`${replyId}/${callId}`, cliId, "tool_use", { part: callId, session: state.threadId }); } catch (e) { log(`[ids] record tool call failed: ${e.message}`); }
+              }
               state.parked[callId] = { rpcId: m.id, name: m.params.tool };
               parkedCalls.push({ callId, name: m.params.tool, arguments: m.params.arguments });
               log(`[tool] parked ${m.params.tool}`);
@@ -820,6 +832,7 @@ async function handleChat(req) {
             if (parked) {
               log(`[tool] answering parked rpcId=${parked.rpcId} name=${parked.name}`);
               srv.respond(parked.rpcId, { contentItems: [{ type: "inputText", text: tr.text }], success: true });
+              try { idMap.recordResultFed(tr.sourceIds, tr.id); } catch (e) { log(`[ids] record tool result failed: ${e.message}`); }
               delete state.parked[tr.id];
             }
           }

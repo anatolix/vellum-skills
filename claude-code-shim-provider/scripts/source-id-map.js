@@ -22,8 +22,10 @@ import { Database } from "bun:sqlite";
 // v1: plain row ids. v2 (Vellum patch 8e): ids may be composite `row/part` — one entry per
 // wire message even when several render from one row (tool fan-out, hook-guidance tail), and
 // an empty assistant row exports its id too. Both read the same way here: opaque strings.
+// v3 (Vellum patch 9): adds `reply_id` — the row Vellum reserved for the reply to this very request
+// (see replyIdOf), so the shim can key what it generates before Vellum ever echoes it back.
 export function attachSourceIds(messages, vellum) {
-  if (!Array.isArray(messages) || !vellum || !(vellum.version === 1 || vellum.version === 2) || !Array.isArray(vellum.messages)) return 0;
+  if (!Array.isArray(messages) || !vellum || !(vellum.version >= 1 && vellum.version <= 3) || !Array.isArray(vellum.messages)) return 0;
   let n = 0;
   for (const e of vellum.messages) {
     const m = messages[e?.index];
@@ -33,6 +35,17 @@ export function attachSourceIds(messages, vellum) {
   }
   return n;
 }
+
+/** `_vellum.reply_id` (v3+): the Vellum row id the reply of this request will be stored under; null when absent. */
+export function replyIdOf(vellum) {
+  const id = vellum && vellum.version >= 3 ? vellum.reply_id : null;
+  return typeof id === "string" && id.length ? id : null;
+}
+
+/** Composite `row/part` → row; a plain id is its own row. */
+export function rowOf(id) { const i = String(id).indexOf("/"); return i < 0 ? String(id) : String(id).slice(0, i); }
+/** Composite `row/part` → part; null for a plain row id. */
+export function partOf(id) { const i = String(id).indexOf("/"); return i < 0 ? null : String(id).slice(i + 1); }
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS blocks (
@@ -46,6 +59,26 @@ CREATE TABLE IF NOT EXISTS blocks (
 );
 CREATE INDEX IF NOT EXISTS blocks_sid ON blocks(source_id);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+-- Vellum id <-> CLI id for everything this session generated or consumed (patch 9).
+--   vellum_id  reply row "<row>", tool call "<reply_row>/<tool_call_id>" or
+--              tool result "<result_row>/<tool_call_id>" ("?/<id>" when the result carried no id)
+--   part       the tool_call_id for calls and results; NULL for reply text
+--   cli_id     Claude: CLI message uuid; Codex: item/call id — '' when the CLI exposed none
+--   kind       reply | tool_use | tool_result
+--   fed        1 once the matching result reached the CLI natively (tool_use/tool_result)
+CREATE TABLE IF NOT EXISTS cli_ids (
+  vellum_id TEXT NOT NULL,
+  row_id    TEXT NOT NULL,
+  part      TEXT,
+  cli_id    TEXT NOT NULL DEFAULT '',
+  kind      TEXT NOT NULL,
+  fed       INTEGER NOT NULL DEFAULT 0,
+  session   TEXT,
+  ts        INTEGER NOT NULL,
+  PRIMARY KEY (vellum_id, cli_id)
+);
+CREATE INDEX IF NOT EXISTS cli_ids_part ON cli_ids(part);
+CREATE INDEX IF NOT EXISTS cli_ids_row ON cli_ids(row_id);
 `;
 
 export class SourceIdMap {
@@ -60,6 +93,12 @@ export class SourceIdMap {
       "INSERT INTO blocks (source_id, hash, kind, len, first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?) " +
       "ON CONFLICT(source_id, hash) DO UPDATE SET last_seen = excluded.last_seen");
     this.qCount = this.db.query("SELECT COUNT(DISTINCT source_id) AS ids, COUNT(*) AS rows FROM blocks");
+    this.qCliIns = this.db.query(
+      "INSERT INTO cli_ids (vellum_id, row_id, part, cli_id, kind, fed, session, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?) " +
+      "ON CONFLICT(vellum_id, cli_id) DO UPDATE SET fed = MAX(fed, excluded.fed), session = COALESCE(excluded.session, session)");
+    this.qCliFed = this.db.query("UPDATE cli_ids SET fed = 1 WHERE part = ?");
+    this.qCliIsFed = this.db.query("SELECT 1 FROM cli_ids WHERE part = ? AND fed = 1 LIMIT 1");
+    this.qCliCount = this.db.query("SELECT COUNT(*) AS n, SUM(kind = 'tool_use') AS calls, SUM(kind = 'tool_use' AND fed = 1) AS fed FROM cli_ids");
     this.markMany = this.db.transaction((blocks, hashes, now) => {
       let n = 0;
       blocks.forEach((b, i) => {
@@ -93,16 +132,54 @@ export class SourceIdMap {
   markFed(blocks, hashes) { return this.markMany(blocks, hashes, Date.now()); }
 
   /** Session restarted from scratch: the CLI forgot everything, so do we. */
-  reset() { this.db.exec("DELETE FROM blocks"); }
+  reset() { this.db.exec("DELETE FROM blocks"); this.db.exec("DELETE FROM cli_ids"); }
 
-  stats() { return this.qCount.get(); }
+  stats() { return { ...this.qCount.get(), cli: this.qCliCount.get() }; }
+
+  /** One generated/consumed item: vellumId (`row` or `row/part`), its CLI-side id, kind. */
+  recordCli(vellumId, cliId, kind, { part = partOf(vellumId), fed = 0, session = null } = {}) {
+    if (!vellumId) return false;
+    this.qCliIns.run(String(vellumId), rowOf(vellumId), part ?? null, cliId == null ? "" : String(cliId), kind, fed ? 1 : 0, session ?? null, Date.now());
+    return true;
+  }
+
+  /**
+   * A tool result for `toolCallId` reached the CLI natively. Records it under the result row's
+   * composite id (from the wire message's ids; `?/<id>` when it carried none) and flips the
+   * matching tool_use to fed. Replaces the old in-memory consumed-set: survives a shim restart.
+   */
+  recordResultFed(sourceIds, toolCallId, cliId = "") {
+    if (!toolCallId) return;
+    const own = (sourceIds || []).find((id) => partOf(id) === toolCallId) || `?/${toolCallId}`;
+    this.recordCli(own, cliId, "tool_result", { part: toolCallId, fed: 1 });
+    this.qCliFed.run(toolCallId);
+  }
+
+  /** Did a result for this tool call already reach the CLI (any kind, any session restart)? */
+  isPartFed(toolCallId) { return !!toolCallId && !!this.qCliIsFed.get(toolCallId); }
+
+  /**
+   * Claude CLI stream-json `assistant` message for the reply Vellum reserved as `replyId`:
+   * text blocks → `replyId`, each tool_use → `replyId/<tool_use_id>`; cli_id = the message uuid.
+   */
+  recordClaudeAssistant(replyId, msg) {
+    if (!replyId || !msg) return 0;
+    const uuid = msg.uuid || "";
+    let n = 0;
+    for (const b of msg.message?.content || []) {
+      if (b?.type === "tool_use" && b.id) n += this.recordCli(`${replyId}/${b.id}`, uuid, "tool_use", { part: b.id, session: msg.session_id }) ? 1 : 0;
+      else if (b?.type === "text" && b.text) n += this.recordCli(replyId, uuid, "reply", { part: null, session: msg.session_id }) ? 1 : 0;
+    }
+    return n;
+  }
   close() { try { this.db.close(); } catch { /* already closed */ } }
 }
 
 /** No-op map for chats that must not touch disk (one-use) when ids are unwanted. */
 export const NULL_SOURCE_ID_MAP = {
   classify() { return "unknown"; }, classifyAll(blocks) { return blocks.map(() => "unknown"); },
-  markFed() { return 0; }, reset() {}, stats() { return { ids: 0, rows: 0 }; }, close() {},
+  markFed() { return 0; }, reset() {}, stats() { return { ids: 0, rows: 0, cli: { n: 0, calls: 0, fed: 0 } }; }, close() {},
+  recordCli() { return false; }, recordResultFed() {}, isPartFed() { return false; }, recordClaudeAssistant() { return 0; },
 };
 
 /** Summarise a classification array for a log line; null when nothing had ids. */
