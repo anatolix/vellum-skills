@@ -17,7 +17,8 @@ describe("attachSourceIds", () => {
   test("no-op without _vellum or on wrong version", () => {
     const msgs = [{ role: "user" }];
     expect(attachSourceIds(msgs, undefined)).toBe(0);
-    expect(attachSourceIds(msgs, { version: 2, messages: [{ index: 0, source_ids: ["a"] }] })).toBe(0);
+    expect(attachSourceIds(msgs, { version: 3, messages: [{ index: 0, source_ids: ["a"] }] })).toBe(0);
+    expect(attachSourceIds([{ role: "tool" }], { version: 2, messages: [{ index: 0, source_ids: ["row/call_1"] }] })).toBe(1);
     expect(msgs[0]._sourceIds).toBeUndefined();
   });
 });

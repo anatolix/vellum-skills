@@ -19,8 +19,11 @@
 import { Database } from "bun:sqlite";
 
 /** Annotate body.messages in place: m._sourceIds = [...] from body._vellum. */
+// v1: plain row ids. v2 (Vellum patch 8e): ids may be composite `row/part` — one entry per
+// wire message even when several render from one row (tool fan-out, hook-guidance tail), and
+// an empty assistant row exports its id too. Both read the same way here: opaque strings.
 export function attachSourceIds(messages, vellum) {
-  if (!Array.isArray(messages) || !vellum || vellum.version !== 1 || !Array.isArray(vellum.messages)) return 0;
+  if (!Array.isArray(messages) || !vellum || !(vellum.version === 1 || vellum.version === 2) || !Array.isArray(vellum.messages)) return 0;
   let n = 0;
   for (const e of vellum.messages) {
     const m = messages[e?.index];
