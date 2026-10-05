@@ -18,7 +18,7 @@ import { z } from "zod";
 import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from "./notice-transport.js";
 import { promptForSession } from "./history-rehydration.js";
 import { isOutputOnlyBatch, closeOneUseSession } from './oneuse-cleanup.js';
-import { attachSourceIds, replyIdOf, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, idCoverage, describeMissing } from "./source-id-map.js";
+import { attachSourceIds, replyIdOf, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, idCoverage, describeMissing, describeReconcile } from "./source-id-map.js";
 const noticeTransport = new NoticeTransport({ source: "claude-shim" });
 const TOOL_MODE = process.env.SHIM_TOOL_MODE || "mcp"; // mcp | text
 const BATCH_IDLE_MS = Number(process.env.SHIM_BATCH_IDLE_MS || 5000);
@@ -406,9 +406,21 @@ class Chat {
     // A persistent chat without ids means the profile lacks `exportSourceIds` (or the Vellum
     // patch is not live): history is matched by text hash only — loud, so it gets fixed.
     const coverage = idCoverage(blocks.filter((b) => b.role !== "tools").map((b) => ({ role: b.role, _sourceIds: b.sourceIds, text: b.text })));
+    // safety net: cli_ids rows the primary path left empty (aborted turn, transcript lag) —
+    // looked up in the CLI transcript by tool_use_id; logged only when it actually had work.
+    if (!this.oneUse) {
+      try {
+        const sid = this.cli?.sessionId || this.sessionId;
+        const rec = this.idMap().reconcileEmpty({ byToolId: transcriptToolResultUuids(sid) });
+        if (rec) console.log(`[ids] ${short(this.key)} safety net ran: ${describeReconcile(rec)}`);
+      } catch (e) { console.error(`[ids] ${short(this.key)} safety net failed: ${e.message}`); }
+    }
+    // the warning card only when the count of id-less messages went up, not on every request
+    const missingGrew = !this.oneUse && this.idMap().missingGrew(coverage.missing);
     if (!this.oneUse && coverage.missing) {
       console.log(`[ids] ${short(this.key)} MISSING ids: ${coverage.summary}; ${describeMissing(coverage)}`);
-      if (coverage.none) diagnostic(onMsg, short(this.key), "⛔ Нет ID сообщений", `${model}; профиль без exportSourceIds или патч Vellum не активен — история сверяется только по хэшу`);
+      if (!missingGrew) {}
+      else if (coverage.none) diagnostic(onMsg, short(this.key), "⛔ Нет ID сообщений", `${model}; профиль без exportSourceIds или патч Vellum не активен — история сверяется только по хэшу`);
       else diagnostic(onMsg, short(this.key), "⚠ Часть сообщений без ID", `${model}; без ID ${coverage.summary} — они сверяются по хэшу`);
     }
     let unseen = inputs.filter((_, i) => !seen.has(hashes[i]));
@@ -494,7 +506,12 @@ class Chat {
             const n = this.idMap().recordUserFed(fedUser, uuid || "", sid);
             if (n) console.log(`[ids] ${short(this.key)} user rows ${fedUser.length} -> ${uuid ? uuid.slice(0, 8) : "no transcript uuid"} (${n} pairs)`);
           }
-        } catch (e) { console.error(`[ids] ${short(this.key)} record user failed: ${e.message}`); } this.sessionId = res.session_id || this.cli.sessionId; this.model = model; this.effort = effort ?? null; this.served++; this.lastUsed = Date.now();
+        } catch (e) { console.error(`[ids] ${short(this.key)} record user failed: ${e.message}`); }
+        try {
+          // results reach the CLI over MCP before it writes them; their entry uuids exist only now
+          const filled = this.idMap().fillResultCli(transcriptToolResultUuids(res.session_id || this.cli.sessionId));
+          if (filled) console.log(`[ids] ${short(this.key)} tool_result uuids filled: ${filled}`);
+        } catch (e) { console.error(`[ids] ${short(this.key)} fill results failed: ${e.message}`); } this.sessionId = res.session_id || this.cli.sessionId; this.model = model; this.effort = effort ?? null; this.served++; this.lastUsed = Date.now();
         res.shim_actual_model = this.cli?.actualModel ?? null;
         this.save();
         if (res.subtype && res.subtype !== "success") console.log(`[sess] ${short(this.key)} result subtype=${res.subtype} ${String(res.result || "").slice(0, 120)}`);
@@ -955,13 +972,46 @@ function transcriptUserUuid(sessionId, asstUuid) {
       const len = Math.min(size, TAIL), buf = Buffer.alloc(len);
       readSync(fd, buf, 0, len, size - len);
       const lines = buf.toString("utf8").split("\n");
-      let parent = null;
-      for (let i = lines.length - 1; i >= 0 && !parent; i--) if (lines[i].includes(asstUuid)) { try { const j = JSON.parse(lines[i]); if (j.uuid === asstUuid) parent = j.parentUuid || null; } catch {} }
-      if (!parent) return null;
-      for (let i = lines.length - 1; i >= 0; i--) if (lines[i].includes(parent)) { try { const j = JSON.parse(lines[i]); if (j.uuid === parent) return j.type === "user" ? parent : null; } catch {} }
+      // walk parentUuid up from the assistant entry: attachment/system entries can sit between the
+      // fed prompt and the first reply (seen live: thinking → attachment → user), so skip them.
+      const byUuid = new Map();
+      for (const l of lines) { if (!l) continue; try { const j = JSON.parse(l); if (j?.uuid) byUuid.set(j.uuid, j); } catch {} }
+      let cur = byUuid.get(asstUuid)?.parentUuid || null;
+      for (let hops = 0; cur && hops < 50; hops++) {
+        const j = byUuid.get(cur);
+        if (!j) return null;
+        if (j.type === "user") return j.uuid;
+        if (j.type === "assistant") return null;
+        cur = j.parentUuid || null;
+      }
     } finally { closeSync(fd); }
   } catch {}
   return null;
+}
+
+// tool_use_id → uuid of the transcript user entry carrying its tool_result (tail of the transcript).
+function transcriptToolResultUuids(sessionId) {
+  const out = new Map();
+  if (!sessionId) return out;
+  try {
+    const slug = process.cwd().replace(/[^a-zA-Z0-9]/g, "-");
+    const path = `${homedir()}/.claude/projects/${slug}/${sessionId}.jsonl`;
+    const size = statSync(path).size, TAIL = 4 * 1024 * 1024;
+    const fd = openSync(path, "r");
+    try {
+      const len = Math.min(size, TAIL), buf = Buffer.alloc(len);
+      readSync(fd, buf, 0, len, size - len);
+      for (const l of buf.toString("utf8").split("\n")) {
+        if (!l.includes('"tool_result"')) continue;
+        try {
+          const j = JSON.parse(l);
+          if (j?.type !== "user" || !Array.isArray(j.message?.content)) continue;
+          for (const b of j.message.content) if (b?.type === "tool_result" && b.tool_use_id) out.set(b.tool_use_id, j.uuid);
+        } catch {}
+      }
+    } finally { closeSync(fd); }
+  } catch {}
+  return out;
 }
 
 function inputBlocks(blocks) {

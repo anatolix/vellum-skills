@@ -96,6 +96,13 @@ export class SourceIdMap {
     this.qCliIns = this.db.query(
       "INSERT INTO cli_ids (vellum_id, row_id, part, cli_id, kind, fed, session, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?) " +
       "ON CONFLICT(vellum_id, cli_id) DO UPDATE SET fed = MAX(fed, excluded.fed), session = COALESCE(excluded.session, session)");
+    this.qCliFill = this.db.query("UPDATE OR IGNORE cli_ids SET cli_id = ? WHERE kind = 'tool_result' AND part = ? AND cli_id = ''");
+    this.qCliEmpty = this.db.query("SELECT vellum_id, part, kind, ts FROM cli_ids WHERE cli_id = '' ORDER BY ts");
+    this.qCliSet = this.db.query("UPDATE OR IGNORE cli_ids SET cli_id = ? WHERE vellum_id = ? AND cli_id = ''");
+    this.qCliCallOf = this.db.query("SELECT cli_id FROM cli_ids WHERE kind = 'tool_use' AND part = ? AND cli_id != '' LIMIT 1");
+    this.qMetaGet = this.db.query("SELECT v FROM meta WHERE k = ?");
+    this.qMetaSet = this.db.query("INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v");
+    this.reconcileReported = new Set();
     this.qCliFed = this.db.query("UPDATE cli_ids SET fed = 1 WHERE part = ?");
     this.qCliIsFed = this.db.query("SELECT 1 FROM cli_ids WHERE part = ? AND fed = 1 LIMIT 1");
     this.qCliCount = this.db.query("SELECT COUNT(*) AS n, SUM(kind = 'tool_use') AS calls, SUM(kind = 'tool_use' AND fed = 1) AS fed FROM cli_ids");
@@ -180,17 +187,63 @@ export class SourceIdMap {
     for (const b of msg.message?.content || []) {
       if (b?.type === "tool_use" && b.id) n += this.recordCli(`${replyId}/${b.id}`, uuid, "tool_use", { part: b.id, session: msg.session_id }) ? 1 : 0;
       else if (b?.type === "text" && b.text) n += this.recordCli(replyId, uuid, "reply", { part: null, session: msg.session_id }) ? 1 : 0;
+      // thinking lives in the reply row too, but the CLI keeps it as its own transcript entry
+      else if ((b?.type === "thinking" || b?.type === "redacted_thinking") && uuid) n += this.recordCli(`${replyId}/thinking:${uuid}`, uuid, "thinking", { part: `thinking:${uuid}`, session: msg.session_id }) ? 1 : 0;
     }
     return n;
   }
+
+  /**
+   * Tool results recorded before the CLI wrote them (cli_id ''): fill in the CLI-side id once it is
+   * known. `byToolId`: Map tool_use_id → CLI id of the entry holding that result. Returns rows filled.
+   */
+  fillResultCli(byToolId) {
+    let n = 0;
+    for (const [tid, cli] of byToolId || []) if (tid && cli) n += this.qCliFill.run(String(cli), String(tid)).changes || 0;
+    return n;
+  }
+
+  /**
+   * Safety net: rows still holding an empty cli_id after the primary recording. Tries every
+   * source that needs no model call — `byToolId` (Claude transcript: tool_use_id → result entry
+   * uuid) and, with `fromCall`, the tool_use row of the same call (Codex: the result lives inside
+   * the same dynamicToolCall item). Rows younger than `minAgeMs` are left to the primary path.
+   * Each unresolved row is reported once per process. Returns null when there was nothing new.
+   */
+  reconcileEmpty({ byToolId = null, fromCall = false, minAgeMs = 30_000, now = Date.now() } = {}) {
+    const rows = this.qCliEmpty.all().filter((r) => now - r.ts >= minAgeMs && !this.reconcileReported.has(r.vellum_id));
+    if (!rows.length) return null;
+    const found = [], left = [];
+    for (const r of rows) {
+      let cli = null;
+      if (r.kind === "tool_result" && r.part) cli = byToolId?.get(r.part) || (fromCall ? this.qCliCallOf.get(r.part)?.cli_id : null) || null;
+      if (cli && this.qCliSet.run(String(cli), r.vellum_id).changes) found.push({ ...r, cli_id: cli });
+      else { left.push(r); this.reconcileReported.add(r.vellum_id); }
+    }
+    return { checked: rows.length, found, left };
+  }
+
+  /** Missing-id notice gate: true only when the count of id-less messages went up since the last one. */
+  missingGrew(n) {
+    const prev = Number(this.qMetaGet.get("missing_ids_notified")?.v || 0);
+    this.qMetaSet.run("missing_ids_notified", String(n));
+    return n > prev;
+  }
   close() { try { this.db.close(); } catch { /* already closed */ } }
+}
+
+/** One log line for a reconcileEmpty() result. */
+export function describeReconcile(res) {
+  const f = res.found.map((r) => `${r.vellum_id} (${r.kind}) -> ${r.cli_id}`).join(", ");
+  const l = res.left.map((r) => `${r.vellum_id} (${r.kind})`).join(", ");
+  return `checked ${res.checked}, found ${res.found.length}${f ? `: ${f}` : ""}; unresolved ${res.left.length}${l ? `: ${l}` : ""}`;
 }
 
 /** No-op map for chats that must not touch disk (one-use) when ids are unwanted. */
 export const NULL_SOURCE_ID_MAP = {
   classify() { return "unknown"; }, classifyAll(blocks) { return blocks.map(() => "unknown"); },
   markFed() { return 0; }, reset() {}, stats() { return { ids: 0, rows: 0, cli: { n: 0, calls: 0, fed: 0 } }; }, close() {},
-  recordCli() { return false; }, recordResultFed() {}, isPartFed() { return false; }, recordClaudeAssistant() { return 0; }, recordUserFed() { return 0; },
+  recordCli() { return false; }, recordResultFed() {}, isPartFed() { return false; }, recordClaudeAssistant() { return 0; }, recordUserFed() { return 0; }, fillResultCli() { return 0; }, reconcileEmpty() { return null; }, missingGrew() { return false; },
 };
 
 /** Summarise a classification array for a log line; null when nothing had ids. */

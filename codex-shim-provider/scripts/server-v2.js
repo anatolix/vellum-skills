@@ -26,7 +26,7 @@ import { promptForSession } from "./history-rehydration.js";
 import { codexThreadConfig, codexResumeParams } from "./thread-config.js";
 import { createSseWriter } from "./sse-writer.js";
 import { prepareNativeSafeModelCatalog, failClosedApprovalResponse } from "./native-tool-policy.js";
-import { attachSourceIds, replyIdOf, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, assistantBlocksOf, idCoverage, describeMissing } from "./source-id-map.js";
+import { attachSourceIds, replyIdOf, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, assistantBlocksOf, idCoverage, describeMissing, describeReconcile } from "./source-id-map.js";
 const noticeTransport = new NoticeTransport({source: "codex-shim"});
 const threadOwners = new Map();
 
@@ -599,7 +599,14 @@ async function handleChat(req) {
     });
     const idSummary = describeClasses(idCls);
     if (idSummary) log(`[ids] key=${key.slice(0, 12)} ${idSummary}`);
-    if (!oneUse && coverage.missing) { pendingNoIdsNotice = coverage; log(`[ids] key=${key.slice(0, 12)} MISSING ids: ${coverage.summary}; ${describeMissing(coverage)}`); }
+    if (!oneUse) {
+      // safety net: results recorded without an item id inherit it from their own dynamicToolCall
+      try { const rec = idMap.reconcileEmpty({ fromCall: true }); if (rec) log(`[ids] key=${key.slice(0, 12)} safety net ran: ${describeReconcile(rec)}`); }
+      catch (e) { log(`[ids] key=${key.slice(0, 12)} safety net failed: ${e.message}`); }
+    }
+    // the warning card only when the count of id-less messages went up, not on every request
+    const missingGrew = !oneUse && idMap.missingGrew(coverage.missing);
+    if (!oneUse && coverage.missing) { if (missingGrew) pendingNoIdsNotice = coverage; log(`[ids] key=${key.slice(0, 12)} MISSING ids: ${coverage.summary}; ${describeMissing(coverage)}`); }
     let lastSeen = -1;
     for (let i = 0; i < blocks.length; i++) if (seen.has(hashes[i])) lastSeen = i;
     // A block whose hash changed but whose last 200 chars match a block this thread already
@@ -836,12 +843,13 @@ async function handleChat(req) {
               const callId = "call_" + Math.random().toString(36).slice(2);
               // patch 9: the call's full Vellum id is known now (reply row/<call id>); the Codex-side
               // id is whatever the app-server exposes for the item (logged once so the shape is on record).
+              let toolCliId = null;
               if (replyId) {
-                const cliId = m.params.callId || m.params.itemId || m.params.id || `rpc:${m.id}`;
+                const cliId = toolCliId = m.params.callId || m.params.itemId || m.params.id || `rpc:${m.id}`;
                 if (!loggedToolCallShape) { loggedToolCallShape = true; log(`[ids] item/tool/call params keys: ${Object.keys(m.params || {}).join(",")}`); }
                 try { idMap.recordCli(`${replyId}/${callId}`, cliId, "tool_use", { part: callId, session: state.threadId }); } catch (e) { log(`[ids] record tool call failed: ${e.message}`); }
               }
-              state.parked[callId] = { rpcId: m.id, name: m.params.tool };
+              state.parked[callId] = { rpcId: m.id, name: m.params.tool, cliId: toolCliId || m.params.callId || m.params.itemId || null };
               parkedCalls.push({ callId, name: m.params.tool, arguments: m.params.arguments });
               log(`[tool] parked ${m.params.tool}`);
               persistState(key, state);
@@ -864,7 +872,7 @@ async function handleChat(req) {
             if (parked) {
               log(`[tool] answering parked rpcId=${parked.rpcId} name=${parked.name}`);
               srv.respond(parked.rpcId, { contentItems: [{ type: "inputText", text: tr.text }], success: true });
-              try { idMap.recordResultFed(tr.sourceIds, tr.id); } catch (e) { log(`[ids] record tool result failed: ${e.message}`); }
+              try { idMap.recordResultFed(tr.sourceIds, tr.id, parked.cliId || ""); /* result lives inside the same dynamicToolCall item */ } catch (e) { log(`[ids] record tool result failed: ${e.message}`); }
               delete state.parked[tr.id];
             }
           }

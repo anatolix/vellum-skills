@@ -177,3 +177,38 @@ describe("cli_ids (patch 9)", () => {
     expect(NULL_SOURCE_ID_MAP.isPartFed("x")).toBe(false);
   });
 });
+
+describe("id coverage fixes (Oct 5)", () => {
+  const fresh = () => new SourceIdMap(":memory:");
+  test("thinking blocks recorded with their own uuid", () => {
+    const m = fresh();
+    expect(m.recordClaudeAssistant("r1", { uuid: "t1", session_id: "s", message: { content: [{ type: "thinking", thinking: "x" }] } })).toBe(1);
+    expect(m.db.query("SELECT kind, cli_id FROM cli_ids").all()).toEqual([{ kind: "thinking", cli_id: "t1" }]);
+  });
+  test("fillResultCli fills only empty tool_result rows", () => {
+    const m = fresh();
+    m.recordResultFed(["row/toolu_1"], "toolu_1");
+    expect(m.fillResultCli(new Map([["toolu_1", "uuid-res"]]))).toBe(1);
+    expect(m.db.query("SELECT cli_id FROM cli_ids WHERE kind='tool_result'").get().cli_id).toBe("uuid-res");
+  });
+  test("reconcileEmpty: Codex inherits call item id, reports leftovers once", () => {
+    const m = fresh();
+    m.recordCli("reply/call_a", "item-1", "tool_use", { part: "call_a" });
+    m.recordResultFed(["res/call_a"], "call_a");
+    m.recordCli("user1", "", "user", { fed: 1 });
+    const now = Date.now() + 60_000;
+    const r = m.reconcileEmpty({ fromCall: true, now });
+    expect(r.found.map(x => x.cli_id)).toEqual(["item-1"]);
+    expect(r.left.map(x => x.vellum_id)).toEqual(["user1"]);
+    expect(m.reconcileEmpty({ fromCall: true, now })).toBe(null);
+  });
+  test("reconcileEmpty skips rows younger than minAgeMs", () => {
+    const m = fresh();
+    m.recordResultFed(["res/toolu_9"], "toolu_9");
+    expect(m.reconcileEmpty({ byToolId: new Map([["toolu_9", "u"]]) })).toBe(null);
+  });
+  test("missingGrew fires only on increase", () => {
+    const m = fresh();
+    expect([m.missingGrew(2), m.missingGrew(2), m.missingGrew(3), m.missingGrew(1), m.missingGrew(1), m.missingGrew(2)]).toEqual([true, false, true, false, false, true]);
+  });
+});
