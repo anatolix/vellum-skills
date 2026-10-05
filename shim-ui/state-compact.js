@@ -13,7 +13,7 @@ export async function start(ctx) {
     manager=createManager({getMessages:crud.getMessages,getMessageById:crud.getMessageById,logger:ctx.logger,
       publish:message=>publishEvent({id:randomUUID(),emittedAt:new Date().toISOString(),conversationId:message.conversationId,message})});
     subscription=assistantEventHub.subscribe({type:'process',callback:envelope=>manager?.consume(envelope).catch(err=>ctx.logger.warn({err:String(err)},'shim-ui event failed open'))});
-    ctx.logger.info('shim-ui compact v1.0.1 listener active');
+    ctx.logger.info('shim-ui compact v1.0.2 listener active');
   } catch (err) { manager?.dispose(); manager=undefined; ctx.logger.warn({err:String(err)},'shim-ui could not load version-gated CRUD; disabled'); }
 }
 export function currentManager(){return manager;}

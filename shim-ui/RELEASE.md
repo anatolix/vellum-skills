@@ -11,4 +11,4 @@ No client upgrade is required. Disable the old token-usage-card pilot to prevent
 
 ## 1.0.1 — compact display
 
-One summary card per reply; updates in place. Routine startup/history/reasoning diagnostics stay in logs. Up to two short warning labels plus an extra-warning count, with full warning strings retained in UI-only diagnostic data. Out is preserved. Hot reload requires no shim, Vellum or client restart.
+One summary card per reply; updates in place. CLI startup is folded into the next real token card instead of being hidden or creating its own card. All-unknown token lines are omitted entirely. Routine history/reasoning diagnostics stay in logs. Up to two short warning labels plus an extra-warning count, with full warning strings retained in UI-only diagnostic data. Out is preserved. Hot reload requires no shim, Vellum or client restart.

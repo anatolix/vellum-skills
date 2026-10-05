@@ -20,8 +20,8 @@ test('rejects foreign hook owner, mismatched source, non-UUID and absent reply i
 test('missing token details are unknown, never fabricated zero; notice escaping is literal',async()=>{
  expect(tokenLine(null)).toBe('Cached — · Uncached — · Out —');
  const {manager,pub}=fixture(); await manager.consume(ev('notice',{text:'a_b `c` !'})); await manager.consume(ev('complete'));
- const ctx={conversationId:c,content:[{type:'text',text:'assistant'}]}; await manager.postModelCall(ctx);
- expect(ctx.content[1].data.body).toBe('Cached — · Uncached — · Out — · 🔴 a\\_b \\`c\\` \\!');
+ const ctx={conversationId:c,error:undefined,content:[{type:'text',text:'assistant'}]}; await manager.postModelCall(ctx);
+ expect(ctx.content[1].data.body).toBe('🔴 a\\_b \\`c\\` \\!');
  expect(pub.filter(x=>x.type==='ui_surface_show').every(x=>x.messageId===r)).toBe(true);
 });
 test('late usage merges prior pending notice and uses stable surface IDs',async()=>{
@@ -53,7 +53,23 @@ test('routine notices produce no cards; genuine warnings and usage share one sho
  expect(pub.filter(e=>e.type==='ui_surface_show')).toHaveLength(1);
  const ctx={conversationId:c,content:[]}; await manager.postModelCall(ctx);
  expect(ctx.content).toHaveLength(1);
- expect(ctx.content[0].data.body).toBe('Cached 80 · Uncached 20 · Out 12 · 🔴 Потеря tool call: 2 · Без ID: 1/17');
+ expect(ctx.content[0].data.body).toBe('Claude CLI: gpt\\-6\\.1\\-sol; из файла; видено=8 · Cached 80 · Uncached 20 · Out 12 · 🔴 Потеря tool call: 2 · Без ID: 1/17');
+});
+test('Codex startup waits for usage and merges into that one card',async()=>{
+ const {manager,pub}=fixture();
+ await manager.consume(ev('notice',{source:'codex-shim',text:'Старт: gpt-5.6-sol; с нуля'}));
+ expect(pub).toHaveLength(0);
+ await manager.consume(ev('usage',{source:'codex-shim',usage:{prompt_tokens:42,prompt_tokens_details:{cached_tokens:30},completion_tokens:5}}));
+ expect(pub.filter(e=>e.type==='ui_surface_show')).toHaveLength(1);
+ expect(pub[0].data.body).toBe('Codex CLI: gpt\\-5\\.6\\-sol; с нуля · Cached 30 · Uncached 12 · Out 5');
+ expect(pub[0].data._shimStartup).toBe('Codex CLI: gpt-5.6-sol; с нуля');
+});
+test('startup plus absent usage produces no empty counter card',async()=>{
+ const {manager,pub}=fixture();
+ await manager.consume(ev('notice',{source:'codex-shim',text:'Старт: gpt-5.6-sol; из файла'}));
+ await manager.consume(ev('complete',{source:'codex-shim'}));
+ expect(pub).toHaveLength(0);
+ const ctx={conversationId:c,content:[]}; await manager.postModelCall(ctx); expect(ctx.content).toEqual([]);
 });
 test('long warnings are bounded without adding more cards',async()=>{
  const {manager,pub}=fixture(); for(let i=0;i<10;i++) await manager.consume(ev('notice',{text:String(i)+'x'.repeat(500)}));
