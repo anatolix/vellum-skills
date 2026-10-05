@@ -19,7 +19,7 @@ import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from ".
 import { promptForSession } from "./history-rehydration.js";
 import { isOutputOnlyBatch, closeOneUseSession } from './oneuse-cleanup.js';
 import { attachSourceIds, replyIdOf, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, idCoverage, describeMissing } from "./source-id-map.js";
-const noticeTransport = new NoticeTransport();
+const noticeTransport = new NoticeTransport({ source: "claude-shim" });
 const TOOL_MODE = process.env.SHIM_TOOL_MODE || "mcp"; // mcp | text
 const BATCH_IDLE_MS = Number(process.env.SHIM_BATCH_IDLE_MS || 5000);
 const TOOL_WAIT_MS = Number(process.env.SHIM_TOOL_WAIT_SEC || 3600) * 1000; // how long a tool_use may wait for Vellum's result (approvals)
@@ -459,7 +459,11 @@ class Chat {
         this.model = model;
         if (TOOL_MODE === "mcp") await this.cli.setTools(mcp);
         const prompt = promptForSession(extra.historyMessages, unseen.map((b) => b.text).concat(["Assistant:"]).join("\n\n"), freshSession);
-        if (freshSession) console.log(`[history] ${short(this.key)} fresh rehydration messages=${extra.historyMessages?.length ?? 0} chars=${prompt.length}`);
+        if (freshSession) {
+          const historyBlocks = (extra.historyMessages || []).filter((m) => m?.role !== "system").reduce((n, m) => n + (Array.isArray(m.content) ? m.content.length : (m.content ? 1 : 0)), 0);
+          console.log(`[history] ${short(this.key)} fresh rehydration messages=${extra.historyMessages?.length ?? 0} blocks=${historyBlocks} chars=${prompt.length}`);
+          if (historyBlocks > 1) shimNotice(onMsg, short(this.key), noticeText("claude-shim", "Восстановлена история", `${historyBlocks} блоков; ${prompt.length} симв.`));
+        }
         console.log(`[sess] ${short(this.key)} cli${this.cli.id} ${why} blocks=${inputs.length} seen=${this.sent.length}`);
         const tPrep = Date.now() - t0;
         for (const h of hashes) seen.add(h);
@@ -593,6 +597,8 @@ const manager = {
         const ib = inputBlocks(blocks);
         diagnostic(onMsg, tag, "Старт", `${model}; с нуля; одноразовый`);
         if (ib.length > FULL_HIST_MIN) diagnostic(onMsg, tag, "Большой контекст", `+${ib.length} блоков; видено=0/${ib.length}`);
+        const historyBlocks = (extra.historyMessages || []).filter((m) => m?.role !== "system").reduce((n, m) => n + (Array.isArray(m.content) ? m.content.length : (m.content ? 1 : 0)), 0);
+        if (historyBlocks > 1) shimNotice(onMsg, tag, noticeText("claude-shim", "Восстановлена история", `${historyBlocks} блоков; ${blocksToPrompt(ib).length} симв.`));
         const res = await cli.send(promptForSession(extra.historyMessages, blocksToPrompt(ib), true), (m) => { produced = true; onMsg(m); });
         res.shim_actual_model = cli.actualModel;
         if (CTX_USAGE) res.shim_context_usage = await cli.contextUsage();
@@ -972,7 +978,7 @@ const TOOL_CALL_RE = /TOOL_CALL:\s*(\{.*\})\s*$/;
 // Take ONLY the first invoke — later ones were written blind, before any result.
 const INVOKE_RE = /<(?:[\w-]+:)?invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/(?:[\w-]+:)?invoke>/;
 const PARAM_RE = /<(?:[\w-]+:)?parameter\s+name="([^"]+)"\s*>([\s\S]*?)<\/(?:[\w-]+:)?parameter>/g;
-function parseInvoke(text, tools) {
+function parseInvoke(text, tools, warn = console.log) {
   if (/TOOL_CALL:/.test(text)) return null;
   const m = text.match(INVOKE_RE);
   if (!m) return null;
@@ -989,7 +995,7 @@ function parseInvoke(text, tools) {
   let before = text.slice(0, m.index).replace(/<\/?(?:[\w-]+:)?function_calls>/g, "");
   const fab = before.search(/<tool_result\b/);
   if (fab >= 0) before = before.slice(0, fab);
-  console.log(`[warn] model used <invoke> XML instead of TOOL_CALL; took 1 of ${total}`);
+  warn(`[warn] model used <invoke> XML instead of TOOL_CALL; took 1 of ${total}`);
   return { calls: [{ name: m[1], arguments: args }], restText: before.trim() };
 }
 
@@ -1017,7 +1023,7 @@ function scanJsonObject(text, start) {
 // JSON.parse with a fallback that escapes raw control characters found inside
 // string literals (invalid JSON, but exactly what a model emits when it pastes
 // a heredoc into "command": "...").
-function parseLooseJson(src) {
+function parseLooseJson(src, warn = console.log) {
   try { return JSON.parse(src); } catch (e0) {
     let out = "", inStr = false, esc = false;
     for (const ch of src) {
@@ -1034,7 +1040,7 @@ function parseLooseJson(src) {
       out += ch;
     }
     const obj = JSON.parse(out);
-    console.log("[warn] TOOL_CALL JSON had raw control chars in strings; repaired");
+    warn("[warn] TOOL_CALL JSON had raw control chars in strings; repaired");
     return obj;
   }
 }
@@ -1044,7 +1050,7 @@ function parseLooseJson(src) {
 // by slicing argument values between top-level key markers taken from the
 // tool's schema, then decoding each value leniently. Returns null if even the
 // name cannot be read.
-function salvageToolCall(chunk, tools) {
+function salvageToolCall(chunk, tools, warn = console.log) {
   const head = chunk.match(/^\s*\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*\{/);
   if (!head) return null;
   const name = head[1];
@@ -1076,12 +1082,12 @@ function salvageToolCall(chunk, tools) {
       try { args[marks[i].key] = JSON.parse(raw); } catch { args[marks[i].key] = raw; }
     }
   }
-  console.log(`[warn] salvaged unterminated TOOL_CALL ${name} keys=${Object.keys(args).join(",")}`);
+  warn(`[warn] salvaged unterminated TOOL_CALL ${name} keys=${Object.keys(args).join(",")}`);
   return { name, arguments: args };
 }
 
-function parseToolCalls(text, tools = []) {
-  const inv = parseInvoke(text, tools);
+function parseToolCalls(text, tools = [], warn = console.log) {
+  const inv = parseInvoke(text, tools, warn);
   if (inv) return inv;
   const calls = [];
   let restText = null;
@@ -1093,19 +1099,19 @@ function parseToolCalls(text, tools = []) {
     if (brace < 0) break;
     const endIdx = scanJsonObject(text, brace);
     if (endIdx < 0) {
-      console.log("[warn] unterminated TOOL_CALL JSON |", text.slice(at, at + 160).replace(/\n/g, "\\n"));
-      const sv = salvageToolCall(text.slice(brace), tools);
+      warn("[warn] unterminated TOOL_CALL JSON |", text.slice(at, at + 160).replace(/\n/g, "\\n"));
+      const sv = salvageToolCall(text.slice(brace), tools, warn);
       if (sv) { if (restText === null) restText = text.slice(0, at); calls.push(sv); }
       break;
     }
     if (restText === null) restText = text.slice(0, at);
     try {
-      const obj = parseLooseJson(text.slice(brace, endIdx));
+      const obj = parseLooseJson(text.slice(brace, endIdx), warn);
       if (obj && typeof obj.name === "string") calls.push({ name: obj.name, arguments: obj.arguments ?? {} });
-      else console.log("[warn] TOOL_CALL without name |", text.slice(brace, brace + 120).replace(/\n/g, "\\n"));
+      else warn("[warn] TOOL_CALL without name |", text.slice(brace, brace + 120).replace(/\n/g, "\\n"));
     } catch (e) {
-      console.log("[warn] unparsable TOOL_CALL:", String(e.message).slice(0, 80), "|", text.slice(brace, brace + 160).replace(/\n/g, "\\n"));
-      const sv = salvageToolCall(text.slice(brace, endIdx), tools);
+      warn("[warn] unparsable TOOL_CALL:", String(e.message).slice(0, 80), "|", text.slice(brace, brace + 160).replace(/\n/g, "\\n"));
+      const sv = salvageToolCall(text.slice(brace, endIdx), tools, warn);
       if (sv) calls.push(sv);
     }
     pos = endIdx; // anything between calls (or after the last) is discarded
@@ -1113,32 +1119,29 @@ function parseToolCalls(text, tools = []) {
   if (restText === null) restText = text;
   let fabricated = false;
   const fab = restText.search(/<tool_result\b/);
-  if (fab >= 0) { fabricated = true; restText = restText.slice(0, fab); console.log("[warn] model fabricated <tool_result>; output truncated"); }
+  if (fab >= 0) { fabricated = true; restText = restText.slice(0, fab); warn("[warn] model fabricated <tool_result>; output truncated"); }
   restText = restText.split("\n").filter((l) => l.trim() !== "```").join("\n").trim();
   if (fabricated && !calls.length && !restText) {
-    restText = "[shim] Ответ модели отброшен: она написала <tool_result> сама вместо вызова инструмента. Повтори запрос.";
+    restText = "";
   }
-  return { calls, restText };
+  return { calls, restText, fabricated };
 }
 
 
 // Map Claude CLI result.usage -> OpenAI usage chunk. Vellum's openai-compatible
 // provider treats prompt_tokens as the TOTAL (cached is a subset), so sum all
 // three input buckets and expose cache read/write under prompt_tokens_details.
-function usageFromResult(res) {
-  const u = res?.usage;
-  if (!u) return null;
-  const input = u.input_tokens ?? 0;
-  const read = u.cache_read_input_tokens ?? 0;
-  const write = u.cache_creation_input_tokens ?? 0;
-  const out = u.output_tokens ?? 0;
-  return {
-    prompt_tokens: input + read + write,
-    completion_tokens: out,
-    total_tokens: input + read + write + out,
-    prompt_tokens_details: { cached_tokens: read, cache_write_tokens: write },
-  };
+// Convert Anthropic per-message usage into the OpenAI inclusive prompt convention.
+function usageFromStep(u) {
+  if (!u || !Number.isFinite(u.input_tokens) || !Number.isFinite(u.output_tokens)) return null;
+  const input = u.input_tokens;
+  const read = Number.isFinite(u.cache_read_input_tokens) ? u.cache_read_input_tokens : 0;
+  const write = Number.isFinite(u.cache_creation_input_tokens) ? u.cache_creation_input_tokens : 0;
+  const out = u.output_tokens;
+  return { prompt_tokens: input + read + write, completion_tokens: out, total_tokens: input + read + write + out,
+    prompt_tokens_details: { cached_tokens: read, cache_write_tokens: write } };
 }
+function usageFromResult(res) { return usageFromStep(res?.usage); }
 
 // Build Vellum's <compaction_result> from the CLI's own summary. The verbatim tail starts at
 // the second-to-last real user turn (so the active exchange survives); Vellum resolves it by the
@@ -1205,7 +1208,7 @@ async function handleCompaction({ model, sdkModel, cacheKey, blocks, id }) {
       send(sseChunk(id, model, {}, "stop"));
     } catch (e) {
       console.log(`[compact] ${tag} ERROR ${String(e?.message || e).slice(0, 200)}`);
-      send(sseChunk(id, model, { content: "⚠ claude-shim compaction failed: " + String(e?.message || e).slice(0, 200) }));
+      send(`data: ${JSON.stringify({ error: { message: "claude-shim compaction failed: " + String(e?.message || e).slice(0, 200), type: "server_error" } })}\n\n`);
       send(sseChunk(id, model, {}, "stop"));
     } finally { clearInterval(ka); send("data: [DONE]\n\n"); closed = true; try { controller.close(); } catch {} }
   } });
@@ -1310,6 +1313,15 @@ async function handleRequest(req) {
           send(sseChunk(id, model, { role: "assistant" }));
           let buffer = "";
           let sawDelta = false;
+          // HTTP request-local usage. A message_start marks a model step; tool loops may
+          // produce several. Never use the aggregate result when a previous step exists.
+          let stepCount = 0, stepUsage = null, stepOutput = null, assistantUsage = null;
+          const finalStepUsage = () => {
+            if (stepUsage && Number.isFinite(stepOutput)) return usageFromStep({ ...stepUsage, output_tokens: stepOutput });
+            if (assistantUsage) return usageFromStep(assistantUsage);
+            return null;
+          };
+          const sendUsage = (u) => { if (u) send(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [], usage: u })}\n\n`); };
           const mcpMode = TOOL_MODE === "mcp";
           const toolUses = [];      // native tool_use blocks seen this turn
           let turnDone = null;      // resolves when the assistant message carrying tool_use(s) is complete
@@ -1338,6 +1350,11 @@ async function handleRequest(req) {
                 if (msgStopped && toolUses.length >= expectedTus) closeBatch("late-block");
               }
             }
+            if (msg.type === "stream_event" && msg.event?.type === "message_start") {
+              stepCount++; stepUsage = msg.event.message?.usage || null; stepOutput = null; assistantUsage = null;
+            }
+            if (msg.type === "stream_event" && msg.event?.type === "message_delta" && Number.isFinite(msg.event.usage?.output_tokens)) stepOutput = msg.event.usage.output_tokens;
+            if (msg.type === "assistant" && msg.message?.usage) assistantUsage = msg.message.usage;
             if (mcpMode && msg.type === "stream_event") kickBatchTimer();
             if (mcpMode && msg.type === "stream_event" && msg.event?.type === "content_block_start" && msg.event.content_block?.type === "tool_use") expectedTus++;
             if (mcpMode && msg.type === "stream_event" && msg.event?.type === "message_stop") {
@@ -1382,6 +1399,7 @@ async function handleRequest(req) {
               if (cacheKey) (manager.oneuse.get(cacheKey) || manager.chats.get(cacheKey))?.cli?.markObserved();
               send(sseChunk(id, model, { tool_calls }));
               send(sseChunk(id, model, {}, "tool_calls"));
+              sendUsage(finalStepUsage());
               console.log(`[res] tool_calls(mcp)=${toolUses.map((t) => t.name).join(",")} pending=${pendingToolUses.size}${replyId ? ` reply=${replyId.slice(0, 13)} cli_ids+${recordedCli}` : " reply=none"}`);
               // the CLI run continues in the background until Vellum's next request resolves the handler;
               // release the per-chat lock now so that request can enter (it only resolves handlers + feeds nothing new)
@@ -1403,7 +1421,7 @@ async function handleRequest(req) {
           }
 
           if (hasTools && !mcpMode) {
-            const { calls, restText } = parseToolCalls(buffer, tools);
+            const { calls, restText, fabricated } = parseToolCalls(buffer, tools, (...args) => { const msg = args.join(" "); console.log(msg); send(noticeFrame(noticeText("claude-shim", "Формат ответа", msg.slice(0, 320)))); });
             if (calls.length) {
               if (restText) send(sseChunk(id, model, { content: restText }));
               const tool_calls = calls.map((c, i) => ({
@@ -1416,14 +1434,18 @@ async function handleRequest(req) {
               send(sseChunk(id, model, {}, "tool_calls"));
               console.log(`[res] tool_calls=${calls.map((c) => c.name).join(",")}`);
             } else {
-              if (buffer) send(sseChunk(id, model, { content: buffer }));
-              send(sseChunk(id, model, {}, "stop"));
+              if (restText) send(sseChunk(id, model, { content: restText }));
+              if (fabricated && !restText) send(`data: ${JSON.stringify({error:{message:"Model fabricated a tool result instead of a tool call",type:"server_error"}})}\n\n`);
+              else send(sseChunk(id, model, {}, "stop"));
             }
           } else {
             if (result?.structured_output !== undefined && !sawDelta) send(sseChunk(id, model, { content: typeof result.structured_output === "string" ? result.structured_output : JSON.stringify(result.structured_output) }));
             send(sseChunk(id, model, {}, "stop"));
           }
-          const usage = usageFromResult(result);
+          // Prefer the final Claude message only. The SDK result usage can aggregate all
+          // tool-loop model calls; use it only for a genuinely single-step request with
+          // no usable per-step stream data.
+          const usage = finalStepUsage() || (stepCount <= 1 ? usageFromResult(result) : null);
           if (usage) {
             const ctx = result?.shim_context_usage ?? await manager.contextUsage(cacheKey);
             if (ctx) usage.context_usage = ctx;

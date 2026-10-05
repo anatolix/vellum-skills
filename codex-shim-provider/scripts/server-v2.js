@@ -27,7 +27,7 @@ import { codexThreadConfig, codexResumeParams } from "./thread-config.js";
 import { createSseWriter } from "./sse-writer.js";
 import { prepareNativeSafeModelCatalog, failClosedApprovalResponse } from "./native-tool-policy.js";
 import { attachSourceIds, replyIdOf, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, assistantBlocksOf, idCoverage, describeMissing } from "./source-id-map.js";
-const noticeTransport = new NoticeTransport();
+const noticeTransport = new NoticeTransport({source: "codex-shim"});
 const threadOwners = new Map();
 
 const PORT = Number(process.env.SHIM_PORT || 8321);
@@ -158,7 +158,12 @@ srv.onServerRequest = async m => {
   const h = m.params?.threadId && threadHandlers.get(m.params.threadId);
   if (h) return h.request(m);
   if (m.method === "currentTime/read") return { currentTimeAt: Math.floor(Date.now() / 1000) };
-  if (m.method === "item/tool/call") log(`[guard] ⚠ tool call for thread with NO live handler (thread=${m.params?.threadId}) — answering EMPTY, model will see nothing`);
+  if (m.method === "item/tool/call") {
+    const owner = threadOwners.get(m.params?.threadId);
+    const warning = noticeText("codex-shim", "Вызов инструмента потерян", `${m.params?.tool || "?"}; обработчик запроса уже завершён`);
+    if (owner?.key) noticeTransport.queue(owner.key, warning);
+    log(`[guard] ⚠ tool call for thread with NO live handler (thread=${m.params?.threadId}) — answering EMPTY, model will see nothing`);
+  }
   else dbg("[unhandled server request]", m.method);
   return {};
 };
@@ -472,8 +477,7 @@ async function handleCompaction({ req, key, model, blocks, lastUserBlock, effort
       }
     } catch (e) {
       log(`[compact] ${tag} ERROR ${String(e).slice(0, 200)}`);
-      sse(res, { ...base, choices: [{ index: 0, delta: { content: "⚠ codex-shim compaction failed: " + String(e).slice(0, 200) } }] });
-      sse(res, { ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+      sse(res, { error: { message: "codex-shim compaction failed: " + String(e), type: "server_error" } });
       res.write("data: [DONE]\n\n");
     } finally { clearInterval(ka); res.close(); }
   }, cancel() { res?.cancel(); } });
@@ -678,8 +682,7 @@ async function handleChat(req) {
     async start(controller) {
       res = createSseWriter(controller);
       const fail = msg => {
-        sse(res, { ...base, choices: [{ index: 0, delta: { content: "⚠ codex: " + String(msg).slice(0, 500) } }] });
-        sse(res, { ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+        sse(res, { error: { message: String(msg), type: "server_error" } });
         res.write("data: [DONE]\n\n"); res.close();
       };
       const noticed = new Set();
@@ -689,6 +692,7 @@ async function handleChat(req) {
         noticed.add(txt); log(`[guard] ${txt}`); res.write(noticeFrame(txt));
       };
       try {
+        if (feedCount > MAX_FEED) notice("Большая история загружена", `${model}; ${feedCount} блоков; ~${Math.round(feedChars / 1000)}K симв.`);
         // --- ensure thread ---
         if (!state) {
           log(`[guard] NEW THREAD key=${key.slice(0, 12)} reason=${invalidReason ? "state invalidated: " + invalidReason : "no prior state"} feed=${feedCount} blocks (~${feedChars} chars) sys=${sys.length} chars tools=${tools ? tools.length : 0}`);
@@ -716,6 +720,8 @@ async function handleChat(req) {
           liveThreads.add(threadId);
           if (!oneUse) threadOwners.set(threadId, {key, model});
           notice("Старт", `${model}; с нуля`);
+          const restoredMessages = messages.filter(m => ["user", "assistant", "tool"].includes(m.role));
+          if (restoredMessages.length > 1) notice("История загружена", `${model}; ${restoredMessages.length} сообщений`);
           state = { threadId, sent: [], model, fingerprint, parked: {}, sys, toolNames };
           idMap.reset(); // fresh thread: nothing has been fed to it yet
           persistState(key, state);
@@ -905,10 +911,9 @@ async function handleChat(req) {
         // tool pauses and failed turns. A blank summary separator isn't real thinking.
         // Usage is reported after a model step, not continuously while it is thinking.
         if (!hasReadableReasoning && usage.reasoning > 0) {
-          sse(res, { ...base, choices: [{ index: 0, delta: {
-            reasoning_content: `[codex-shim] Reasoning: ${usage.reasoning} токенов. Summary недоступна.\n`,
-          } }] });
-          log(`[turn] ${elapsed()} thinking fallback reasoningTokens=${usage.reasoning}`);
+          notice("Reasoning недоступен", `${model}; ${usage.reasoning} токенов без summary`);
+          log(`[turn] ${elapsed()} reasoning summary unavailable tokens=${usage.reasoning}`);
+
         }
 
         const finish = fr => sse(res, { ...base, choices: [{ index: 0, delta: {}, finish_reason: fr }] });
@@ -921,8 +926,7 @@ async function handleChat(req) {
           log(`[res] tool_calls=${parkedCalls.map(c => c.name).join(",")} ${Date.now() - t0}ms`);
         } else if (turnError) {
           notice("Ошибка CLI", `${model}; ${String(turnError).slice(0, 120)}`);
-          sse(res, { ...base, choices: [{ index: 0, delta: { content: agentBuf ? "" : "⚠ codex: " + String(turnError).slice(0, 500) } }] });
-          finish("stop");
+          sse(res, { error: { message: String(turnError), type: "server_error" } });
         } else {
           if (tools && agentBuf) sse(res, { ...base, choices: [{ index: 0, delta: { content: agentBuf } }] });
           finish("stop");

@@ -469,3 +469,10 @@ the word comes back.
 See `{baseDir}/references/failure-modes.md` for more.
 
 Why the code looks the way it does, and every problem hit while building it: `{baseDir}/references/lessons-learned.md`.
+
+
+## Native UI diagnostics (shims-ui-v1.0.0)
+
+Install the sibling `shim-ui/` directory as the workspace plugin `plugins/shim-ui`, activate it through native plugin IPC, and set `SHIM_UI_SOCKET` on this shim. Requires Vellum 0.12.6 and `exportSourceIds: true` (wire v3 reply_id). Full setup, exclusions and rollback: `../shim-ui/README.md`.
+
+Cached / Uncached / Out are per HTTP/model response, never whole-chat or whole multi-tool turn totals. History restoration is reported on first full-history feed. Warnings are 🔴 native cards; they are excluded by both OpenAI and Anthropic prompt serializers. Old synthetic notice tools are only stripped from historical input; no new fake tool, text warning, or diagnostic reasoning fallback is generated. `SHIM_NOTICE_FMT` and `SHIM_NOTICE_TEXT_INTERFACES` are obsolete. Non-rendering channels receive no text fallback. HTTP/SSE errors and genuine tool-result errors remain errors. Disable the old token-usage-card pilot.

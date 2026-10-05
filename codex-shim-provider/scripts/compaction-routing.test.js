@@ -16,24 +16,23 @@ test('emergency compaction fallback',()=>expect(isCompactionRequest(req(body('<e
 test('quoted tag in ordinary prose is not compaction',()=>{const b=body('Explain this tag:\n'+instruction);expect(isCompactionRequest(req(b),b)).toBe(false)});
 test('old instruction in history is not current operation',()=>{const b=body('Test');b.messages.unshift({role:'user',content:instruction});expect(isCompactionRequest(req(b),b)).toBe(false)});
 test('no user message is not compaction',()=>{const b=body('');b.messages=[];expect(isCompactionRequest(req(b),b)).toBe(false)});
-for (const marker of ['header','instruction']) test(`transport bypass precedes pending continuation: ${marker}`,async()=>{
- const t=new NoticeTransport();const pending={callId:'old-notice',active:false};t.pending.set('routing-test',pending);
+for (const marker of ['header','instruction']) test(`compaction bypass preserves summary and suppresses UI metadata: ${marker}`,async()=>{
+ const events=[];const t=new NoticeTransport({publish:async m=>events.push(m)});
  const b=body(marker==='header'?'opaque':instruction);let calls=0;
  const response=await t.fetch(req(b,marker==='header'?{'x-shim-operation':'compact','x-call-site':'mainAgent'}:{}),async inner=>{calls++;expect((await inner.json()).reasoning_effort).toBe('high');return new Response('<compaction_result>SUMMARY</compaction_result>')});
- expect(calls).toBe(1);expect(await response.text()).toBe('<compaction_result>SUMMARY</compaction_result>');expect(t.pending.get('routing-test')).toBe(pending);
+ expect(calls).toBe(1);expect(await response.text()).toBe('<compaction_result>SUMMARY</compaction_result>');expect(events).toEqual([]);
 });
-test('compaction creates no diagnostic park; following Test uses its own handler',async()=>{
+test('compaction creates no park; following Test uses its own handler',async()=>{
  const t=new NoticeTransport();let calls=0;
  const handler=async inner=>{calls++;const b=await inner.json();return new Response('data: '+JSON.stringify({choices:[{delta:{content:b.messages.at(-1).content===instruction?'SUMMARY':'TEST-ANSWER'},finish_reason:'stop'}]})+'\n\ndata: [DONE]\n\n',{headers:{'content-type':'text/event-stream'}})};
- expect(await (await t.fetch(req(body(instruction)),handler)).text()).toContain('SUMMARY');expect(t.pending.size).toBe(0);
+ expect(await (await t.fetch(req(body(instruction)),handler)).text()).toContain('SUMMARY');
  expect(await (await t.fetch(req(body('Test')),handler)).text()).toContain('TEST-ANSWER');expect(calls).toBe(2);
 });
-test('normal diagnostics still park and resume SAME reader after acknowledgement',async()=>{
- const t=new NoticeTransport();let calls=0;
+test('normal diagnostics use UI sidechannel without a synthetic tool roundtrip',async()=>{
+ const events=[];const t=new NoticeTransport({publish:async m=>events.push(m)});let calls=0;
  const handler=async()=>{calls++;return new Response(noticeFrame('normal start')+'data: '+JSON.stringify({choices:[{delta:{content:'NORMAL-ANSWER'},finish_reason:'stop'}]})+'\n\ndata: [DONE]\n\n',{headers:{'content-type':'text/event-stream'}})};
- const first=await (await t.fetch(req(body('normal')),handler)).text();expect(first).toContain('__shim_notice__');const pending=t.pending.get('routing-test');expect(pending).toBeDefined();
- const b=body('normal');b.messages.push({role:'tool',tool_call_id:pending.callId,content:'Unknown tool'});
- const second=await (await t.fetch(req(b),handler)).text();expect(second).toContain('NORMAL-ANSWER');expect(calls).toBe(1);expect(t.pending.size).toBe(0);
+ const b=body('normal',{prompt_cache_key:'123e4567-e89b-42d3-a456-426614174000',_vellum:{version:3,reply_id:'123e4567-e89b-42d3-a456-426614174001'}});
+ const out=await (await t.fetch(req(b),handler)).text();expect(out).not.toContain('__shim_notice__');expect(out).not.toContain('normal start');expect(out).toContain('NORMAL-ANSWER');expect(calls).toBe(1);expect(events.map(x=>x.detail.kind)).toEqual(['notice','complete']);
 });
 test('both handlers share the transport predicate',()=>{
  const here=fileURLToPath(new URL('.',import.meta.url));

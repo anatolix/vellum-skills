@@ -1,43 +1,40 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {NoticeTransport,noticeFrame,NOTICE_TOOL,cleanNotices} from '../scripts/notice-transport.js';
-const body={model:'test',prompt_cache_key:'chat-1',tools:[{type:'function',function:{name:'bash'}}],messages:[{role:'user',content:'Hello'}]};
-const req=b=>new Request('http://localhost/v1/chat/completions',{method:'POST',body:JSON.stringify(b),headers:{'content-type':'application/json'}});
-const chunk=delta=>`data: ${JSON.stringify({choices:[{index:0,delta}]})}\n\n`;
-const frames=s=>s.split('\n\n').filter(x=>x.startsWith('data: {')).map(x=>JSON.parse(x.slice(6)));
-const tc=s=>frames(s).flatMap(x=>x.choices||[]).flatMap(x=>x.delta?.tool_calls||[])[0];
-function ack(b,t){return {...b,messages:[...b.messages,{role:'assistant',content:'---',tool_calls:[t]},{role:'tool',tool_call_id:t.id,content:'Unknown tool'}]};}
-test('two singleton diagnostic round trips, no model replay, no thinking in diagnostic',async()=>{
- const n=new NoticeTransport();let calls=0;
- const h=async()=>{calls++;return new Response(noticeFrame('start')+noticeFrame('large feed')+chunk({reasoning_content:'Thinking'})+chunk({content:'Answer'})+'data: [DONE]\n\n',{headers:{'content-type':'text/event-stream'}});};
- const one=await(await n.fetch(req(body),h)).text();assert(!one.includes('Thinking'));const t1=tc(one);assert.equal(t1.function.name,NOTICE_TOOL);
- let b=ack(body,t1);const two=await(await n.fetch(req(b),h)).text();const t2=tc(two);assert.notEqual(t1.id,t2.id);assert(!two.includes('Thinking'));
- b=ack(b,t2);const three=await(await n.fetch(req(b),h)).text();assert(three.includes('Thinking'));assert(three.includes('Answer'));assert.equal(calls,1);assert.equal(n.pending.size,0);
- assert.deepEqual(cleanNotices(b.messages),body.messages);
+import {createServer} from 'node:net';
+import {mkdtemp,rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {NoticeTransport,noticeFrame} from '../scripts/notice-transport.js';
+import {publishShimUI} from '../scripts/shim-ui-transport.js';
+const key='c30f1bbd-01ea-4b21-915f-c6a507b075e8',reply='01a10c67-02f8-74e9-9d78-7e7fd658e2d5';
+const chunk=JSON.stringify({choices:[{delta:{content:'answer'},finish_reason:null}]});
+const usage={prompt_tokens:100,completion_tokens:5,prompt_tokens_details:{cached_tokens:70}};
+const req=(extra={},headers={})=>new Request('http://localhost/v1/chat/completions',{method:'POST',headers:{'content-type':'application/json',...headers},body:JSON.stringify({model:'test',prompt_cache_key:key,_vellum:{version:3,reply_id:reply},messages:[{role:'user',content:'hello'}],...extra})});
+const stream=text=>new Response(text,{headers:{'content-type':'text/event-stream'}});
+test('UI metadata never enters stream; late warnings, usage and complete bound to exact reply',async()=>{
+ const events=[];let calls=0;const transport=new NoticeTransport({source:'codex-shim',publish:async m=>events.push(m)});
+ transport.queue(key,'queued');
+ const response=await transport.fetch(req(),async()=>{calls++;return stream(noticeFrame('first')+`data: ${chunk}\n\n`+noticeFrame('late')+`data: ${JSON.stringify({choices:[],usage})}\n\ndata: [DONE]\n\n`);});
+ const out=await response.text();assert.equal(calls,1);assert(!out.includes('shim_notice'));assert(!out.includes('__shim_notice__'));assert(!out.includes('late'));assert(out.includes('answer'));
+ assert.deepEqual(events.map(e=>e.detail.kind),['notice','notice','notice','usage','complete']);
+ assert(events.every(e=>e.conversationId===key&&e.detail.replyId===reply&&e.detail.source==='codex-shim'));assert.deepEqual(events[3].detail.usage,usage);
 });
-test('retry without acknowledgement re-emits same diagnostic, no repeated inference',async()=>{
- const n=new NoticeTransport();let calls=0;const h=async()=>{calls++;return new Response(noticeFrame('start')+chunk({content:'ok'}),{headers:{'content-type':'text/event-stream'}});};
- const a=tc(await(await n.fetch(req(body),h)).text());const b=tc(await(await n.fetch(req(body),h)).text());assert.equal(a.id,b.id);assert.equal(calls,1);
- await(await n.fetch(req(ack(body,a)),h)).text();
-});
-test('oneuse, no tools, structured response and tool_choice none never get fake calls or prose',async()=>{
- for(const patch of [{prompt_cache_key:'router-oneuse-test'},{tools:[]},{response_format:{type:'json_object'}},{tool_choice:'none'}]){
- const n=new NoticeTransport();const s=await(await n.fetch(req({...body,...patch}),async()=>new Response(noticeFrame('notice')+chunk({content:'{"ok":true}'}),{headers:{'content-type':'text/event-stream'}}))).text();
- assert(!s.includes(NOTICE_TOOL));assert(!s.includes('notice'));assert(s.includes('ok'));
+test('metadata exclusions: background, router, compact, dryrun, absent reply',async()=>{
+ for(const [extra,headers] of [[{prompt_cache_key:'router-oneuse-test'},{}],[{}, {'x-call-site':'select_pages'}],[{}, {'x-shim-operation':'compact'}],[{messages:[{role:'user',content:'<compaction_instructions>summary'}]},{}],[{}, {'x-shim-dry-run':'1'}],[{_vellum:undefined},{}]]){
+ const events=[];const t=new NoticeTransport({publish:async m=>events.push(m)});const out=await (await t.fetch(req(extra,headers),async()=>stream(noticeFrame('private')+`data: ${chunk}\n\ndata: [DONE]\n\n`))).text();assert.equal(events.length,0);assert(!out.includes('private'));assert(out.includes('answer'));
  }
 });
-test('late diagnostic deferred, never mixes with model thinking',async()=>{
- const n=new NoticeTransport();const h=async()=>new Response(chunk({reasoning_content:'thinking'})+noticeFrame('died')+chunk({content:'result'}),{headers:{'content-type':'text/event-stream'}});
- const s=await(await n.fetch(req(body),h)).text();assert(!s.includes('died'));assert.equal(n.later.get('chat-1')[0],'died');
- const t=tc(await(await n.fetch(req(body),h)).text());assert(t.function.arguments.includes('died'));
- await(await n.fetch(req(ack(body,t)),h)).text();
+test('IPC failure never falls back into model text; missing usage complete still emitted',async()=>{
+ const events=[];const t=new NoticeTransport({publish:async m=>{events.push(m);throw new Error('down');}});
+ const out=await(await t.fetch(req(),async()=>stream(noticeFrame('warning')+`data: ${chunk}\n\ndata: [DONE]\n\n`))).text();assert(out.includes('answer'));assert(!out.includes('warning'));assert.equal(events.at(-1).detail.kind,'complete');
 });
-test('HTTP errors unchanged; real tool history preserved',async()=>{
- const n=new NoticeTransport();const r=await n.fetch(req(body),async()=>Response.json({error:'bad'},{status:400}));assert.equal(r.status,400);
- const history=[...body.messages,{role:'assistant',tool_calls:[{id:'real',function:{name:'bash'}}]},{role:'tool',tool_call_id:'real',content:'result'}];assert.deepEqual(cleanNotices(history),history);
+test('HTTP and streamed errors stay errors, not assistant warnings',async()=>{
+ const t=new NoticeTransport({publish:async()=>true});const r=await t.fetch(req(),async()=>Response.json({error:{message:'invalid'}},{status:400}));assert.equal(r.status,400);
+ const out=await(await t.fetch(req(),async()=>stream('data: {"error":{"message":"failed"}}\n\ndata: [DONE]\n\n'))).text();assert(out.includes('"error"'));assert(!out.includes('"content"'));
 });
-test('pending reader cancelled when acknowledgement never arrives',async()=>{
- const n=new NoticeTransport({ttlMs:20});let signal;
- await(await n.fetch(req(body),async r=>{signal=r.signal;return new Response(noticeFrame('start')+chunk({content:'ok'}),{headers:{'content-type':'text/event-stream'}});})).text();
- await new Promise(r=>setTimeout(r,40));assert.equal(n.pending.size,0);assert(signal.aborted);
+test('framed authenticated local IPC envelope and non-fatal timeout',async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'shim-ui-'));const path=join(dir,'socket');let received;
+ const server=createServer(socket=>{let bytes=Buffer.alloc(0);socket.on('data',c=>{bytes=Buffer.concat([bytes,c]);if(bytes.length<4||bytes.length<4+bytes.readUInt32BE(0))return;received=JSON.parse(bytes.subarray(4));const data=Buffer.from(JSON.stringify({id:received.id,result:{ok:true}}));const h=Buffer.alloc(4);h.writeUInt32BE(data.length);socket.end(Buffer.concat([h,data]));});});
+ await new Promise(r=>server.listen(path,r));
+ try{assert.equal(await publishShimUI({type:'hook_event',conversationId:key,hookName:'shim-ui',owner:{kind:'plugin',id:'shim-ui-transport'},detail:{kind:'complete',replyId:reply,source:'claude-shim'}},{socketPath:path}),true);assert.equal(received.method,'/events/publish');assert.equal(received.params.body.event.message.detail.replyId,reply);assert.equal(await publishShimUI({}, {socketPath:join(dir,'missing'),timeoutMs:50}),false);}finally{await new Promise(r=>server.close(r));await rm(dir,{recursive:true,force:true});}
 });

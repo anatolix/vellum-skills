@@ -11,6 +11,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
+import uuid
 import urllib.error
 import urllib.request
 
@@ -56,6 +58,10 @@ def fake_server():
         method, mid, p = m.get("method"), m.get("id"), m.get("params", {})
         if method == "initialize":
             reply(mid, {})
+        elif method == "skills/list":
+            reply(mid, {"skills": []})
+        elif method == "skills/config/write":
+            reply(mid, {})
         elif method == "model/list":
             reply(mid, {"data": [
                 {"id": name, "hidden": False, "supportedReasoningEfforts": [{"reasoningEffort": e} for e in efforts]}
@@ -70,6 +76,8 @@ def fake_server():
         elif method == "turn/start":
             tid = p["threadId"]
             case = p["input"][0]["text"]
+            if "[Saved user message]\n" in case:
+                case = case.rsplit("[Saved user message]\n", 1)[1].split("\n\n[Saved",1)[0]
             reply(mid, {"turn": {"id": "turn-" + tid, "status": "inProgress"}})
             notif("item/started", tid, item={"type": "reasoning", "id": "r1", "summary": [], "content": []})
             if case == "summary":
@@ -142,9 +150,28 @@ def run_tests():
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
-        env = {**os.environ, "CODEX_BIN": str(fake), "SHIM_PORT": str(port),
+        events = []
+        ui_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        ui_path = tmp + "/ui.sock"
+        ui_socket.bind(ui_path); ui_socket.listen()
+        def ui_listen():
+            while True:
+                try: conn, _ = ui_socket.accept()
+                except OSError: return
+                with conn:
+                    data = b""
+                    while len(data) < 4 or len(data) < 4 + int.from_bytes(data[:4], "big"):
+                        chunk = conn.recv(65536)
+                        if not chunk: break
+                        data += chunk
+                    if len(data) < 4: continue
+                    m = json.loads(data[4:]); events.append(m["params"]["body"]["event"]["message"])
+                    reply = json.dumps({"id":m["id"],"result":{"ok":True}}).encode()
+                    conn.sendall(len(reply).to_bytes(4,"big") + reply)
+        threading.Thread(target=ui_listen, daemon=True).start()
+        env = {**os.environ, "SHIM_UI_SOCKET":ui_path, "CODEX_BIN": str(fake), "SHIM_PORT": str(port),
                "CODEX_WORKDIR": tmp + "/workdir", "SHIM_SESSIONS_DIR": tmp + "/sessions", "SHIM_FP_DIR": tmp + "/fp",
-               "SHIM_MODELS": "mock-model", "FAKE_CODEX_CAPTURE": tmp + "/rpc.jsonl"}
+               "SHIM_MODELS": "mock-model", "SHIM_SAFE_MODEL_CATALOG": tmp + "/safe-models.json", "FAKE_CODEX_CAPTURE": tmp + "/rpc.jsonl"}
         for name in ("SHIM_ALLOW_KEYLESS", "SHIM_NATIVE_TOOLS", "SHIM_MAX_FEED",
                      "SHIM_DEFAULT_EFFORT", "SHIM_REASONING_SUMMARY"):
             env.pop(name, None)
@@ -154,7 +181,7 @@ def run_tests():
         url = "http://127.0.0.1:" + str(port)
 
         def request(case, *, key=None, tools=None, messages=None, header=False, effort=None, model="mock-model", nested=False):
-            body = {"model": model, "messages": messages or [{"role": "user", "content": case}]}
+            body = {"model": model, "_vellum":{"version":3,"reply_id":str(uuid.uuid4())}, "messages": messages or [{"role": "user", "content": case}]}
             if effort is not None:
                 body.update({"reasoning": {"effort": effort}} if nested else {"reasoning_effort": effort})
             headers = {"Content-Type": "application/json"}
@@ -193,18 +220,14 @@ def run_tests():
 
         def assert_fallback(chunks, count=152):
             text = thinking(chunks)
-            assert text.count("[codex-shim]") == 1, text
-            assert "Reasoning: " + str(count) + " токенов" in text, text
+            assert "[codex-shim]" not in text, text
+            assert "Reasoning:" not in text, text
             assert "OPAQUE" not in text and "999999" not in text, text
             u = last_usage(chunks)
             assert u["completion_tokens_details"]["reasoning_tokens"] == count, u
             assert u["total_tokens"] == 300 and u["completion_tokens"] == 200, u
-            fallback_index = next(i for i, c in enumerate(chunks)
-                                  if any("[codex-shim]" in x["delta"].get("reasoning_content", "")
-                                         for x in c.get("choices", [])))
-            finish_index = next(i for i, c in enumerate(chunks)
-                                if any(x.get("finish_reason") for x in c.get("choices", [])))
-            assert fallback_index < finish_index, chunks
+            assert not any("Reasoning:" in x.get("delta", {}).get("reasoning_content", "")
+                           for c in chunks for x in c.get("choices", [])), chunks
 
         try:
             for _ in range(100):
@@ -226,8 +249,16 @@ def run_tests():
                 passed += 1
                 print("PASS", name, flush=True)
 
-            for case in ("encrypted", "blank-summary", "duplicate", "updated-count", "failed"):
+            for case in ("encrypted", "blank-summary", "duplicate", "updated-count"):
                 check(case, lambda case=case: assert_fallback(request(case)))
+
+            def failed_turn_is_error():
+                chunks = request("failed")
+                errors = [c["error"] for c in chunks if "error" in c]
+                assert errors and errors[0]["message"] == "fake failure", chunks
+                assert not any(choice.get("delta", {}).get("content", "").startswith("⚠ codex:")
+                               for c in chunks for choice in c.get("choices", [])), chunks
+            check("failed-turn-preserves-error-envelope", failed_turn_is_error)
 
             for case, expected in (("summary", "Real summary."), ("late-summary", "Real summary."),
                                    ("raw", "Exposed raw text."), ("item-summary", "Snapshot summary."),
@@ -268,11 +299,9 @@ def run_tests():
             def buffered():
                 chunks = request("buffered", tools=tool_defs)
                 assert_fallback(chunks)
-                indexes = [(i, x["delta"]) for i, c in enumerate(chunks) for x in c.get("choices", [])]
-                ri = next(i for i, d in indexes if "[codex-shim]" in d.get("reasoning_content", ""))
-                ci = next(i for i, d in indexes if d.get("content") == "OK")
-                assert ri < ci
-            check("fallback-before-buffered-answer", buffered)
+                assert any(x.get("delta", {}).get("content") == "OK" for c in chunks for x in c.get("choices", [])), chunks
+                assert not thinking(chunks), chunks
+            check("UI-only-diagnostic-with-buffered-answer", buffered)
 
             check("conversation-header-key", lambda: assert_fallback(request("header", header=True)))
 
@@ -358,7 +387,7 @@ def run_tests():
                 assert starts
                 for params in starts:
                     assert params["config"]["features"] == {
-                        "shell_tool": False, "unified_exec": False, "multi_agent": False, "multi_agent_v2": False, "plugins": False, "apps": False}, params
+                        "shell_tool": False, "unified_exec": False, "multi_agent": False, "multi_agent_v2": False, "plugins": False, "apps": False, "image_generation": False, "view_image": False}, params
                     assert params["config"]["agents"]["enabled"] is False, params
                     assert params["config"]["include_permissions_instructions"] is False, params
                 turns = [m["params"] for m in captured() if m.get("method") == "turn/start"]
@@ -433,6 +462,28 @@ def run_tests():
                 assert all(m["params"]["config"]["include_permissions_instructions"] is False for m in calls if m.get("method") == "thread/resume"), calls
                 assert not any(m.get("method") == "thread/start" for m in calls), calls
             check("disk-resume-notice-and-no-fresh-thread", disk_resume)
+            def native_ui():
+                key = str(uuid.uuid4())
+                start = len(events)
+                request("ui-first", key=key)
+                first = events[start:]
+                assert [e["detail"]["kind"] for e in first][-2:] == ["usage","complete"], first
+                u = next(e["detail"]["usage"] for e in first if e["detail"]["kind"] == "usage")
+                assert u["prompt_tokens"] == 100 and u["prompt_tokens_details"]["cached_tokens"] == 70 and u["completion_tokens"] == 200, u
+                assert len({e["detail"]["replyId"] for e in first}) == 1
+                assert all(e["conversationId"] == key and e["detail"]["source"] == "codex-shim" for e in first)
+                start = len(events)
+                request("ui-switch", key=key, model="effort-model", messages=[{"role":"user","content":"ui-first"},{"role":"assistant","content":"OK"},{"role":"user","content":"ui-switch"}])
+                switched = events[start:]
+                assert any("История загружена" in e["detail"].get("text", "") for e in switched), switched
+                assert sum(e["detail"]["kind"] == "usage" for e in switched) == 1
+                assert sum(e["detail"]["kind"] == "complete" for e in switched) == 1
+                start = len(events)
+                request("ui-warm", key=key, model="effort-model", messages=[{"role":"user","content":"ui-first"},{"role":"assistant","content":"OK"},{"role":"user","content":"ui-switch"},{"role":"assistant","content":"OK"},{"role":"user","content":"ui-warm"}])
+                warm = events[start:]
+                assert not any("История загружена" in e["detail"].get("text", "") for e in warm), warm
+                assert sum(e["detail"]["kind"] == "usage" for e in warm) == 1
+            check("native-UI-exact-reply-per-call-and-model-switch-history", native_ui)
             print(str(passed) + " tests passed; 0 real model calls.", flush=True)
         except Exception:
             logfile.flush()
@@ -443,10 +494,11 @@ def run_tests():
             os.killpg(proc.pid, signal.SIGTERM)
             proc.wait(timeout=5)
             logfile.close()
+            ui_socket.close()
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "app-server":
+    if "app-server" in sys.argv[1:]:
         fake_server()
     else:
         run_tests()
