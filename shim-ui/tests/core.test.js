@@ -8,8 +8,9 @@ test('exact event binding stages surfaces on reserved unfinalized row, preservin
  await manager.consume(ev('notice',{text:'**warning** [x]'})); await manager.consume(ev('usage',{usage:{prompt_tokens:100,prompt_tokens_details:{cached_tokens:70,cache_write_tokens:10},completion_tokens:8}}));
  const ctx={conversationId:c,error:undefined,content:[foreign,tool,result,{type:'image',source:{type:'url',url:'x'}}]}; await manager.postModelCall(ctx);
  expect(ctx.content.slice(0,4)).toEqual([foreign,tool,result,{type:'image',source:{type:'url',url:'x'}}]);
- const surfaces=ctx.content.slice(4); expect(surfaces).toHaveLength(1); expect(surfaces.every(x=>x.type==='ui_surface')).toBe(true);
- expect(surfaces[0].data.body).toBe('Cached 70 · Uncached 20 · Out 8 · Write 10 · 🔴 \\*\\*warning\\*\\* \\[x\\]');
+ const surfaces=ctx.content.slice(4); expect(surfaces).toHaveLength(2); expect(surfaces.every(x=>x.type==='ui_surface')).toBe(true);
+ expect(surfaces[0].data.body).toBe('Cached 70 · Uncached 20 · Out 8 · Write 10');
+ expect(surfaces[1].surfaceId).toContain(':warnings'); expect(surfaces[1].data.body).toBe('🔴 \\*\\*warning\\*\\* \\[x\\]');
  expect(pub.some(x=>x.messageId===r)).toBe(true); expect(bindingKey(c,r)).not.toBe(bindingKey(c,'other'));
 });
 test('rejects foreign hook owner, mismatched source, non-UUID and absent reply id',async()=>{
@@ -24,10 +25,13 @@ test('missing token details are unknown, never fabricated zero; notice escaping 
  expect(ctx.content[1].data.body).toBe('🔴 a\\_b \\`c\\` \\!');
  expect(pub.filter(x=>x.type==='ui_surface_show').every(x=>x.messageId===r)).toBe(true);
 });
-test('late usage merges prior pending notice and uses stable surface IDs',async()=>{
+test('warnings and tokens publish as two separate cards on the same reply',async()=>{
  const {manager,pub}=fixture(); await manager.consume(ev('notice',{text:'warning'})); await manager.consume(ev('usage',{usage:{prompt_tokens:9,prompt_tokens_details:{cached_tokens:4},completion_tokens:2}}));
- const shows=pub.filter(x=>x.type==='ui_surface_show'); expect(shows).toHaveLength(1); expect(pub[1].type).toBe('ui_surface_update'); expect(shows[0].surfaceId).toBe(pub[1].surfaceId); expect(manager.pendingSize).toBe(1);
- const ctx={conversationId:c,content:[]}; await manager.postModelCall(ctx); expect(ctx.content).toHaveLength(1);
+ const shows=pub.filter(x=>x.type==='ui_surface_show'); expect(shows).toHaveLength(2);
+ expect(shows[0].surfaceId).toContain(':warnings'); expect(shows[1].surfaceId).toContain(':summary');
+ expect(shows[0].data.body).toBe('🔴 warning'); expect(shows[1].data.body).toBe('Cached 4 · Uncached 5 · Out 2');
+ expect(shows.every(x=>x.messageId===r)).toBe(true); expect(manager.pendingSize).toBe(1);
+ const ctx={conversationId:c,content:[]}; await manager.postModelCall(ctx); expect(ctx.content).toHaveLength(2);
 });
 test('each row surface only once and all common content block types remain intact',async()=>{
  const {manager}=fixture(); await manager.consume(ev('notice',{text:'warning'}));
@@ -42,7 +46,7 @@ test('foreign or finalized reply rows are rejected before any UI broadcast',asyn
  }
 });
 
-test('routine notices produce no cards; genuine warnings and usage share one short summary',async()=>{
+test('routine notices produce no cards; warnings get their own card beside the token card',async()=>{
  const {manager,pub}=fixture();
  for(const text of ['Старт: gpt-6.1-sol; из файла; видено=8','Reasoning недоступен: gpt-6.1-sol; 574 токенов без summary','История загружена: 200 сообщений']) await manager.consume(ev('notice',{text}));
  expect(pub).toHaveLength(0);
@@ -50,10 +54,12 @@ test('routine notices produce no cards; genuine warnings and usage share one sho
  await manager.consume(ev('notice',{text:'⚠ Часть сообщений без ID: gpt-6.1-sol; без ID 1 из 17 *user1* — они сверяются по хэшу'}));
  await manager.consume(ev('usage',{usage:{prompt_tokens:100,prompt_tokens_details:{cached_tokens:80},completion_tokens:12}}));
  await manager.consume(ev('complete'));
- expect(pub.filter(e=>e.type==='ui_surface_show')).toHaveLength(1);
+ const shows=pub.filter(e=>e.type==='ui_surface_show'); expect(shows).toHaveLength(2);
  const ctx={conversationId:c,content:[]}; await manager.postModelCall(ctx);
- expect(ctx.content).toHaveLength(1);
- expect(ctx.content[0].data.body).toBe('Claude CLI: gpt\\-6\\.1\\-sol; из файла; видено=8 · Cached 80 · Uncached 20 · Out 12 · 🔴 Потеря tool call: 2 · Без ID: 1/17');
+ expect(ctx.content).toHaveLength(2);
+ expect(ctx.content[0].data.body).toBe('Claude CLI: gpt\\-6\\.1\\-sol; из файла; видено=8 · Cached 80 · Uncached 20 · Out 12');
+ expect(ctx.content[1].surfaceId).toContain(':warnings');
+ expect(ctx.content[1].data.body).toBe('🔴 Потеря tool call: 2 · Без ID: 1/17');
 });
 test('Codex startup waits for usage and merges into that one card',async()=>{
  const {manager,pub}=fixture();
@@ -108,8 +114,43 @@ test('roll-up keeps only the last 5 step lines',async()=>{
 });
 test('update within one step edits the same card in place, no dismiss',async()=>{
  const {manager,pub}=fixture2();
- await manager.consume(ev('notice',{text:'warning'}));
  await manager.consume(ev('usage',{usage:{prompt_tokens:9,prompt_tokens_details:{cached_tokens:4},completion_tokens:2}}));
+ await manager.consume(ev('usage',{usage:{prompt_tokens:19,prompt_tokens_details:{cached_tokens:14},completion_tokens:3}}));
  expect(pub.filter(x=>x.type==='ui_surface_dismiss')).toHaveLength(0);
- expect(pub.filter(x=>x.type==='ui_surface_update')).toHaveLength(1);
+ const updates=pub.filter(x=>x.type==='ui_surface_update');
+ expect(updates).toHaveLength(1); expect(updates[0].data.body).toBe('Cached 14 · Uncached 5 · Out 3');
+});
+
+// v1.1.0 boundary: text output or human message breaks the roll-up
+test('roll-up resets when the previous step produced text — old card stays, new card starts',async()=>{
+ const pub=[],stripped=[];
+ const rows={ [r]:{id:r,conversationId:c,role:'assistant',finalized:0,content:[{type:'text',text:'Готово.'}]}, [r2]:{id:r2,conversationId:c,role:'assistant',finalized:0} };
+ const manager=createManager({getMessages:()=>[rows[r],rows[r2]],getMessageById:id=>rows[id]??null,publish:async e=>pub.push(e),removeSurfaceBlock:async(id,sid)=>stripped.push([id,sid]),logger:{warn(){}}});
+ await manager.consume(ev('usage',{usage:{prompt_tokens:100,prompt_tokens_details:{cached_tokens:70},completion_tokens:8}}));
+ await manager.consume(ev2('usage',{usage:{prompt_tokens:200,prompt_tokens_details:{cached_tokens:150},completion_tokens:9}}));
+ const shows=pub.filter(x=>x.type==='ui_surface_show');
+ expect(shows).toHaveLength(2); expect(pub.filter(x=>x.type==='ui_surface_dismiss')).toHaveLength(0); expect(stripped).toEqual([]);
+ expect(shows[1].data.body).toBe('Cached 150 · Uncached 50 · Out 9');
+});
+test('roll-up resets on a human text message between steps',async()=>{
+ const pub=[];
+ const userRow={id:'123e4567-e89b-42d3-a456-426614174003',conversationId:c,role:'user',finalized:1,content:[{type:'text',text:'следующий вопрос'}]};
+ const rows={ [r]:{id:r,conversationId:c,role:'assistant',finalized:0,content:[{type:'tool_use',id:'t',name:'bash',input:{}}]}, [r2]:{id:r2,conversationId:c,role:'assistant',finalized:0} };
+ const manager=createManager({getMessages:()=>[rows[r],userRow,rows[r2]],getMessageById:id=>rows[id]??userRow,publish:async e=>pub.push(e),logger:{warn(){}}});
+ await manager.consume(ev('usage',{usage:{prompt_tokens:100,prompt_tokens_details:{cached_tokens:70},completion_tokens:8}}));
+ await manager.consume(ev2('usage',{usage:{prompt_tokens:200,prompt_tokens_details:{cached_tokens:150},completion_tokens:9}}));
+ expect(pub.filter(x=>x.type==='ui_surface_dismiss')).toHaveLength(0);
+ expect(pub.filter(x=>x.type==='ui_surface_show')).toHaveLength(2);
+});
+test('tool_result-only user rows do NOT break the roll-up',async()=>{
+ const pub=[],stripped=[];
+ const toolRow={id:'123e4567-e89b-42d3-a456-426614174004',conversationId:c,role:'user',finalized:1,content:[{type:'tool_result',tool_use_id:'t',content:'ok'}]};
+ const rows={ [r]:{id:r,conversationId:c,role:'assistant',finalized:0,content:[{type:'thinking',thinking:'hmm'},{type:'tool_use',id:'t',name:'bash',input:{}}]}, [r2]:{id:r2,conversationId:c,role:'assistant',finalized:0} };
+ const manager=createManager({getMessages:()=>[rows[r],toolRow,rows[r2]],getMessageById:id=>rows[id]??toolRow,publish:async e=>pub.push(e),removeSurfaceBlock:async(id,sid)=>stripped.push([id,sid]),logger:{warn(){}}});
+ await manager.consume(ev('usage',{usage:{prompt_tokens:100,prompt_tokens_details:{cached_tokens:70},completion_tokens:8}}));
+ await manager.consume(ev2('usage',{usage:{prompt_tokens:200,prompt_tokens_details:{cached_tokens:150},completion_tokens:9}}));
+ const shows=pub.filter(x=>x.type==='ui_surface_show');
+ expect(shows).toHaveLength(2); expect(pub.filter(x=>x.type==='ui_surface_dismiss')).toHaveLength(1);
+ expect(shows[1].data.body).toBe('Cached 70 · Uncached 30 · Out 8  \nCached 150 · Uncached 50 · Out 9');
+ expect(stripped).toEqual([[r,shows[0].surfaceId]]);
 });

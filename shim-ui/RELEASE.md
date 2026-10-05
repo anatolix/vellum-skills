@@ -16,3 +16,7 @@ One summary card per reply; updates in place. CLI startup is folded into the nex
 ## 1.1.0 — turn roll-up
 
 One rolling usage card per chat instead of one card per reply step. Each new step's card is shown on the newest reply row holding up to 5 recent step lines (`Cached … · Uncached … · Out …`, one per step, hard-broken); the superseded card is dismissed live via `ui_surface_dismiss` AND stripped from its persisted message row via `updateMessageContent`, so reload does not resurrect it. Updates within a single step still edit the same surface in place (no dismiss). Warnings ride their step's line unchanged.
+
+## 1.2.0 — scoped roll-up
+
+Roll-up applies ONLY to token cards, and only within a silent run (thinking + tool calls, no visible text). The run breaks — old card stays, a fresh card starts — as soon as the model writes any text or a human text message arrives; tool_result-only user rows do not break it. Warnings are back on their own separate per-reply cards (never rolled into the token line), as in 1.0.0.

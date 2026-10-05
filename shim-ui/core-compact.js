@@ -20,6 +20,7 @@ export function tokenLine(usage) {
   return `Cached ${fmt(cached)} · Uncached ${fmt(uncached)} · Out ${fmt(out)}${write > 0 ? ` · Write ${fmt(write)}` : ''}`;
 }
 export const summaryId = replyId => `shim-ui:${replyId}:summary`;
+export const warnId = replyId => `shim-ui:${replyId}:warnings`;
 const noticeText = value => String(value).replace(/^\s*\[(?:codex|claude)-shim\]\s*/,'').replace(/^[🔴⚠⛔\s]+/u,'').replace(/\s+/g,' ').trim();
 export function startupNotice(value, source) {
   const match=noticeText(value).match(/^Старт(?: CLI| диалога CLI)?\s*[:;]\s*(.+)$/i);
@@ -61,6 +62,22 @@ export function createManager({ getMessages, getMessageById, publish, removeSurf
     while (applied.size > MAX_PENDING*4) applied.delete(applied.values().next().value);
   }
   const rolled = turn => turn.lines.join('  \n');
+  const hasText = row => Array.isArray(row?.content) && row.content.some(b=>b?.type==='text' && String(b.text||'').trim());
+  // Roll-up breaks on visible output: any model text since the card's current
+  // step (including that step's own row) or any human text message in between.
+  async function needsReset(turn, conversationId, replyId) {
+    try {
+      if (getMessageById && hasText(await getMessageById(turn.replyId))) return true;
+      if (getMessages) {
+        const rows=await getMessages(conversationId);
+        const i=rows.findIndex(x=>x.id===turn.replyId), j=rows.findIndex(x=>x.id===replyId);
+        if (i>=0 && j>i)
+          for (const m of rows.slice(i+1,j))
+            if (m.role==='user' && hasText(m)) return true;
+      }
+    } catch { /* fail open: keep rolling */ }
+    return false;
+  }
   const safePublish = async message => { try { await publish(message); } catch (e) { logger.warn?.({err:String(e)}, 'shim-ui event publish failed (non-fatal)'); } };
   function normalize(event) {
     if (!event || event.type !== 'hook_event' || event.hookName !== 'shim-ui' || event.owner?.kind !== 'plugin' || event.owner?.id !== OWNER) return null;
@@ -93,10 +110,11 @@ export function createManager({ getMessages, getMessageById, publish, removeSurf
     } else if (e.kind==='complete') {
       item.complete=true;
     }
-    const data=summaryData(item.usage,[...item.notices.values()],Boolean(item.usage || item.complete),item.startup);
+    const data=summaryData(item.usage,[],Boolean(item.usage || item.complete),item.startup);
     if(data.body && data.body !== item.shownBody) {
       const id=summaryId(item.replyId);
       let turn=turns.get(e.conversationId);
+      if (turn && turn.surfaceId!==id && await needsReset(turn,e.conversationId,e.replyId)) { turns.delete(e.conversationId); turn=undefined; }
       if (turn && turn.surfaceId===id) {
         turn.lines[turn.lines.length-1]=data.body; turn.updated=now();
         const data2={...data, body:rolled(turn)};
@@ -122,6 +140,16 @@ export function createManager({ getMessages, getMessageById, publish, removeSurf
       }
       item.shown=true; item.shownBody=data.body;
     }
+    // Warnings live on their OWN card per reply — never rolled into the token card.
+    const warnLabels=[...new Set([...item.notices.values()].map(compactNotice).filter(Boolean))];
+    const warnBody=warnLabels.length ? '🔴 '+warnLabels.slice(0,2).map(mdLiteral).join(' · ')+(warnLabels.length>2?` · ещё ${warnLabels.length-2}`:'') : '';
+    if (warnBody && warnBody!==item.shownWarnBody) {
+      const wdata={body:warnBody, _shimWarnings:[...item.notices.values()]};
+      await safePublish(item.shownWarn
+        ? {type:'ui_surface_update',conversationId:item.conversationId,surfaceId:warnId(item.replyId),data:wdata}
+        : {type:'ui_surface_show',conversationId:item.conversationId,surfaceId:warnId(item.replyId),surfaceType:'card',data:wdata,messageId:item.replyId});
+      item.shownWarn=true; item.shownWarnBody=warnBody; item.warnData=wdata;
+    }
     return true;
   }
   async function postModelCall(ctx) {
@@ -134,12 +162,14 @@ export function createManager({ getMessages, getMessageById, publish, removeSurf
       const key=bindingKey(ctx.conversationId,row.id), item=pending.get(key);
       if (!item) return;
       if (applied.has(key)) return;
-      let data=summaryData(item.usage,[...item.notices.values()],Boolean(item.usage || item.complete),item.startup);
-      if(!data.body) { pending.delete(key); return; }
-      if (item.rolledData) data=item.rolledData;
+      const data=item.rolledData ?? summaryData(item.usage,[],Boolean(item.usage || item.complete),item.startup);
+      const warnData=item.warnData;
+      if(!data.body && !warnData?.body) { pending.delete(key); return; }
       const id=summaryId(item.replyId);
-      if(!(ctx.content||[]).some(b=>b?.type==='ui_surface' && b.surfaceId===id))
+      if(data.body && !(ctx.content||[]).some(b=>b?.type==='ui_surface' && b.surfaceId===id))
         ctx.content.push({type:'ui_surface',surfaceId:id,surfaceType:'card',data});
+      if(warnData?.body && !(ctx.content||[]).some(b=>b?.type==='ui_surface' && b.surfaceId===warnId(item.replyId)))
+        ctx.content.push({type:'ui_surface',surfaceId:warnId(item.replyId),surfaceType:'card',data:warnData});
       applied.add(key);
       pending.delete(key);
     } catch (e) { logger.warn?.({err:String(e)}, 'shim-ui post-model-call failed open'); }
