@@ -17,7 +17,7 @@ import { z } from "zod";
 import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from "./notice-transport.js";
 import { promptForSession } from "./history-rehydration.js";
 import { isOutputOnlyBatch, closeOneUseSession } from './oneuse-cleanup.js';
-import { attachSourceIds, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, idCoverage } from "./source-id-map.js";
+import { attachSourceIds, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, idCoverage, describeMissing } from "./source-id-map.js";
 const noticeTransport = new NoticeTransport();
 const TOOL_MODE = process.env.SHIM_TOOL_MODE || "mcp"; // mcp | text
 const BATCH_IDLE_MS = Number(process.env.SHIM_BATCH_IDLE_MS || 5000);
@@ -381,8 +381,12 @@ class Chat {
     if (idSummary) console.log(`[ids] ${short(this.key)} ${idSummary}`);
     // A persistent chat without ids means the profile lacks `exportSourceIds` (or the Vellum
     // patch is not live): history is matched by text hash only — loud, so it gets fixed.
-    const coverage = idCoverage(blocks.filter((b) => b.role !== "tools").map((b) => ({ role: b.role, _sourceIds: b.sourceIds })));
-    if (!this.oneUse && coverage.summary) { console.log(`[ids] ${short(this.key)} MISSING ids: ${coverage.summary}`); diagnostic(onMsg, short(this.key), "⛔ Нет ID сообщений", `${this.model}; без ID: ${coverage.summary} — эти сообщения сверяются только по хэшу`); }
+    const coverage = idCoverage(blocks.filter((b) => b.role !== "tools").map((b) => ({ role: b.role, _sourceIds: b.sourceIds, text: b.text })));
+    if (!this.oneUse && coverage.missing) {
+      console.log(`[ids] ${short(this.key)} MISSING ids: ${coverage.summary}; ${describeMissing(coverage)}`);
+      if (coverage.none) diagnostic(onMsg, short(this.key), "⛔ Нет ID сообщений", `${model}; профиль без exportSourceIds или патч Vellum не активен — история сверяется только по хэшу`);
+      else diagnostic(onMsg, short(this.key), "⚠ Часть сообщений без ID", `${model}; без ID ${coverage.summary} — они сверяются по хэшу`);
+    }
     let unseen = inputs.filter((_, i) => !seen.has(hashes[i]));
     // mcp mode: the tool results were handed to the CLI natively (resolveToolResults);
     // mark them seen and, if nothing else is new while a run is in flight, attach to that run.

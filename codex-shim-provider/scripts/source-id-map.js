@@ -135,16 +135,29 @@ export function assistantBlocksOf(messages) {
  */
 export function idCoverage(messages) {
   const counts = {};
-  let missing = 0;
-  for (const m of messages || []) {
+  const details = []; // one entry per message without ids: where it sits and what it starts with
+  let missing = 0, total = 0;
+  (messages || []).forEach((m, index) => {
     const r = m?.role;
-    if (!r || r === "system" || r === "developer") continue;
+    if (!r || r === "system" || r === "developer") return;
     const c = counts[r] || (counts[r] = [0, 0]);
-    c[1]++;
-    if (Array.isArray(m._sourceIds) && m._sourceIds.length) c[0]++; else missing++;
-  }
+    c[1]++; total++;
+    if (Array.isArray(m._sourceIds) && m._sourceIds.length) { c[0]++; return; }
+    missing++;
+    const raw = m.content ?? m.text ?? "";
+    const text = typeof raw === "string" ? raw : (raw || []).map(p => (p && (p.text || p.content)) || "").join(" ");
+    details.push({ index, role: r, len: text.length, head: text.replace(/\s+/g, " ").trim().slice(0, 60) });
+  });
+  // `none`: nothing in the request carried ids (profile not opted in / Vellum patch not live).
+  // `summary`: "<missing> из <total> (role n, ...)" — counts of messages WITHOUT ids.
+  const none = total > 0 && missing === total;
   const summary = missing
-    ? Object.entries(counts).filter(([, [w, t]]) => w < t).map(([r, [w, t]]) => `${r} ${w}/${t}`).join(", ")
+    ? `${missing} из ${total} (${Object.entries(counts).filter(([, [w, t]]) => w < t).map(([r, [w, t]]) => `${r} ${t - w}`).join(", ")})`
     : null;
-  return { counts, missing, summary };
+  return { counts, missing, total, none, summary, details };
+}
+
+/** Log-friendly one-liner of the messages without ids. */
+export function describeMissing(coverage) {
+  return (coverage?.details || []).map((d) => `#${d.index} ${d.role} ${d.len}ch "${d.head}"`).join(" | ");
 }

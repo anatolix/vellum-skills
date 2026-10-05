@@ -26,7 +26,7 @@ import { promptForSession } from "./history-rehydration.js";
 import { codexThreadConfig, codexResumeParams } from "./thread-config.js";
 import { createSseWriter } from "./sse-writer.js";
 import { prepareNativeSafeModelCatalog, failClosedApprovalResponse } from "./native-tool-policy.js";
-import { attachSourceIds, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, assistantBlocksOf, idCoverage } from "./source-id-map.js";
+import { attachSourceIds, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, assistantBlocksOf, idCoverage, describeMissing } from "./source-id-map.js";
 const noticeTransport = new NoticeTransport();
 const threadOwners = new Map();
 
@@ -588,7 +588,7 @@ async function handleChat(req) {
     });
     const idSummary = describeClasses(idCls);
     if (idSummary) log(`[ids] key=${key.slice(0, 12)} ${idSummary}`);
-    if (!oneUse && coverage.summary) { pendingNoIdsNotice = coverage.summary; log(`[ids] key=${key.slice(0, 12)} MISSING ids: ${coverage.summary}`); }
+    if (!oneUse && coverage.missing) { pendingNoIdsNotice = coverage; log(`[ids] key=${key.slice(0, 12)} MISSING ids: ${coverage.summary}; ${describeMissing(coverage)}`); }
     let lastSeen = -1;
     for (let i = 0; i < blocks.length; i++) if (seen.has(hashes[i])) lastSeen = i;
     // A block whose hash changed but whose last 200 chars match a block this thread already
@@ -721,7 +721,10 @@ async function handleChat(req) {
         if (compactLocks.has(state.threadId)) { await awaitCompactLock(state.threadId, key.slice(0, 12)); const fresh = loadState(key); if (fresh?.pendingCompactNotice) state.pendingCompactNotice = fresh.pendingCompactNotice; }
         if (state.pendingCompactNotice) { notice("Компакция", state.pendingCompactNotice); delete state.pendingCompactNotice; persistState(key, state); }
         else if (skipped.length) notice("Не отправлено", `${model}; ${skipped.length} старых блоков (~${Math.round(skipped.reduce((n, b) => n + b.text.length, 0) / 1000)}K симв.): история переписана, тред видел исходники`);
-        if (pendingNoIdsNotice) notice("⛔ Нет ID сообщений", `${model}; без ID: ${pendingNoIdsNotice} — эти сообщения сверяются только по хэшу`);
+        if (pendingNoIdsNotice) {
+          if (pendingNoIdsNotice.none) notice("⛔ Нет ID сообщений", `${model}; профиль без exportSourceIds или патч Vellum не активен — история сверяется только по хэшу`);
+          else notice("⚠ Часть сообщений без ID", `${model}; без ID ${pendingNoIdsNotice.summary} — они сверяются по хэшу`);
+        }
         if (feedCount > MAX_FEED) notice("Большой контекст", `${model}; +${feedCount} блоков; видено=${blocks.length-feedCount}/${blocks.length}`);
         // --- run turn (handlers FIRST — answering a parked call resumes the turn immediately) ---
         const parkedCalls = [];

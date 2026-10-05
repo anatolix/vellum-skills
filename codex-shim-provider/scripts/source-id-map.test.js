@@ -104,6 +104,8 @@ describe("idCoverage", () => {
       { role: "tool", _sourceIds: ["a"] }, { role: "user" },
     ]);
     expect(c.missing).toBe(2);
-    expect(c.summary).toBe("user 1/2, assistant 0/1");
+    expect(c.summary).toBe("2 из 4 (user 1, assistant 1)");
+    expect(c.none).toBe(false);
+    expect(c.details.map((d) => d.index)).toEqual([1, 3]);
   });
 });
