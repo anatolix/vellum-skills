@@ -350,6 +350,29 @@ class Chat {
     finally { rel(); if (this.oneUse) setTimeout(() => manager.maybeDestroyOneUse(this.key), 500); }
   }
 
+  // Dry run (header X-Shim-Dry-Run: 1): the same seen/rewritten/new classification _run applies,
+  // reported per block and nothing else — no CLI, no markFed, no save. Mirrors codex-shim.
+  dryRun(blocks) {
+    const inputs = inputBlocks(blocks);
+    const hashes = inputs.map((b) => sha(b.text));
+    const asst = blocks.filter((b) => b.role === "assistant");
+    const prior = new Set(this.sent);
+    const idCls = this.idMap().classifyAll(inputs, hashes);
+    idCls.forEach((c, i) => { if (c === "seen" || c === "rewritten") prior.add(hashes[i]); });
+    let lastSeenIdx0 = -1; for (let i = 0; i < hashes.length; i++) if (prior.has(hashes[i])) lastSeenIdx0 = i;
+    const report = inputs.map((b, i) => {
+      const consumed = b.role === "tool" && !!b.consumed;
+      const decision = prior.has(hashes[i]) ? "already-fed" : consumed ? "already-fed-natively" : i < lastSeenIdx0 ? "skip-rewritten-history" : "feed";
+      return { index: i, kind: b.role, source_ids: b.sourceIds || null, len: b.text.length, id_class: idCls[i], hash_known: this.sent.includes(hashes[i]), decision, head: b.text.replace(/\s+/g, " ").slice(0, 60) };
+    });
+    const feed = report.filter((r) => r.decision === "feed").length;
+    console.log(`[ids] ${short(this.key)} DRY RUN session=${this.sessionId || "none"} blocks=${inputs.length} feed=${feed}`);
+    const asstHashes = asst.map((b) => sha(b.text));
+    const asstCls = this.idMap().classifyAll(asst, asstHashes);
+    return { dry_run: true, key: this.key, session: this.sessionId, fresh: !this.sent.length, sent_hashes: this.sent.length, blocks: report,
+      assistant_rows: asst.map((b, i) => ({ source_ids: b.sourceIds || null, tracked: asstCls[i] })) };
+  }
+
   // No resets. The CLI transcript is the source of truth; Vellum's history is
   // only used to find what the CLI has not seen yet. Every input block whose
   // hash is unknown to this chat is fed, in order. Compaction (summary replaces
@@ -1249,6 +1272,13 @@ async function handleRequest(req) {
     attachSourceIds(body.messages || [], body._vellum);
     const replyId = replyIdOf(body._vellum); // Vellum row the reply of THIS request will live in (v3)
     const reqIdMap = manager.idMapFor(cacheKey);
+    if (cacheKey && /^(1|true|ids)$/i.test(req.headers.get("x-shim-dry-run") || "")) {
+      // before resolveToolResults: that step hands results to the CLI, a dry run must not
+      const dryBlocks = messagesToBlocks(body.messages || [], tools, reqIdMap);
+      const chat = manager.chats.get(cacheKey) ?? (existsSync(`${SESS_DIR}/${sha(cacheKey)}.json`) ? manager.get(cacheKey) : null);
+      if (!chat) { console.log(`[ids] ${short(cacheKey)} DRY RUN: no session for this chat`); return Response.json({ dry_run: true, key: cacheKey, session: null, fresh: true, blocks: inputBlocks(dryBlocks).map((b, i) => ({ index: i, kind: b.role, source_ids: b.sourceIds || null, len: b.text.length, id_class: "fresh", decision: "feed", head: b.text.replace(/\s+/g, " ").slice(0, 60) })) }); }
+      return Response.json(chat.dryRun(dryBlocks));
+    }
     const resolved = TOOL_MODE === "mcp" ? resolveToolResults(body.messages || [], cacheKey, reqIdMap) : 0;
     if (resolved) console.log(`[mcp] resolved ${resolved} pending tool result(s)`);
     const blocks = messagesToBlocks(body.messages || [], tools, reqIdMap);
