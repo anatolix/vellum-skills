@@ -154,6 +154,26 @@ def synthetic_kind(text):
         if rx.search(text or ""): return name
     return None
 
+PROFILE_RX = re.compile(r"model_profile:\s*(.+)")
+
+def turn_profile(meta_json):
+    try: meta = json.loads(meta_json or "{}")
+    except Exception: return None
+    m = PROFILE_RX.search(meta.get("turnContextBlock") or "")
+    return m.group(1).strip() if m else None
+
+def profile_shim(profile):
+    p = (profile or "").lower()
+    if "claude code" in p: return "claude"
+    if "chatgpt" in p or "codex" in p: return "codex"
+    return None  # direct provider (Kimi, OpenRouter...) — no CLI at all
+
+def vellum_internal(role, text):
+    t = (text or "").strip()
+    if role == "user" and re.fullmatch(r"/[a-z][\w-]*(\s.*)?", t, re.S): return "slash-команда Vellum"
+    if role == "assistant" and t.startswith("Context Compacted"): return "отчёт компакции Vellum"
+    return None
+
 # ---------- rendering ----------
 def render_block(b, out):
     t = b.get("type", "?") if isinstance(b, dict) else "raw"
@@ -195,6 +215,25 @@ def main():
         "claude": claude_transcript(shims.get("claude", {}).get("sessionId")),
         "codex": codex_transcript(shims.get("codex", {}).get("threadId")),
     }
+
+    # Timeline facts for classifying rows without any CLI id.
+    profile = None
+    for m in msgs:
+        p = turn_profile(m.get("metadata"))
+        if p: profile = p
+        m["_profile"] = profile
+    paired_ts = {}
+    for name, sh in shims.items():
+        rows = set((sh.get("cli_ids") or {}).keys())
+        paired_ts[name] = [m["created_at"] for m in msgs if m["id"] in rows]
+    first_pair = {n: min(v) for n, v in paired_ts.items() if v}
+    last_pair = max((max(v) for v in paired_ts.values() if v), default=None)
+    compact_upto = {}
+    for e in comp:  # rows compacted away before each compaction event
+        n = e.get("compacted_message_count") or 0
+        for m in msgs[:n]:
+            compact_upto.setdefault(m["id"], e["compacted_at"])
+    stats = {}
 
     out = []
     out.append(f"# Диагностика чата: {conv['title']}\n")
@@ -311,8 +350,25 @@ def main():
         if unique:
             return "<br>".join(unique), False
         if synthetic:
-            return f"— synthetic: <code>{esc(synthetic)}</code>", False
-        return "⚠ <b>НЕТ cli_id / tool_id</b>", True
+            return f"ℹ synthetic: <code>{esc(synthetic)}</code>", False
+        why = vellum_internal(message.get("role"), text)
+        if why:
+            return f"ℹ CLI не видел: {esc(why)}, в модель не уходит", False
+        ca = message["created_at"]
+        if last_pair is None or ca > last_pair:
+            return "ℹ CLI ещё не видел: после последнего запроса к шиму", False
+        restored = [n for n, f in first_pair.items() if ca < f]
+        if restored:
+            ct = compact_upto.get(message["id"])
+            if ct and all(ct <= first_pair[n] for n in restored):
+                return "ℹ в CLI попало только через summary компакции", False
+            return ("ℹ в CLI попало внутри восстановленной истории ("
+                    + ", ".join(restored) + "), отдельного ID нет"), False
+        shim = profile_shim(message.get("_profile"))
+        if message.get("role") == "assistant" and shim is None:
+            return (f"⚠ <b>ответ модели вне шима</b> ({esc(message.get('_profile') or '?')}) — "
+                    "в CLI не передан"), True
+        return "⚠ <b>НЕТ cli_id / tool_id</b> — настоящий пропуск", True
 
     def message_details(index, message, blocks, synthetic):
         role = message.get("role") or "?"
@@ -323,6 +379,8 @@ def main():
         )
         if message.get("client_message_id"):
             header += f"<br>client_message_id: <code>{esc(message['client_message_id'])}</code>"
+        if message.get("_profile"):
+            header += f"<br>модель хода: <code>{esc(message['_profile'])}</code>"
         if synthetic:
             header += f"<br>synthetic: <code>{esc(synthetic)}</code>"
 
@@ -383,6 +441,15 @@ def main():
         cli_cell, missing_cli = exact_or_transcript_ids(m, blocks, text, synthetic)
         if missing_cli:
             cli_warn_total += 1
+        has_real = bool(re.search(r"</b> · [^<]*: <code>", cli_cell))
+        if not has_real and "cli_id пустой" in cli_cell:
+            key = "⚠ запись в cli_ids есть, но cli_id пустой"
+            if not missing_cli: cli_warn_total += 1
+        elif cli_cell[:1] in "ℹ⚠" and not has_real:
+            key = re.sub(r"<[^>]+>|\(.*?\)", "", cli_cell).split(":")[0].split("—")[0].split("(")[0].strip(" )")
+        else:
+            key = "✅ есть cli_id / tool_id"
+        stats[key] = stats.get(key, 0) + 1
 
         out.append(
             f"| {vellum_cell} | {cli_cell} | {message_details(i, m, blocks, synthetic)} |"
@@ -392,7 +459,8 @@ def main():
         "## Итог\n\n"
         f"- сообщений: {len(msgs)}\n"
         f"- пустых vellum_id: **{vellum_warn_total}**\n"
-        f"- сообщений без cli_id и без tool_id (не synthetic): **{cli_warn_total}**\n"
+        f"- **настоящих пропусков (⚠): {cli_warn_total}**\n"
+        + "".join(f"- {k}: {v}\n" for k, v in sorted(stats.items(), key=lambda kv: -kv[1]))
     )
 
     dest = a.output or os.path.join(WS, "scratch", f"diag-{cid[:8]}.md")
