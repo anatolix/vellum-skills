@@ -79,3 +79,37 @@ test('long warnings are bounded without adding more cards',async()=>{
 });
 
 test('failed compaction is NOT hidden as routine status',async()=>{const {manager,pub}=fixture();await manager.consume(ev('notice',{text:'Компакция: ошибка CLI'}));expect(pub).toHaveLength(1);expect(pub[0].data.body).toContain('ошибка CLI');expect(pub[0].data._shimWarnings).toEqual(['Компакция: ошибка CLI']);});
+
+// v1.1.0 turn roll-up
+const r2='123e4567-e89b-42d3-a456-426614174002';
+const ev2=(kind,detail={})=>({type:'hook_event',conversationId:c,hookName:'shim-ui',owner:{kind:'plugin',id:'shim-ui-transport'},detail:{kind,source:'claude-shim',replyId:r2,...detail}});
+function fixture2(){const pub=[],stripped=[];const rows={ [r]:{id:r,conversationId:c,role:'assistant',finalized:0}, [r2]:{id:r2,conversationId:c,role:'assistant',finalized:0} };
+ const manager=createManager({getMessages:()=>[{id:r2,role:'assistant',finalized:0}],getMessageById:id=>rows[id]??null,publish:async e=>pub.push(e),removeSurfaceBlock:async(id,sid)=>stripped.push([id,sid]),logger:{warn(){}}});return {manager,pub,stripped};}
+test('second step dismisses first card and rolls lines into one card on the new row',async()=>{
+ const {manager,pub,stripped}=fixture2();
+ await manager.consume(ev('usage',{usage:{prompt_tokens:100,prompt_tokens_details:{cached_tokens:70},completion_tokens:8}}));
+ await manager.consume(ev2('usage',{usage:{prompt_tokens:200,prompt_tokens_details:{cached_tokens:150},completion_tokens:9}}));
+ const shows=pub.filter(x=>x.type==='ui_surface_show'), updates=pub.filter(x=>x.type==='ui_surface_update'), dismiss=pub.filter(x=>x.type==='ui_surface_dismiss');
+ expect(shows).toHaveLength(2); expect(updates).toHaveLength(0); expect(dismiss).toHaveLength(1);
+ expect(dismiss[0].surfaceId).toBe(shows[0].surfaceId); expect(shows[1].messageId).toBe(r2); expect(shows[1].surfaceId).not.toBe(shows[0].surfaceId);
+ expect(shows[1].data.body).toBe('Cached 70 · Uncached 30 · Out 8  \nCached 150 · Uncached 50 · Out 9');
+ expect(stripped).toEqual([[r,shows[0].surfaceId]]);
+});
+test('roll-up keeps only the last 5 step lines',async()=>{
+ const pub=[];
+ const manager=createManager({getMessages:()=>[],getMessageById:id=>({id,conversationId:c,role:'assistant',finalized:0}),publish:async e=>pub.push(e),logger:{warn(){}}});
+ for(let i=0;i<7;i++){const rid='123e4567-e89b-42d3-a456-426614170'+String(i)+'00';
+  await manager.consume({type:'hook_event',conversationId:c,hookName:'shim-ui',owner:{kind:'plugin',id:'shim-ui-transport'},detail:{kind:'usage',source:'claude-shim',replyId:rid,usage:{prompt_tokens:10+i,prompt_tokens_details:{cached_tokens:i},completion_tokens:1}}});}
+ const shows=pub.filter(x=>x.type==='ui_surface_show');
+ const body=shows[shows.length-1].data.body;
+ expect(body.split('  \n')).toHaveLength(5);
+ expect(body.startsWith('Cached 2 ·')).toBe(true); expect(body).toContain('Cached 6 ·');
+ expect(pub.filter(x=>x.type==='ui_surface_dismiss').length).toBe(6);
+});
+test('update within one step edits the same card in place, no dismiss',async()=>{
+ const {manager,pub}=fixture2();
+ await manager.consume(ev('notice',{text:'warning'}));
+ await manager.consume(ev('usage',{usage:{prompt_tokens:9,prompt_tokens_details:{cached_tokens:4},completion_tokens:2}}));
+ expect(pub.filter(x=>x.type==='ui_surface_dismiss')).toHaveLength(0);
+ expect(pub.filter(x=>x.type==='ui_surface_update')).toHaveLength(1);
+});

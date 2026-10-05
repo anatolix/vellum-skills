@@ -12,3 +12,7 @@ No client upgrade is required. Disable the old token-usage-card pilot to prevent
 ## 1.0.1 — compact display
 
 One summary card per reply; updates in place. CLI startup is folded into the next real token card instead of being hidden or creating its own card. All-unknown token lines are omitted entirely. Routine history/reasoning diagnostics stay in logs. Up to two short warning labels plus an extra-warning count, with full warning strings retained in UI-only diagnostic data. Out is preserved. Hot reload requires no shim, Vellum or client restart.
+
+## 1.1.0 — turn roll-up
+
+One rolling usage card per chat instead of one card per reply step. Each new step's card is shown on the newest reply row holding up to 5 recent step lines (`Cached … · Uncached … · Out …`, one per step, hard-broken); the superseded card is dismissed live via `ui_surface_dismiss` AND stripped from its persisted message row via `updateMessageContent`, so reload does not resurrect it. Updates within a single step still edit the same surface in place (no dismiss). Warnings ride their step's line unchanged.

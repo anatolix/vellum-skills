@@ -10,10 +10,16 @@ export async function start(ctx) {
   try {
     const root='/home/vellum/.local/share/vellum/assistants/juno/.vellum/runtime/0.12.6/node_modules/@vellumai/assistant/src';
     const crud=await import(`file://${root}/persistence/conversation-crud.ts`);
-    manager=createManager({getMessages:crud.getMessages,getMessageById:crud.getMessageById,logger:ctx.logger,
+    const removeSurfaceBlock=(messageId,surfaceId)=>{
+      const row=crud.getMessageById(messageId);
+      if(!row||!Array.isArray(row.content)) return;
+      const next=row.content.filter(b=>!(b&&b.type==='ui_surface'&&b.surfaceId===surfaceId));
+      if(next.length!==row.content.length) crud.updateMessageContent(messageId,JSON.stringify(next));
+    };
+    manager=createManager({getMessages:crud.getMessages,getMessageById:crud.getMessageById,removeSurfaceBlock,logger:ctx.logger,
       publish:message=>publishEvent({id:randomUUID(),emittedAt:new Date().toISOString(),conversationId:message.conversationId,message})});
     subscription=assistantEventHub.subscribe({type:'process',callback:envelope=>manager?.consume(envelope).catch(err=>ctx.logger.warn({err:String(err)},'shim-ui event failed open'))});
-    ctx.logger.info('shim-ui compact v1.0.2 listener active');
+    ctx.logger.info('shim-ui compact v1.1.0 listener active');
   } catch (err) { manager?.dispose(); manager=undefined; ctx.logger.warn({err:String(err)},'shim-ui could not load version-gated CRUD; disabled'); }
 }
 export function currentManager(){return manager;}

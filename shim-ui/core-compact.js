@@ -1,6 +1,7 @@
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_PENDING = 512;
+const MAX_LINES = 5;
 const TTL_MS = 15 * 60_000;
 const OWNER = 'shim-ui-transport';
 export const validUUID = value => typeof value === 'string' && UUID.test(value);
@@ -45,15 +46,21 @@ export function summaryData(usage, warnings=[], includeUsage=true, startup=null)
   if(labels.length) parts.push('🔴 '+labels.slice(0,2).map(mdLiteral).join(' · ')+(labels.length>2?` · ещё ${labels.length-2}`:''));
   return {body:parts.join(' · '), ...(showUsage&&startup?{_shimStartup:startup}:{}), ...(labels.length?{_shimWarnings:warnings.filter(w=>compactNotice(w))}:{})};
 }
-export function createManager({ getMessages, getMessageById, publish, logger=console, now=Date.now }) {
+export function createManager({ getMessages, getMessageById, publish, removeSurfaceBlock, logger=console, now=Date.now }) {
   const pending = new Map();
   const applied = new Set();
+  // conversationId -> rolling usage card for the whole chat: one card at the
+  // newest step, holding up to MAX_LINES recent step lines; the previous
+  // step's card is dismissed live and stripped from its persisted row.
+  const turns = new Map();
   function prune() {
     const cutoff=now()-TTL_MS;
     for (const [k,v] of pending) if (v.updated < cutoff) pending.delete(k);
+    for (const [k,v] of turns) if (v.updated < cutoff) turns.delete(k);
     while (pending.size > MAX_PENDING) pending.delete(pending.keys().next().value);
     while (applied.size > MAX_PENDING*4) applied.delete(applied.values().next().value);
   }
+  const rolled = turn => turn.lines.join('  \n');
   const safePublish = async message => { try { await publish(message); } catch (e) { logger.warn?.({err:String(e)}, 'shim-ui event publish failed (non-fatal)'); } };
   function normalize(event) {
     if (!event || event.type !== 'hook_event' || event.hookName !== 'shim-ui' || event.owner?.kind !== 'plugin' || event.owner?.id !== OWNER) return null;
@@ -88,9 +95,31 @@ export function createManager({ getMessages, getMessageById, publish, logger=con
     }
     const data=summaryData(item.usage,[...item.notices.values()],Boolean(item.usage || item.complete),item.startup);
     if(data.body && data.body !== item.shownBody) {
-      await safePublish(item.shown
-        ? {type:'ui_surface_update',conversationId:item.conversationId,surfaceId:summaryId(item.replyId),data}
-        : {type:'ui_surface_show',conversationId:item.conversationId,surfaceId:summaryId(item.replyId),surfaceType:'card',data,messageId:item.replyId});
+      const id=summaryId(item.replyId);
+      let turn=turns.get(e.conversationId);
+      if (turn && turn.surfaceId===id) {
+        turn.lines[turn.lines.length-1]=data.body; turn.updated=now();
+        const data2={...data, body:rolled(turn)};
+        await safePublish({type:'ui_surface_update',conversationId:item.conversationId,surfaceId:id,data:data2});
+        item.rolledData=data2;
+      } else if (turn && turn.lines.length) {
+        turn.lines.push(data.body); while(turn.lines.length>MAX_LINES) turn.lines.shift();
+        turn.updated=now();
+        const data2={...data, body:rolled(turn)};
+        await safePublish({type:'ui_surface_dismiss',conversationId:item.conversationId,surfaceId:turn.surfaceId});
+        await safePublish({type:'ui_surface_show',conversationId:item.conversationId,surfaceId:id,surfaceType:'card',data:data2,messageId:item.replyId});
+        if (removeSurfaceBlock && turn.replyId!==item.replyId) {
+          try { await removeSurfaceBlock(turn.replyId, turn.surfaceId); }
+          catch (err) { logger.warn?.({err:String(err)}, 'shim-ui strip of superseded card failed (non-fatal)'); }
+        }
+        turn.surfaceId=id; turn.replyId=item.replyId;
+        item.rolledData=data2;
+      } else {
+        turn={lines:[data.body],surfaceId:id,replyId:item.replyId,updated:now()};
+        turns.set(e.conversationId,turn);
+        await safePublish({type:'ui_surface_show',conversationId:item.conversationId,surfaceId:id,surfaceType:'card',data,messageId:item.replyId});
+        item.rolledData=data;
+      }
       item.shown=true; item.shownBody=data.body;
     }
     return true;
@@ -105,8 +134,9 @@ export function createManager({ getMessages, getMessageById, publish, logger=con
       const key=bindingKey(ctx.conversationId,row.id), item=pending.get(key);
       if (!item) return;
       if (applied.has(key)) return;
-      const data=summaryData(item.usage,[...item.notices.values()],Boolean(item.usage || item.complete),item.startup);
+      let data=summaryData(item.usage,[...item.notices.values()],Boolean(item.usage || item.complete),item.startup);
       if(!data.body) { pending.delete(key); return; }
+      if (item.rolledData) data=item.rolledData;
       const id=summaryId(item.replyId);
       if(!(ctx.content||[]).some(b=>b?.type==='ui_surface' && b.surfaceId===id))
         ctx.content.push({type:'ui_surface',surfaceId:id,surfaceType:'card',data});
@@ -114,5 +144,5 @@ export function createManager({ getMessages, getMessageById, publish, logger=con
       pending.delete(key);
     } catch (e) { logger.warn?.({err:String(e)}, 'shim-ui post-model-call failed open'); }
   }
-  return { consume, postModelCall, dispose(){pending.clear();applied.clear();}, get pendingSize(){return pending.size;} };
+  return { consume, postModelCall, dispose(){pending.clear();applied.clear();turns.clear();}, get pendingSize(){return pending.size;} };
 }
