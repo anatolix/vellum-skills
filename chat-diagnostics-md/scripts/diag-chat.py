@@ -53,7 +53,7 @@ def resolve(db, q):
 # ---------- shim discovery ----------
 def load_sqlite_ids(path):
     """Return set of source_ids in a shim per-session map (via immutable copy)."""
-    if not os.path.exists(path): return None, 0
+    if not os.path.exists(path): return None, 0, None
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".sqlite"); tmp.close()
     try:
         shutil.copyfile(path, tmp.name)
@@ -65,10 +65,18 @@ def load_sqlite_ids(path):
         con = sqlite3.connect(f"file:{tmp.name}?mode=ro", uri=True)
         ids = {r[0] for r in con.execute("select distinct source_id from blocks")}
         n = con.execute("select count(*) from blocks").fetchone()[0]
+        # patch 9 (Oct 5): exact Vellum id <-> CLI id pairs written by the shim itself.
+        # Keyed by Vellum row id; a tool call/result is `row/<tool_call_id>` → keyed by row too.
+        cli = {}
+        try:
+            for vid, row, part, cid, kind, fed in con.execute("select vellum_id, row_id, part, cli_id, kind, fed from cli_ids order by ts"):
+                cli.setdefault(row, []).append({"vellum_id": vid, "part": part, "cli_id": cid, "kind": kind, "fed": fed})
+        except sqlite3.Error:
+            cli = None  # map created before patch 9: no table
         con.close()
-        return ids, n
+        return ids, n, cli
     except Exception:
-        return set(), 0
+        return set(), 0, None
     finally:
         try: os.unlink(tmp.name)
         except OSError: pass
@@ -93,7 +101,7 @@ def find_shims(conv_id):
             entry = {"state_file": f, "model": st.get("model"), "served": st.get("served"),
                      "sessionId": st.get("sessionId"), "threadId": st.get("threadId"),
                      "map_file": base + ".ids.sqlite"}
-            entry["map_ids"], entry["map_rows"] = load_sqlite_ids(entry["map_file"])
+            entry["map_ids"], entry["map_rows"], entry["cli_ids"] = load_sqlite_ids(entry["map_file"])
             out[name] = entry
             break
     return out
@@ -220,6 +228,13 @@ def main():
             out.append(f"- source-id map: ⚠ файл не найден ({s['map_file']})")
         else:
             out.append(f"- source-id map: {len(s['map_ids'])} уникальных source_id, {s['map_rows']} строк (`{s['map_file']}`)")
+            cl = s.get("cli_ids")
+            if cl is None:
+                out.append("- cli_ids (patch 9): ⚠ таблицы нет — карта создана до патча 9, пары CLI-id только по транскрипту")
+            else:
+                tot = sum(len(v) for v in cl.values()); fed = sum(1 for v in cl.values() for e in v if e["kind"] == "tool_use" and e["fed"])
+                calls = sum(1 for v in cl.values() for e in v if e["kind"] == "tool_use")
+                out.append(f"- cli_ids (patch 9): {tot} пар, строк Vellum: {len(cl)}, tool_use: {calls} (fed {fed})")
         out.append(f"- транскрипт: {len(transcripts[name])} уникальных текстов")
     out.append("")
 
@@ -257,11 +272,21 @@ def main():
         if m.get('client_message_id'):
             id_lines.append(f"client: <code>{m['client_message_id']}</code>")
         for name, s in shims.items():
-            if not nt:
-                id_lines.append(f"{name}: — (нет текста)")
-                continue
             ids = s.get("map_ids")
             in_map = ids is not None and m["id"] in ids
+            # patch 9: exact pairs from the shim's own cli_ids table win over text matching
+            # (tool rows have no text, but they do have pairs — check pairs first)
+            pairs = (s.get("cli_ids") or {}).get(m["id"])
+            if not pairs and not nt:
+                id_lines.append(f"{name}: — (нет текста)" + ("" if s.get("cli_ids") is None or in_map else " · ⚠ НЕТ в map"))
+                continue
+            if pairs:
+                for e in pairs:
+                    tag = e["kind"] + (f" {e['part']}" if e["part"] else "")
+                    cid = e["cli_id"] or "∅"
+                    fed = " · fed" if e["fed"] else ("" if e["kind"] == "reply" else " · not fed")
+                    id_lines.append(f"{name} {tag}: <code>{crc(cid) if e['cli_id'] else '—'}</code> ({cid[:13]}…){fed}" if e["cli_id"] else f"{name} {tag}: ⚠ cli_id пустой{fed}")
+                continue
             uuids = transcripts[name].get(nt)
             if not uuids and len(nt) >= 20:
                 for t, us in transcripts[name].items():
@@ -269,7 +294,7 @@ def main():
                         uuids = us; break
             if uuids:
                 u = uuids[0]
-                line = f"{name} crc: <code>{crc(u)}</code> ({u[:13]}…)"
+                line = f"{name} crc: <code>{crc(u)}</code> ({u[:13]}…) · по тексту"
                 if len(uuids) > 1: line += f" ×{len(uuids)}"
                 id_lines.append(line if in_map else "⚠ " + line + " · НЕТ в map")
             elif in_map:

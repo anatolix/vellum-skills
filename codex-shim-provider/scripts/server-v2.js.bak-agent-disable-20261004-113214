@@ -12,21 +12,15 @@
 //   CODEX_WORKDIR    (default ~/codex-shim/workdir)
 //   SHIM_SESSIONS_DIR(default ~/codex-shim/sessions) — key→threadId state
 //   SHIM_MODELS      (comma list override; default from model/list)
-//   SHIM_SANDBOX     read-only (default) | workspace-write | danger-full-access
-//   SHIM_SAFE_MODEL_CATALOG (default ~/codex-shim/native-safe-model-catalog.json)
+//   SHIM_SANDBOX     read-only | workspace-write (default) | danger-full-access
 //   SHIM_DEBUG=1     verbose logging
 
-import { createCompactionTracker, startTurnWithRetry } from "./compaction-turn.js";
 import { spawn } from "bun";
 import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { join } from "path";
 import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from "./notice-transport.js";
 import { promptForSession } from "./history-rehydration.js";
-import { codexThreadConfig, codexResumeParams } from "./thread-config.js";
-import { createSseWriter } from "./sse-writer.js";
-import { prepareNativeSafeModelCatalog, failClosedApprovalResponse } from "./native-tool-policy.js";
-import { attachSourceIds, replyIdOf, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, assistantBlocksOf, idCoverage, describeMissing } from "./source-id-map.js";
 const noticeTransport = new NoticeTransport();
 const threadOwners = new Map();
 
@@ -35,17 +29,11 @@ const HOME = process.env.HOME;
 const CODEX_BIN = process.env.CODEX_BIN || join(HOME, ".local/bin/codex");
 const WORKDIR = process.env.CODEX_WORKDIR || join(HOME, "codex-shim/workdir");
 const SESS_DIR = process.env.SHIM_SESSIONS_DIR || join(HOME, "codex-shim/sessions");
-const SANDBOX = process.env.SHIM_SANDBOX || "read-only";
-const CODEX_HOME = process.env.SHIM_CODEX_HOME || join(HOME, ".codex");
-const SAFE_MODEL_CATALOG = process.env.SHIM_SAFE_MODEL_CATALOG || join(HOME, "codex-shim/native-safe-model-catalog.json");
+const SANDBOX = process.env.SHIM_SANDBOX || "workspace-write";
 const DEBUG = !!process.env.SHIM_DEBUG;
 
 mkdirSync(SESS_DIR, { recursive: true });
 mkdirSync(WORKDIR, { recursive: true });
-prepareNativeSafeModelCatalog({
-  sourcePath: join(CODEX_HOME, "models_cache.json"),
-  targetPath: SAFE_MODEL_CATALOG,
-});
 
 const sha1 = s => createHash("sha1").update(s).digest("hex");
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -55,9 +43,9 @@ const dbg = (...a) => DEBUG && log(...a);
 class AppServer {
   constructor() { this.proc = null; this.idc = 0; this.pending = new Map(); this.onServerRequest = null; this.onNotification = null; this.modelList = []; }
   start() {
-    log("[appserver] starting", CODEX_BIN, `(sandbox=${SANDBOX}, safe-model-catalog=${SAFE_MODEL_CATALOG})`);
-    this.proc = spawn({ cmd: [CODEX_BIN, "-c", `model_catalog_json=${JSON.stringify(SAFE_MODEL_CATALOG)}`, "app-server"], stdin: "pipe", stdout: "pipe", stderr: "pipe",
-      env: { ...process.env, CODEX_HOME } });
+    log("[appserver] starting", CODEX_BIN);
+    this.proc = spawn({ cmd: [CODEX_BIN, "app-server"], stdin: "pipe", stdout: "pipe", stderr: "pipe",
+      env: { ...process.env, CODEX_HOME: process.env.SHIM_CODEX_HOME || join(HOME, ".codex") } });
     this.readLoop();
     this.proc.exited.then(code => {
       log("[appserver] exited", code, "— failing pending and restarting");
@@ -172,19 +160,6 @@ function models() {
 function sessPath(key) { return join(SESS_DIR, sha1(key) + ".json"); }
 function loadState(key) { try { return JSON.parse(readFileSync(sessPath(key), "utf8")); } catch { return null; } }
 function saveState(key, st) { writeFileSync(sessPath(key), JSON.stringify(st)); }
-// Vellum row id <-> block hash per chat: one SQLite file next to the session JSON, kept open
-// for the process lifetime. A failure to open degrades that chat to hash-only matching.
-const idMaps = new Map();
-let loggedToolCallShape = false; // patch 9: log item/tool/call param keys once per process
-function openIdMap(key) {
-  let m = idMaps.get(key);
-  if (!m) {
-    try { m = new SourceIdMap(join(SESS_DIR, sha1(key) + ".ids.sqlite")); }
-    catch (e) { log(`[ids] open failed key=${key.slice(0, 12)}, hash-only: ${e.message}`); m = NULL_SOURCE_ID_MAP; }
-    idMaps.set(key, m);
-  }
-  return m;
-}
 
 // router-oneuse-<uuid> keys come from shim-router for Vellum internal call sites:
 // one logical task per key. State lives ONLY in memory (never in SESS_DIR, so one-use
@@ -230,10 +205,10 @@ function blocksOf(messages) {
   for (const m of messages || []) {
     if (m.role === "user") {
       const c = typeof m.content === "string" ? m.content : (m.content || []).map(p => p.type === "text" ? p.text : "").join("\n");
-      if (c.trim()) out.push({ kind: "user", text: c, sourceIds: m._sourceIds || null });
+      if (c.trim()) out.push({ kind: "user", text: c });
     } else if (m.role === "tool") {
       const c = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
-      out.push({ kind: "tool", id: m.tool_call_id || "", text: c, sourceIds: m._sourceIds || null });
+      out.push({ kind: "tool", id: m.tool_call_id || "", text: c });
     }
   }
   return out;
@@ -391,14 +366,15 @@ async function handleCompaction({ req, key, model, blocks, lastUserBlock, effort
   if (parkedNow) log(`[compact] ${tag} tool call in flight (${parkedNow}) — summary only, native compaction skipped`);
   if (compactLocks.has(state.threadId)) { log(`[compact] ${tag} REJECTED: compaction already running`); return jsonResp({ error: { message: "codex-shim: compaction already in progress", type: "invalid_request_error", code: "busy" } }, 409); }
   if (!liveThreads.has(state.threadId)) {
-    try { await srv.request("thread/resume", codexResumeParams(state.threadId, { sandbox: SANDBOX })); liveThreads.add(state.threadId); }
+    try { await srv.request("thread/resume", { threadId: state.threadId, excludeTurns: true, config: { include_permissions_instructions: false, include_environment_context: false, include_collaboration_mode_instructions: false, include_apps_instructions: false } }); liveThreads.add(state.threadId); }
     catch (e) { log(`[compact] ${tag} resume failed: ${String(e).slice(0, 120)}`); return jsonResp({ error: { message: "codex-shim: thread could not be resumed for compaction", type: "server_error" } }, 503); }
   }
   log(`[compact] ${tag} thread=${state.threadId} model=${model} instruction=${lastUserBlock.text.length} chars blocks=${blocks.length}`);
   const base = { id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model };
-  let res;
+  const enc = new TextEncoder();
   const stream = new ReadableStream({ async start(controller) {
-    res = createSseWriter(controller);
+    let closed = false;
+    const res = { write: s => { if (!closed) controller.enqueue(enc.encode(s)); }, close: () => { if (!closed) { closed = true; controller.close(); } } };
     const ka = setInterval(() => res.write(": keepalive\n\n"), 15000);
     const usage = { input: 0, output: 0, cached: 0 };
     const timeFn = async m => (m.method === "currentTime/read" ? { currentTimeAt: Math.floor(Date.now() / 1000) } : {});
@@ -444,16 +420,15 @@ async function handleCompaction({ req, key, model, blocks, lastUserBlock, effort
       if (ok && !parkedNow) {
         const done = (async () => {
           const c0 = Date.now(); let compacted = false, cFailed = null;
-          // Release waiting turns only on the compaction TURN's turn/completed, not on the
-          // earlier item/completed(contextCompaction) — see compaction-turn.js.
-          const tracker = createCompactionTracker();
           const prevHandler = threadHandlers.get(state.threadId);
-          threadHandlers.set(state.threadId, { notif: (method, p) => tracker.onNotification(method, p), request: timeFn });
+          threadHandlers.set(state.threadId, { notif: (method, p) => {
+              if (method === "item/completed" && p.item?.type === "contextCompaction") compacted = true;
+              if (method === "turn/completed") { if (p.turn?.status === "failed" || p.turn?.error) cFailed = p.turn?.error?.message || "compaction turn failed"; else compacted = compacted || true; }
+            }, request: timeFn });
           try {
             await srv.request("thread/compact/start", { threadId: state.threadId });
             const cd = Date.now() + 180000;
-            while (!tracker.finished && Date.now() < cd) await new Promise(r => setTimeout(r, 150));
-            compacted = tracker.compacted; cFailed = tracker.state.failed;
+            while (!compacted && !cFailed && Date.now() < cd) await new Promise(r => setTimeout(r, 150));
             log(`[compact] ${tag} native compaction ${compacted ? "done" : cFailed ? "FAILED: " + cFailed : "TIMEOUT"} in ${Date.now() - c0}ms`);
             const st = loadState(key) || state;
             // Model switching may have created a new thread while this detached compact
@@ -476,7 +451,7 @@ async function handleCompaction({ req, key, model, blocks, lastUserBlock, effort
       sse(res, { ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
       res.write("data: [DONE]\n\n");
     } finally { clearInterval(ka); res.close(); }
-  }, cancel() { res?.cancel(); } });
+  } });
   return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" } });
 }
 
@@ -501,11 +476,7 @@ async function handleChat(req) {
   const allToolNames = (tools || []).map(t => t.function?.name);
   const toolNames = stableToolNames(tools); // fingerprint/diff basis — volatile tools excluded
   const knownVolatile = rememberVolatileTools(tools);
-  attachSourceIds(messages, body._vellum);
-  const replyId = replyIdOf(body._vellum); // Vellum row the reply of THIS request will live in (v3)
   const blocks = blocksOf(messages);
-  const assistantBlocks = assistantBlocksOf(messages); // id tracking only, never fed
-  const coverage = idCoverage(messages);
 
   // Session key: explicit prompt_cache_key → X-Conversation-Id header (local Vellum
   // patch in providers/retry.ts). NO silent fallback: a keyless request would mean a
@@ -548,7 +519,6 @@ async function handleChat(req) {
   }
 
   const oneUse = ONEUSE_RE.test(key);
-  const idMap = oneUse ? NULL_SOURCE_ID_MAP : openIdMap(key);
   let state = oneUse ? (oneUseStates.get(key) ?? null) : key ? loadState(key) : null;
   // One-time migration: sessions fingerprinted before volatile tools were excluded. Match on the
   // legacy hash and re-key silently instead of invalidating every live chat after this deploy.
@@ -573,24 +543,9 @@ async function handleChat(req) {
   // are skipped (and marked seen below); only the tail after the last seen block is fed.
   // Exception: a tool result for a call this thread still has parked is always delivered.
   let toFeed = blocks, skipped = [];
-  // Persistent thread without Vellum ids: profile lacks `exportSourceIds` (or the Vellum patch
-  // is not live) — history is matched by text hash only. Surfaced loudly so it gets fixed.
-  let pendingNoIdsNotice = false;
   if (state) {
     const seen = new Set(state.sent);
     const hashes = blocks.map(blockHash);
-    // Vellum row ids (body._vellum, local patch 8): a block whose ids this thread already fed is
-    // seen even when its rendering changed (compaction stripped injections, a card came or went,
-    // a real edit). A result for a still-parked tool call is always delivered regardless.
-    const idCls = idMap.classifyAll(blocks, hashes);
-    idCls.forEach((c, i) => {
-      if (c !== "seen" && c !== "rewritten") return;
-      if (blocks[i].kind === "tool" && state.parked && state.parked[blocks[i].id]) return;
-      seen.add(hashes[i]);
-    });
-    const idSummary = describeClasses(idCls);
-    if (idSummary) log(`[ids] key=${key.slice(0, 12)} ${idSummary}`);
-    if (!oneUse && coverage.missing) { pendingNoIdsNotice = coverage; log(`[ids] key=${key.slice(0, 12)} MISSING ids: ${coverage.summary}; ${describeMissing(coverage)}`); }
     let lastSeen = -1;
     for (let i = 0; i < blocks.length; i++) if (seen.has(hashes[i])) lastSeen = i;
     // A block whose hash changed but whose last 200 chars match a block this thread already
@@ -651,12 +606,12 @@ async function handleChat(req) {
 
   const headers = { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" };
   const base = { id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model };
-  let res;
+  const enc = new TextEncoder();
 
   const stream = new ReadableStream({
-    cancel() { res?.cancel(); },
     async start(controller) {
-      res = createSseWriter(controller);
+      let closed = false;
+      const res = { write: s => { if (!closed) controller.enqueue(enc.encode(s)); }, close: () => { if (!closed) controller.close(); } };
       const fail = msg => {
         sse(res, { ...base, choices: [{ index: 0, delta: { content: "⚠ codex: " + String(msg).slice(0, 500) } }] });
         sse(res, { ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
@@ -687,8 +642,9 @@ async function handleChat(req) {
             // app-server (we see nothing, only the rollout file shows them) and
             // multi_agent spawns sub-agents silently. With them off the model uses the
             // caller's dynamic tools (Vellum `bash` etc.) which we park + log.
-            // SHIM_NATIVE_TOOLS=1 can re-enable shell tools, but native agents stay disabled.
-            config: { ...codexThreadConfig(), model_reasoning_summary: "detailed", show_raw_agent_reasoning: true },
+            // SHIM_NATIVE_TOOLS=1 re-enables them.
+            config: { include_permissions_instructions: false, include_environment_context: false, include_collaboration_mode_instructions: false, include_apps_instructions: false, model_reasoning_summary: "detailed", show_raw_agent_reasoning: true,
+              ...(process.env.SHIM_NATIVE_TOOLS ? {} : { features: { shell_tool: false, unified_exec: false, multi_agent: false, plugins: false, apps: false } }) },
             dynamicTools: dynTools.length ? dynTools : undefined,
             ephemeral: key ? undefined : true,
           });
@@ -697,7 +653,6 @@ async function handleChat(req) {
           if (!oneUse) threadOwners.set(threadId, {key, model});
           notice("Старт", `${model}; с нуля`);
           state = { threadId, sent: [], model, fingerprint, parked: {}, sys, toolNames };
-          idMap.reset(); // fresh thread: nothing has been fed to it yet
           persistState(key, state);
           log("[guard] thread started:", threadId, "model:", model);
         } else if (!liveThreads.has(state.threadId)) {
@@ -705,7 +660,7 @@ async function handleChat(req) {
           log(`[guard] RESUME thread=${state.threadId} key=${key.slice(0, 12)} alreadyFed=${(state.sent || []).length} new=${feedCount} (${userBlocks.length} user + ${toolResults.length} tool) parked=${Object.keys(state.parked || {}).length}`);
 
           try {
-            await srv.request("thread/resume", codexResumeParams(state.threadId, { sandbox: SANDBOX }));
+            await srv.request("thread/resume", { threadId: state.threadId, excludeTurns: true, config: { include_permissions_instructions: false, include_environment_context: false, include_collaboration_mode_instructions: false, include_apps_instructions: false } });
             liveThreads.add(state.threadId);
             if (!oneUse) threadOwners.set(state.threadId, {key, model});
             notice("Старт", `${model}; из файла; видено=${state.sent?.length || 0}`);
@@ -723,17 +678,12 @@ async function handleChat(req) {
         if (compactLocks.has(state.threadId)) { await awaitCompactLock(state.threadId, key.slice(0, 12)); const fresh = loadState(key); if (fresh?.pendingCompactNotice) state.pendingCompactNotice = fresh.pendingCompactNotice; }
         if (state.pendingCompactNotice) { notice("Компакция", state.pendingCompactNotice); delete state.pendingCompactNotice; persistState(key, state); }
         else if (skipped.length) notice("Не отправлено", `${model}; ${skipped.length} старых блоков (~${Math.round(skipped.reduce((n, b) => n + b.text.length, 0) / 1000)}K симв.): история переписана, тред видел исходники`);
-        if (pendingNoIdsNotice) {
-          if (pendingNoIdsNotice.none) notice("⛔ Нет ID сообщений", `${model}; профиль без exportSourceIds или патч Vellum не активен — история сверяется только по хэшу`);
-          else notice("⚠ Часть сообщений без ID", `${model}; без ID ${pendingNoIdsNotice.summary} — они сверяются по хэшу`);
-        }
         if (feedCount > MAX_FEED) notice("Большой контекст", `${model}; +${feedCount} блоков; видено=${blocks.length-feedCount}/${blocks.length}`);
         // --- run turn (handlers FIRST — answering a parked call resumes the turn immediately) ---
         const parkedCalls = [];
         const usage = { input: 0, output: 0, cached: 0, reasoning: null };
         let agentBuf = "";
         let done = false, turnError = null;
-        let userItemRecorded = false; // patch 9b: user rows paired once per turn
         // turn telemetry: explains post-hoc where the time went ("what was ChatGPT doing")
         const tTurn = Date.now();
         const elapsed = () => "+" + ((Date.now() - tTurn) / 1000).toFixed(1) + "s";
@@ -768,12 +718,6 @@ async function handleChat(req) {
               if (summaryBuf.trim()) log(`[turn] ${elapsed()} summary: ${summaryBuf.trim().slice(0, 120)}`);
               summaryBuf = "";
               sse(res, { ...base, choices: [{ index: 0, delta: { reasoning_content: "\n\n" } }] });
-            } else if ((method === "item/started" || method === "item/completed") && p.item?.type === "userMessage" && p.item.id) {
-              // patch 9b: the fed user blocks' Codex-side id is the userMessage item
-              if (!userItemRecorded) { userItemRecorded = true; try { idMap.recordUserFed(userBlocks, p.item.id, state.threadId); } catch (e) { log(`[ids] record user failed: ${e.message}`); } }
-            } else if (method === "item/completed" && p.item?.type === "agentMessage") {
-              // patch 9: the reply text's Codex item id, keyed by the Vellum row reserved for it
-              if (replyId) { try { idMap.recordCli(replyId, p.item.id || "", "reply", { part: null, session: state.threadId }); } catch (e) { log(`[ids] record reply failed: ${e.message}`); } }
             } else if (method === "item/completed" && p.item?.type === "reasoning") {
               // Some transports deliver only a final item, without summary deltas.
               // Don't duplicate a summary/raw text that was already streamed.
@@ -792,8 +736,6 @@ async function handleChat(req) {
               usage.reasoning = Number.isSafeInteger(reasoning) && reasoning >= 0 ? reasoning : null;
             } else if (method === "turn/completed") {
               done = true;
-              // no userMessage item seen this turn: at least pin the user blocks to the turn id
-              if (!userItemRecorded && userBlocks.length && p.turn?.id) { userItemRecorded = true; try { idMap.recordUserFed(userBlocks, `turn:${p.turn.id}`, state.threadId); } catch (e) { log(`[ids] record user failed: ${e.message}`); } }
               log(`[turn] ${elapsed()} completed status=${p.turn?.status || "?"} reasoning=${reasoningChars}ch reasoningTokens=${usage.reasoning ?? "?"} text=${agentBuf.length}ch`);
               if (p.turn?.status === "failed" || p.turn?.error) turnError = p.turn?.error?.message || JSON.stringify(p.turn?.error || "turn failed");
             }
@@ -808,13 +750,6 @@ async function handleChat(req) {
               }
               // park: ends this HTTP response as tool_calls; answered by a later request
               const callId = "call_" + Math.random().toString(36).slice(2);
-              // patch 9: the call's full Vellum id is known now (reply row/<call id>); the Codex-side
-              // id is whatever the app-server exposes for the item (logged once so the shape is on record).
-              if (replyId) {
-                const cliId = m.params.callId || m.params.itemId || m.params.id || `rpc:${m.id}`;
-                if (!loggedToolCallShape) { loggedToolCallShape = true; log(`[ids] item/tool/call params keys: ${Object.keys(m.params || {}).join(",")}`); }
-                try { idMap.recordCli(`${replyId}/${callId}`, cliId, "tool_use", { part: callId, session: state.threadId }); } catch (e) { log(`[ids] record tool call failed: ${e.message}`); }
-              }
               state.parked[callId] = { rpcId: m.id, name: m.params.tool };
               parkedCalls.push({ callId, name: m.params.tool, arguments: m.params.arguments });
               log(`[tool] parked ${m.params.tool}`);
@@ -822,10 +757,9 @@ async function handleChat(req) {
               return new Promise(() => {}); // never resolved here; answered via srv.respond later
             }
             if (m.method === "currentTime/read") return { currentTimeAt: Math.floor(Date.now() / 1000) };
-            const deniedApproval = failClosedApprovalResponse(m.method);
-            if (deniedApproval !== undefined) {
-              log("[approval denied]", m.method);
-              return deniedApproval;
+            if (m.method.endsWith("requestApproval") || m.method === "applyPatchApproval" || m.method === "execCommandApproval") {
+              dbg("[approval auto-accept]", m.method);
+              return { decision: "accept" };
             }
             return {};
           },
@@ -838,7 +772,6 @@ async function handleChat(req) {
             if (parked) {
               log(`[tool] answering parked rpcId=${parked.rpcId} name=${parked.name}`);
               srv.respond(parked.rpcId, { contentItems: [{ type: "inputText", text: tr.text }], success: true });
-              try { idMap.recordResultFed(tr.sourceIds, tr.id); } catch (e) { log(`[ids] record tool result failed: ${e.message}`); }
               delete state.parked[tr.id];
             }
           }
@@ -849,17 +782,15 @@ async function handleChat(req) {
           // effort: Vellum sends OpenAI-style reasoning_effort (or reasoning.effort); summary:
           // reasoning summaries must be requested per turn or codex emits empty reasoning items.
           log(`[effort] model=${model} requested=${requestedEffort ?? "default"} effective=${effort}`);
-          await startTurnWithRetry((m, p) => srv.request(m, p), {
+          await srv.request("turn/start", {
             threadId: state.threadId,
             input: [{ type: "text", text: prompt, text_elements: [] }],
             summary: process.env.SHIM_REASONING_SUMMARY || "detailed",
             ...(effort ? { effort: String(effort) } : {}),
-          }, { log });
+          });
         }
         // mark fed
         state.sent = blocks.map(blockHash);
-        idMap.markFed(blocks, state.sent);
-        idMap.markFed(assistantBlocks, assistantBlocks.map(blockHash));
         state.meta = Object.fromEntries(blocks.map(b => [blockHash(b), blockMeta(b)])); // per-block len/head/tail for history-edit forensics
         persistState(key, state);
 
@@ -917,6 +848,7 @@ async function handleChat(req) {
         }
         res.write("data: [DONE]\n\n");
         res.close();
+        closed = true;
         threadHandlers.delete(state.threadId);
         if (oneUse) {
           if (parkedCalls.length) {

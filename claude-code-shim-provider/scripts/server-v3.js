@@ -10,7 +10,8 @@
 // and return real OpenAI `tool_calls` deltas. Tool execution stays on the Vellum side.
 // Claude Code's own SDK tools (Bash/Read/...) remain disabled on purpose.
 import { createSdkMcpServer, tool, query } from "@anthropic-ai/claude-agent-sdk";
-import { mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync, writeFileSync, statSync, openSync, readSync, closeSync } from "node:fs";
+import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 
 import { z } from "zod";
@@ -453,8 +454,20 @@ class Chat {
         if (this.pendingCompactNotice) { diagnostic(onMsg, short(this.key), "Компакция", this.pendingCompactNotice); this.pendingCompactNotice = null; this.save(); }
         else if (skippedOld.length) diagnostic(onMsg, short(this.key), "Не отправлено", `${model}; ${skippedOld.length} старых блоков (~${Math.round(skippedOld.reduce((n, b) => n + b.text.length, 0) / 1000)}K симв.): история переписана, CLI видел исходники`);
         else if (prior.size && lastSeenIdx < 0) diagnostic(onMsg, short(this.key), "История не совпала", `отправляю=${unseen.length}; видено=0/${inputs.length}`);
-        const res = await this.cli.send(prompt, (m) => { produced = true; onMsg(m); });
-        this.sent = [...seen]; markFed(); this.sessionId = res.session_id || this.cli.sessionId; this.model = model; this.effort = effort ?? null; this.served++; this.lastUsed = Date.now();
+        // patch 9b: the CLI never echoes the prompt it was fed, but its transcript links the turn's
+        // first assistant entry to the user entry via parentUuid — that uuid is the user blocks' CLI id.
+        let firstAsstUuid = null;
+        const res = await this.cli.send(prompt, (m) => { produced = true; if (!firstAsstUuid && m?.type === "assistant" && m.uuid) firstAsstUuid = m.uuid; onMsg(m); });
+        this.sent = [...seen]; markFed();
+        try {
+          const fedUser = unseen.filter((b) => b.role === "user" && b.sourceIds?.length);
+          if (fedUser.length) {
+            const sid = res.session_id || this.cli.sessionId;
+            const uuid = transcriptUserUuid(sid, firstAsstUuid);
+            const n = this.idMap().recordUserFed(fedUser, uuid || "", sid);
+            if (n) console.log(`[ids] ${short(this.key)} user rows ${fedUser.length} -> ${uuid ? uuid.slice(0, 8) : "no transcript uuid"} (${n} pairs)`);
+          }
+        } catch (e) { console.error(`[ids] ${short(this.key)} record user failed: ${e.message}`); } this.sessionId = res.session_id || this.cli.sessionId; this.model = model; this.effort = effort ?? null; this.served++; this.lastUsed = Date.now();
         res.shim_actual_model = this.cli?.actualModel ?? null;
         this.save();
         if (res.subtype && res.subtype !== "success") console.log(`[sess] ${short(this.key)} result subtype=${res.subtype} ${String(res.result || "").slice(0, 120)}`);
@@ -899,6 +912,29 @@ function systemText(blocks) {
 
 // History fed to the CLI as user input. System/tools go via options; assistant
 // turns are skipped: the CLI already holds its own replies in the transcript.
+// Claude CLI transcript: ~/.claude/projects/<cwd slug>/<sessionId>.jsonl. The entry whose uuid is
+// the turn's first assistant message points at the user entry that was fed (parentUuid). Reads only
+// the tail of the file; returns null when anything is off (the pair is then recorded without a uuid).
+function transcriptUserUuid(sessionId, asstUuid) {
+  if (!sessionId || !asstUuid) return null;
+  try {
+    const slug = process.cwd().replace(/[^a-zA-Z0-9]/g, "-");
+    const path = `${homedir()}/.claude/projects/${slug}/${sessionId}.jsonl`;
+    const size = statSync(path).size, TAIL = 4 * 1024 * 1024;
+    const fd = openSync(path, "r");
+    try {
+      const len = Math.min(size, TAIL), buf = Buffer.alloc(len);
+      readSync(fd, buf, 0, len, size - len);
+      const lines = buf.toString("utf8").split("\n");
+      let parent = null;
+      for (let i = lines.length - 1; i >= 0 && !parent; i--) if (lines[i].includes(asstUuid)) { try { const j = JSON.parse(lines[i]); if (j.uuid === asstUuid) parent = j.parentUuid || null; } catch {} }
+      if (!parent) return null;
+      for (let i = lines.length - 1; i >= 0; i--) if (lines[i].includes(parent)) { try { const j = JSON.parse(lines[i]); if (j.uuid === parent) return j.type === "user" ? parent : null; } catch {} }
+    } finally { closeSync(fd); }
+  } catch {}
+  return null;
+}
+
 function inputBlocks(blocks) {
   return blocks.filter((b) => b.role !== "assistant" && b.role !== "system" && b.role !== "tools");
 }

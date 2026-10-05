@@ -155,6 +155,17 @@ export class SourceIdMap {
     this.qCliFed.run(toolCallId);
   }
 
+  /**
+   * User blocks fed to the CLI in one turn, paired with the CLI-side id of the entry that holds
+   * them (Claude: the transcript user uuid; Codex: the userMessage item id, or `turn:<id>` when
+   * the app-server exposed no item). One row per Vellum id of every fed block.
+   */
+  recordUserFed(blocks, cliId, session = null) {
+    let n = 0;
+    for (const b of blocks || []) for (const id of b?.sourceIds || []) n += this.recordCli(id, cliId, "user", { part: partOf(id), fed: 1, session }) ? 1 : 0;
+    return n;
+  }
+
   /** Did a result for this tool call already reach the CLI (any kind, any session restart)? */
   isPartFed(toolCallId) { return !!toolCallId && !!this.qCliIsFed.get(toolCallId); }
 
@@ -179,7 +190,7 @@ export class SourceIdMap {
 export const NULL_SOURCE_ID_MAP = {
   classify() { return "unknown"; }, classifyAll(blocks) { return blocks.map(() => "unknown"); },
   markFed() { return 0; }, reset() {}, stats() { return { ids: 0, rows: 0, cli: { n: 0, calls: 0, fed: 0 } }; }, close() {},
-  recordCli() { return false; }, recordResultFed() {}, isPartFed() { return false; }, recordClaudeAssistant() { return 0; },
+  recordCli() { return false; }, recordResultFed() {}, isPartFed() { return false; }, recordClaudeAssistant() { return 0; }, recordUserFed() { return 0; },
 };
 
 /** Summarise a classification array for a log line; null when nothing had ids. */

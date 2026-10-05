@@ -36,7 +36,7 @@ python3 {baseDir}/scripts/diag-chat.py <conversation-id | префикс | то�
 ## Источники данных
 
 - `data/db/assistant.db` (read-only, `mode=ro`): `messages`, `conversations`, `conversation_compaction_events`, `conversation_keys`. Колонка `content` — JSON-массив блоков.
-- Shim state: `~/claude-shim/sessions/<sha1(key)>.json` → `key, sessionId, model, served`; рядом `<sha1>.ids.sqlite` (таблица `blocks`: source_id, hash, kind). Аналогично `~/codex-shim/sessions/` → `threadId`. SQLite-карты открываются через immutable-копию во временный файл, чтобы не ловить WAL-локи живого шима.
+- Shim state: `~/claude-shim/sessions/<sha1(key)>.json` → `key, sessionId, model, served`; рядом `<sha1>.ids.sqlite` (таблица `blocks`: source_id, hash, kind; с патча 9 — таблица `cli_ids`: vellum_id ↔ cli_id, kind reply/tool_use/tool_result/user, fed — это основной источник пар, транскрипт только fallback с пометкой «по тексту»). Аналогично `~/codex-shim/sessions/` → `threadId`. SQLite-карты открываются через immutable-копию во временный файл, чтобы не ловить WAL-локи живого шима.
 - Транскрипты: Claude — `~/.claude/projects/-home-vellum-claude-shim/<sessionId>.jsonl` (поля `uuid`, `message.content`); Codex — rollout-jsonl по threadId.
 
 ## Границы

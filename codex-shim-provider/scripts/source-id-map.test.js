@@ -162,6 +162,18 @@ describe("cli_ids (patch 9)", () => {
     expect(m.isPartFed("call_a")).toBe(false);
     m.close();
     expect(NULL_SOURCE_ID_MAP.recordClaudeAssistant("r", {})).toBe(0);
+    expect(NULL_SOURCE_ID_MAP.recordUserFed([{ sourceIds: ["u"] }], "x")).toBe(0);
+  });
+
+  test("fed user blocks pair every source id with the CLI entry id", () => {
+    const m = new SourceIdMap(":memory:");
+    expect(m.recordUserFed([{ sourceIds: ["u1"] }, { sourceIds: ["u2/tail", "u3"] }, { sourceIds: null }], "uuid-9", "s1")).toBe(3);
+    expect(m.db.query("SELECT vellum_id, part, cli_id, kind, fed FROM cli_ids ORDER BY vellum_id").all()).toEqual([
+      { vellum_id: "u1", part: null, cli_id: "uuid-9", kind: "user", fed: 1 },
+      { vellum_id: "u2/tail", part: "tail", cli_id: "uuid-9", kind: "user", fed: 1 },
+      { vellum_id: "u3", part: null, cli_id: "uuid-9", kind: "user", fed: 1 },
+    ]);
+    m.close();
     expect(NULL_SOURCE_ID_MAP.isPartFed("x")).toBe(false);
   });
 });
