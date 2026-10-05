@@ -557,7 +557,11 @@ async function handleChat(req) {
     state.fingerprint = fingerprint; state.toolNames = toolNames; persistState(key, state);
   }
   let prevState = null, invalidReason = null;
-  if (state && (state.model !== model || state.fingerprint !== fingerprint)) {
+  // Dry run (X-Shim-Dry-Run: 1, see below) classifies against the stored thread even when the
+  // replayed body has a different system prompt / tool set — the mismatch is reported, not acted on.
+  const dryRun = /^(1|true|ids)$/i.test(req.headers.get("x-shim-dry-run") || "");
+  const fpMismatch = !!state && (state.model !== model || state.fingerprint !== fingerprint);
+  if (state && fpMismatch && !dryRun) {
     prevState = state;
     invalidReason = [
       state.model !== model ? `model ${state.model} -> ${model}` : null,
@@ -573,6 +577,7 @@ async function handleChat(req) {
   // are skipped (and marked seen below); only the tail after the last seen block is fed.
   // Exception: a tool result for a call this thread still has parked is always delivered.
   let toFeed = blocks, skipped = [];
+  let idCls = null; // per-block id classification (null: fresh thread, nothing to compare)
   // Persistent thread without Vellum ids: profile lacks `exportSourceIds` (or the Vellum patch
   // is not live) — history is matched by text hash only. Surfaced loudly so it gets fixed.
   let pendingNoIdsNotice = false;
@@ -582,7 +587,7 @@ async function handleChat(req) {
     // Vellum row ids (body._vellum, local patch 8): a block whose ids this thread already fed is
     // seen even when its rendering changed (compaction stripped injections, a card came or went,
     // a real edit). A result for a still-parked tool call is always delivered regardless.
-    const idCls = idMap.classifyAll(blocks, hashes);
+    idCls = idMap.classifyAll(blocks, hashes);
     idCls.forEach((c, i) => {
       if (c !== "seen" && c !== "rewritten") return;
       if (blocks[i].kind === "tool" && state.parked && state.parked[blocks[i].id]) return;
@@ -613,6 +618,21 @@ async function handleChat(req) {
       log(`[guard] HISTORY-EDIT key=${key.slice(0, 12)} ${skipped.length} unseen block(s) before last seen #${lastSeen} (~${skipped.reduce((n, b) => n + b.text.length, 0)} chars) — rewritten history, NOT fed; tail=${toFeed.length}`);
       dumpHistoryEdit(key.slice(0, 12), { key: key.slice(0, 12), thread: state.threadId, model: state.model }, blocks, hashes, skippedIdx, lastSeen, state.sent || [], state.meta || {});
     }
+  }
+
+  // Dry run (header X-Shim-Dry-Run: 1): report the feed decision per block and stop — nothing is
+  // fed, marked or persisted. Lets a diagnostic replay a chat's history and see what the shim
+  // would consider already sent (by id / by hash) versus new.
+  if (dryRun) {
+    const feedSet = new Set(toFeed), skipSet = new Set(skipped);
+    const report = blocks.map((b, i) => ({
+      index: i, kind: b.kind, id: b.id || null, source_ids: b.sourceIds || null, len: b.text.length,
+      id_class: idCls ? idCls[i] : "fresh", decision: feedSet.has(b) ? "feed" : skipSet.has(b) ? "skip-rewritten-history" : "already-fed",
+      head: b.text.replace(/\s+/g, " ").slice(0, 60),
+    }));
+    log(`[ids] DRY RUN key=${key.slice(0, 12)} thread=${state?.threadId || "none"} blocks=${blocks.length} feed=${toFeed.length}`);
+    return jsonResp({ dry_run: true, key, thread: state?.threadId || null, fresh: !state, fingerprint_match: !fpMismatch, sent_hashes: state?.sent?.length ?? 0, blocks: report,
+      assistant_rows: assistantBlocks.map(b => ({ source_ids: b.sourceIds || null, tracked: b.sourceIds ? idMap.classify(b, blockHash(b)) : "unknown" })) });
   }
 
   // guard: many UNSEEN blocks at once == probable full-history replay (the Oct 1 quota
