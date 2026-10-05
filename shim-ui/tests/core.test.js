@@ -49,33 +49,39 @@ test('foreign or finalized reply rows are rejected before any UI broadcast',asyn
 test('routine notices produce no cards; warnings get their own card beside the token card',async()=>{
  const {manager,pub}=fixture();
  for(const text of ['Старт: gpt-6.1-sol; из файла; видено=8','Reasoning недоступен: gpt-6.1-sol; 574 токенов без summary','История загружена: 200 сообщений']) await manager.consume(ev('notice',{text}));
- expect(pub).toHaveLength(0);
+ expect(pub).toHaveLength(1); expect(pub[0].surfaceId).toContain(':startup');
  await manager.consume(ev('notice',{text:'Потеря tool call: 2'}));
  await manager.consume(ev('notice',{text:'⚠ Часть сообщений без ID: gpt-6.1-sol; без ID 1 из 17 *user1* — они сверяются по хэшу'}));
  await manager.consume(ev('usage',{usage:{prompt_tokens:100,prompt_tokens_details:{cached_tokens:80},completion_tokens:12}}));
  await manager.consume(ev('complete'));
- const shows=pub.filter(e=>e.type==='ui_surface_show'); expect(shows).toHaveLength(2);
+ const shows=pub.filter(e=>e.type==='ui_surface_show'); expect(shows).toHaveLength(3);
  const ctx={conversationId:c,content:[]}; await manager.postModelCall(ctx);
- expect(ctx.content).toHaveLength(2);
- expect(ctx.content[0].data.body).toBe('Claude CLI: gpt\\-6\\.1\\-sol; из файла; видено=8 · Cached 80 · Uncached 20 · Out 12');
- expect(ctx.content[1].surfaceId).toContain(':warnings');
- expect(ctx.content[1].data.body).toBe('🔴 Потеря tool call: 2 · Без ID: 1/17');
+ expect(ctx.content).toHaveLength(3);
+ expect(ctx.content[0].surfaceId).toContain(':startup');
+ expect(ctx.content[0].data.body).toBe('Claude CLI: gpt\\-6\\.1\\-sol; из файла; видено=8');
+ expect(ctx.content[1].data.body).toBe('Cached 80 · Uncached 20 · Out 12');
+ expect(ctx.content[2].surfaceId).toContain(':warnings');
+ expect(ctx.content[2].data.body).toBe('🔴 Потеря tool call: 2 · Без ID: 1/17');
 });
-test('Codex startup waits for usage and merges into that one card',async()=>{
+test('startup gets its own card immediately; usage is a separate card',async()=>{
  const {manager,pub}=fixture();
  await manager.consume(ev('notice',{source:'codex-shim',text:'Старт: gpt-5.6-sol; с нуля'}));
- expect(pub).toHaveLength(0);
+ expect(pub).toHaveLength(1); expect(pub[0].surfaceId).toContain(':startup');
+ expect(pub[0].data.body).toBe('Codex CLI: gpt\\-5\\.6\\-sol; с нуля');
  await manager.consume(ev('usage',{source:'codex-shim',usage:{prompt_tokens:42,prompt_tokens_details:{cached_tokens:30},completion_tokens:5}}));
- expect(pub.filter(e=>e.type==='ui_surface_show')).toHaveLength(1);
- expect(pub[0].data.body).toBe('Codex CLI: gpt\\-5\\.6\\-sol; с нуля · Cached 30 · Uncached 12 · Out 5');
- expect(pub[0].data._shimStartup).toBe('Codex CLI: gpt-5.6-sol; с нуля');
+ const shows=pub.filter(e=>e.type==='ui_surface_show'); expect(shows).toHaveLength(2);
+ expect(shows[1].surfaceId).toContain(':summary'); expect(shows[1].data.body).toBe('Cached 30 · Uncached 12 · Out 5');
+ const ctx={conversationId:c,content:[]}; await manager.postModelCall(ctx);
+ expect(ctx.content.map(b=>b.surfaceId)).toEqual([shows[0].surfaceId,shows[1].surfaceId]);
 });
-test('startup plus absent usage produces no empty counter card',async()=>{
+test('startup plus absent usage: only the startup card, no empty counter card',async()=>{
  const {manager,pub}=fixture();
  await manager.consume(ev('notice',{source:'codex-shim',text:'Старт: gpt-5.6-sol; из файла'}));
  await manager.consume(ev('complete',{source:'codex-shim'}));
- expect(pub).toHaveLength(0);
- const ctx={conversationId:c,content:[]}; await manager.postModelCall(ctx); expect(ctx.content).toEqual([]);
+ const shows=pub.filter(e=>e.type==='ui_surface_show'); expect(shows).toHaveLength(1);
+ expect(shows[0].surfaceId).toContain(':startup');
+ const ctx={conversationId:c,content:[]}; await manager.postModelCall(ctx);
+ expect(ctx.content).toHaveLength(1); expect(ctx.content[0].surfaceId).toContain(':startup');
 });
 test('long warnings are bounded without adding more cards',async()=>{
  const {manager,pub}=fixture(); for(let i=0;i<10;i++) await manager.consume(ev('notice',{text:String(i)+'x'.repeat(500)}));

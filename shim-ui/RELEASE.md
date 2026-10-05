@@ -20,3 +20,7 @@ One rolling usage card per chat instead of one card per reply step. Each new ste
 ## 1.2.0 — scoped roll-up
 
 Roll-up applies ONLY to token cards, and only within a silent run (thinking + tool calls, no visible text). The run breaks — old card stays, a fresh card starts — as soon as the model writes any text or a human text message arrives; tool_result-only user rows do not break it. Warnings are back on their own separate per-reply cards (never rolled into the token line), as in 1.0.0.
+
+## 1.3.0 — startup unglued
+
+CLI startup is its own separate card again, published immediately on the notice (no waiting for usage, never merged into the token line, never rolled). Token cards roll only among themselves within a silent run; warnings keep their own cards. Three card kinds, three surface suffixes: :startup, :summary, :warnings.

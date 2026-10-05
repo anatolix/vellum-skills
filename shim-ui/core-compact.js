@@ -21,6 +21,7 @@ export function tokenLine(usage) {
 }
 export const summaryId = replyId => `shim-ui:${replyId}:summary`;
 export const warnId = replyId => `shim-ui:${replyId}:warnings`;
+export const startupId = replyId => `shim-ui:${replyId}:startup`;
 const noticeText = value => String(value).replace(/^\s*\[(?:codex|claude)-shim\]\s*/,'').replace(/^[🔴⚠⛔\s]+/u,'').replace(/\s+/g,' ').trim();
 export function startupNotice(value, source) {
   const match=noticeText(value).match(/^Старт(?: CLI| диалога CLI)?\s*[:;]\s*(.+)$/i);
@@ -105,12 +106,19 @@ export function createManager({ getMessages, getMessageById, publish, removeSurf
         const label=compactNotice(e.text);
         if(label) item.notices.set(label,e.text);
       }
-    } else if (e.kind==='usage') {
+    }
+    // Startup gets its OWN card immediately — never waits for usage, never rolled.
+    if (item.startup && !item.shownStartup) {
+      const sdata={body:mdLiteral(item.startup)};
+      await safePublish({type:'ui_surface_show',conversationId:item.conversationId,surfaceId:startupId(item.replyId),surfaceType:'card',data:sdata,messageId:item.replyId});
+      item.shownStartup=true; item.startupData=sdata;
+    }
+    if (e.kind==='usage') {
       item.usage=e.usage ?? null;
     } else if (e.kind==='complete') {
       item.complete=true;
     }
-    const data=summaryData(item.usage,[],Boolean(item.usage || item.complete),item.startup);
+    const data=summaryData(item.usage,[],Boolean(item.usage || item.complete));
     if(data.body && data.body !== item.shownBody) {
       const id=summaryId(item.replyId);
       let turn=turns.get(e.conversationId);
@@ -162,9 +170,12 @@ export function createManager({ getMessages, getMessageById, publish, removeSurf
       const key=bindingKey(ctx.conversationId,row.id), item=pending.get(key);
       if (!item) return;
       if (applied.has(key)) return;
-      const data=item.rolledData ?? summaryData(item.usage,[],Boolean(item.usage || item.complete),item.startup);
+      const data=item.rolledData ?? summaryData(item.usage,[],Boolean(item.usage || item.complete));
       const warnData=item.warnData;
-      if(!data.body && !warnData?.body) { pending.delete(key); return; }
+      if(!data.body && !warnData?.body && !item.startupData) { pending.delete(key); return; }
+      const sid=startupId(item.replyId);
+      if(item.startupData && !(ctx.content||[]).some(b=>b?.type==='ui_surface' && b.surfaceId===sid))
+        ctx.content.push({type:'ui_surface',surfaceId:sid,surfaceType:'card',data:item.startupData});
       const id=summaryId(item.replyId);
       if(data.body && !(ctx.content||[]).some(b=>b?.type==='ui_surface' && b.surfaceId===id))
         ctx.content.push({type:'ui_surface',surfaceId:id,surfaceType:'card',data});
