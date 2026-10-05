@@ -1,8 +1,10 @@
 {
   "name": "shim-ui",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "description": "Native UI-only cards for Claude/Codex shim response events",
-  "peerDependencies": { "@vellumai/plugin-api": "^0.8.0" }
+  "peerDependencies": {
+    "@vellumai/plugin-api": "^0.8.0"
+  }
 }

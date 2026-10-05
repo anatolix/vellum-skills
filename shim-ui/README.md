@@ -11,7 +11,7 @@ Server-only plugin that turns shim sidechannel events into native `ui_surface` c
 
 The listener and hook dynamically import private CRUD from the installed 0.12.6 runtime only; the plugin refuses other versions. Native cards publish `ui_surface_show` with the reserved reply row's message ID. The post-model-call hook selects only the latest unfinalized assistant row and requires exact `conversationId + replyId` binding before appending blocks to the hook's in-memory `ctx.content`; host persistence occurs normally afterward. OpenAI and Anthropic serializers are tested to drop `ui_surface` on future requests.
 
-Usage line: `Cached x · Uncached y · Out z`, with optional `· Write w`. Prompt tokens are inclusive; uncached subtracts cached and cache-write. Unknown values render `—`, never zero. Warnings display as `🔴 ` plus Markdown-literal escaped raw text, with one surface per distinct warning and stable IDs for usage updates.
+Usage line: `Cached x · Uncached y · Out z`, with optional `· Write w`. Prompt tokens are inclusive; uncached subtracts cached and cache-write. Unknown values render `—`, never zero. Version 1.0.1 uses ONE compact card per reply: token counters plus at most two short warning labels and an additional-warning count. Updates replace that same surface. Routine startup, successful history loading/compaction, model switching and unavailable reasoning-summary notices remain in shim logs, not in cards. Actual warnings (lost calls, missing IDs, failures) remain visible; partial ID coverage is shortened to `Без ID: n/total`. No client or daemon restart is needed.
 
 ## Tests
 
