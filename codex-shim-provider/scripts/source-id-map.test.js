@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { attachSourceIds, SourceIdMap, describeClasses } from "./source-id-map.js";
+import { attachSourceIds, SourceIdMap, describeClasses, assistantBlocksOf, idCoverage } from "./source-id-map.js";
 
 const blk = (text, ...sourceIds) => ({ kind: "user", text, sourceIds: sourceIds.length ? sourceIds : null });
 const h = (b) => "h:" + b.text;
@@ -66,5 +66,44 @@ describe("describeClasses", () => {
   test("null when nothing carried ids", () => {
     expect(describeClasses(["unknown", "unknown"])).toBeNull();
     expect(describeClasses(["seen", "rewritten", "new", "unknown"])).toBe("ids: seen=1 rewritten=1 new=1 noid=1");
+  });
+});
+
+describe("assistantBlocksOf", () => {
+  test("keeps assistant text and tool calls with their ids, skips other roles and empties", () => {
+    const msgs = [
+      { role: "user", content: "hi", _sourceIds: ["u1"] },
+      { role: "assistant", content: "hello", _sourceIds: ["a1"] },
+      { role: "assistant", content: null, tool_calls: [{ id: "c1", function: { name: "bash" } }], _sourceIds: ["a2"] },
+      { role: "assistant", content: "" },
+      { role: "tool", tool_call_id: "c1", content: "ok", _sourceIds: ["a2"] },
+    ];
+    const b = assistantBlocksOf(msgs);
+    expect(b.map(x => x.sourceIds)).toEqual([["a1"], ["a2"]]);
+    expect(b.every(x => x.kind === "assistant")).toBe(true);
+    expect(b[1].id).toBe("c1:bash");
+  });
+  test("assistant ids land in the map", () => {
+    const map = new SourceIdMap(":memory:");
+    const b = assistantBlocksOf([{ role: "assistant", content: "x", _sourceIds: ["a1"] }]);
+    map.markFed(b, ["h"]);
+    expect(map.classify(b[0], "h")).toBe("seen");
+    map.close();
+  });
+});
+
+describe("idCoverage", () => {
+  test("null summary when every non-system message has ids", () => {
+    const c = idCoverage([{ role: "system" }, { role: "user", _sourceIds: ["u"] }, { role: "assistant", _sourceIds: ["a"] }]);
+    expect(c.summary).toBe(null);
+    expect(c.missing).toBe(0);
+  });
+  test("reports partial gaps per role, not just all-or-nothing", () => {
+    const c = idCoverage([
+      { role: "user", _sourceIds: ["u1"] }, { role: "assistant" },
+      { role: "tool", _sourceIds: ["a"] }, { role: "user" },
+    ]);
+    expect(c.missing).toBe(2);
+    expect(c.summary).toBe("user 1/2, assistant 0/1");
   });
 });

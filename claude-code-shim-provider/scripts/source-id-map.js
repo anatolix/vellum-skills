@@ -109,3 +109,42 @@ export function describeClasses(classes) {
   if (c.seen + c.rewritten + c.new === 0) return null;
   return `ids: seen=${c.seen} rewritten=${c.rewritten} new=${c.new}${c.unknown ? ` noid=${c.unknown}` : ""}`;
 }
+
+/**
+ * Assistant turns of the wire history as id-only blocks. Never fed to a CLI (the CLI
+ * produced them itself); recorded so every Vellum row of the conversation — user,
+ * assistant and tool — is tracked in the per-session map.
+ */
+export function assistantBlocksOf(messages) {
+  const out = [];
+  for (const m of messages || []) {
+    if (m?.role !== "assistant") continue;
+    const text = typeof m.content === "string" ? m.content
+      : (m.content || []).map(p => (p && p.type === "text" ? p.text : "")).join("\n");
+    const calls = (m.tool_calls || []).map(c => `${c.id || ""}:${c.function?.name || ""}`).join(",");
+    if (!text.trim() && !calls) continue;
+    out.push({ kind: "assistant", id: calls, text: text || "", sourceIds: m._sourceIds || null });
+  }
+  return out;
+}
+
+/**
+ * Per-role id coverage of the wire messages (system excluded). Returns
+ * { counts: {role: [withIds, total]}, missing: n, summary } — summary is null when
+ * every non-system message carried ids.
+ */
+export function idCoverage(messages) {
+  const counts = {};
+  let missing = 0;
+  for (const m of messages || []) {
+    const r = m?.role;
+    if (!r || r === "system" || r === "developer") continue;
+    const c = counts[r] || (counts[r] = [0, 0]);
+    c[1]++;
+    if (Array.isArray(m._sourceIds) && m._sourceIds.length) c[0]++; else missing++;
+  }
+  const summary = missing
+    ? Object.entries(counts).filter(([, [w, t]]) => w < t).map(([r, [w, t]]) => `${r} ${w}/${t}`).join(", ")
+    : null;
+  return { counts, missing, summary };
+}

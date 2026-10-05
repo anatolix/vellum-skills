@@ -17,7 +17,7 @@ import { z } from "zod";
 import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from "./notice-transport.js";
 import { promptForSession } from "./history-rehydration.js";
 import { isOutputOnlyBatch, closeOneUseSession } from './oneuse-cleanup.js';
-import { attachSourceIds, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses } from "./source-id-map.js";
+import { attachSourceIds, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, idCoverage } from "./source-id-map.js";
 const noticeTransport = new NoticeTransport();
 const TOOL_MODE = process.env.SHIM_TOOL_MODE || "mcp"; // mcp | text
 const BATCH_IDLE_MS = Number(process.env.SHIM_BATCH_IDLE_MS || 5000);
@@ -358,6 +358,10 @@ class Chat {
   async _run(model, blocks, onMsg, effort = null, mcp = null, extra = {}) {
     const inputs = inputBlocks(blocks);
     const hashes = inputs.map((b) => sha(b.text));
+    // Assistant turns are never fed (the CLI holds its own replies) but their Vellum ids are
+    // tracked in the map too, so every row of the chat — user, assistant, tool — is covered.
+    const asst = blocks.filter((b) => b.role === "assistant");
+    const markFed = () => { this.idMap().markFed(inputs, hashes); this.idMap().markFed(asst, asst.map((b) => sha(b.text))); };
     const sys = systemText(blocks);
     const sysHash = sys ? sha(sys) : null;
     if (sysHash !== this.sysHash) {
@@ -377,7 +381,8 @@ class Chat {
     if (idSummary) console.log(`[ids] ${short(this.key)} ${idSummary}`);
     // A persistent chat without ids means the profile lacks `exportSourceIds` (or the Vellum
     // patch is not live): history is matched by text hash only — loud, so it gets fixed.
-    if (!this.oneUse && !inputs.some((b) => b.sourceIds && b.sourceIds.length)) diagnostic(onMsg, short(this.key), "⛔ Нет ID сообщений", `${this.model}; профиль без exportSourceIds — история сверяется только по хэшу`);
+    const coverage = idCoverage(blocks.filter((b) => b.role !== "tools").map((b) => ({ role: b.role, _sourceIds: b.sourceIds })));
+    if (!this.oneUse && coverage.summary) { console.log(`[ids] ${short(this.key)} MISSING ids: ${coverage.summary}`); diagnostic(onMsg, short(this.key), "⛔ Нет ID сообщений", `${this.model}; без ID: ${coverage.summary} — эти сообщения сверяются только по хэшу`); }
     let unseen = inputs.filter((_, i) => !seen.has(hashes[i]));
     // mcp mode: the tool results were handed to the CLI natively (resolveToolResults);
     // mark them seen and, if nothing else is new while a run is in flight, attach to that run.
@@ -387,7 +392,7 @@ class Chat {
       if (!unseen.length && this.cli?.done) {
         console.log(`[sess] ${short(this.key)} continuing in-flight run (tool results delivered)`);
         const res = await this.cli.attach(onMsg);
-        this.sent = [...seen]; this.idMap().markFed(inputs, hashes); this.sessionId = res.session_id || this.cli.sessionId; this.served++; this.lastUsed = Date.now(); this.save();
+        this.sent = [...seen]; markFed(); this.sessionId = res.session_id || this.cli.sessionId; this.served++; this.lastUsed = Date.now(); this.save();
         console.log(`[sess] ${short(this.key)} served #${this.served} model=${model} (continued) in=${res.usage?.input_tokens ?? "?"} cache_read=${res.usage?.cache_read_input_tokens ?? "?"} session=${this.sessionId}`);
         return res;
       }
@@ -428,7 +433,7 @@ class Chat {
         console.log(`[sess] ${short(this.key)} cli${this.cli.id} ${why} blocks=${inputs.length} seen=${this.sent.length}`);
         const tPrep = Date.now() - t0;
         for (const h of hashes) seen.add(h);
-        if (TOOL_MODE === "mcp") { this.sent = [...seen]; this.idMap().markFed(inputs, hashes); this.save(); }
+        if (TOOL_MODE === "mcp") { this.sent = [...seen]; markFed(); this.save(); }
         // emitted at the point of the actual send so any re-feed path is caught, foreseen or not
         for (const note of this.pendingNotices.splice(0)) shimNotice(onMsg, short(this.key), note);
         this.save();
@@ -443,7 +448,7 @@ class Chat {
         else if (skippedOld.length) diagnostic(onMsg, short(this.key), "Не отправлено", `${model}; ${skippedOld.length} старых блоков (~${Math.round(skippedOld.reduce((n, b) => n + b.text.length, 0) / 1000)}K симв.): история переписана, CLI видел исходники`);
         else if (prior.size && lastSeenIdx < 0) diagnostic(onMsg, short(this.key), "История не совпала", `отправляю=${unseen.length}; видено=0/${inputs.length}`);
         const res = await this.cli.send(prompt, (m) => { produced = true; onMsg(m); });
-        this.sent = [...seen]; this.idMap().markFed(inputs, hashes); this.sessionId = res.session_id || this.cli.sessionId; this.model = model; this.effort = effort ?? null; this.served++; this.lastUsed = Date.now();
+        this.sent = [...seen]; markFed(); this.sessionId = res.session_id || this.cli.sessionId; this.model = model; this.effort = effort ?? null; this.served++; this.lastUsed = Date.now();
         res.shim_actual_model = this.cli?.actualModel ?? null;
         this.save();
         if (res.subtype && res.subtype !== "success") console.log(`[sess] ${short(this.key)} result subtype=${res.subtype} ${String(res.result || "").slice(0, 120)}`);

@@ -26,7 +26,7 @@ import { promptForSession } from "./history-rehydration.js";
 import { codexThreadConfig, codexResumeParams } from "./thread-config.js";
 import { createSseWriter } from "./sse-writer.js";
 import { prepareNativeSafeModelCatalog, failClosedApprovalResponse } from "./native-tool-policy.js";
-import { attachSourceIds, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses } from "./source-id-map.js";
+import { attachSourceIds, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, assistantBlocksOf, idCoverage } from "./source-id-map.js";
 const noticeTransport = new NoticeTransport();
 const threadOwners = new Map();
 
@@ -502,6 +502,8 @@ async function handleChat(req) {
   const knownVolatile = rememberVolatileTools(tools);
   attachSourceIds(messages, body._vellum);
   const blocks = blocksOf(messages);
+  const assistantBlocks = assistantBlocksOf(messages); // id tracking only, never fed
+  const coverage = idCoverage(messages);
 
   // Session key: explicit prompt_cache_key → X-Conversation-Id header (local Vellum
   // patch in providers/retry.ts). NO silent fallback: a keyless request would mean a
@@ -586,7 +588,7 @@ async function handleChat(req) {
     });
     const idSummary = describeClasses(idCls);
     if (idSummary) log(`[ids] key=${key.slice(0, 12)} ${idSummary}`);
-    if (!oneUse && !blocks.some((b) => b.sourceIds && b.sourceIds.length)) pendingNoIdsNotice = true;
+    if (!oneUse && coverage.summary) { pendingNoIdsNotice = coverage.summary; log(`[ids] key=${key.slice(0, 12)} MISSING ids: ${coverage.summary}`); }
     let lastSeen = -1;
     for (let i = 0; i < blocks.length; i++) if (seen.has(hashes[i])) lastSeen = i;
     // A block whose hash changed but whose last 200 chars match a block this thread already
@@ -719,7 +721,7 @@ async function handleChat(req) {
         if (compactLocks.has(state.threadId)) { await awaitCompactLock(state.threadId, key.slice(0, 12)); const fresh = loadState(key); if (fresh?.pendingCompactNotice) state.pendingCompactNotice = fresh.pendingCompactNotice; }
         if (state.pendingCompactNotice) { notice("Компакция", state.pendingCompactNotice); delete state.pendingCompactNotice; persistState(key, state); }
         else if (skipped.length) notice("Не отправлено", `${model}; ${skipped.length} старых блоков (~${Math.round(skipped.reduce((n, b) => n + b.text.length, 0) / 1000)}K симв.): история переписана, тред видел исходники`);
-        if (pendingNoIdsNotice) notice("⛔ Нет ID сообщений", `${model}; профиль без exportSourceIds — история сверяется только по хэшу`);
+        if (pendingNoIdsNotice) notice("⛔ Нет ID сообщений", `${model}; без ID: ${pendingNoIdsNotice} — эти сообщения сверяются только по хэшу`);
         if (feedCount > MAX_FEED) notice("Большой контекст", `${model}; +${feedCount} блоков; видено=${blocks.length-feedCount}/${blocks.length}`);
         // --- run turn (handlers FIRST — answering a parked call resumes the turn immediately) ---
         const parkedCalls = [];
@@ -835,6 +837,7 @@ async function handleChat(req) {
         // mark fed
         state.sent = blocks.map(blockHash);
         idMap.markFed(blocks, state.sent);
+        idMap.markFed(assistantBlocks, assistantBlocks.map(blockHash));
         state.meta = Object.fromEntries(blocks.map(b => [blockHash(b), blockMeta(b)])); // per-block len/head/tail for history-edit forensics
         persistState(key, state);
 
