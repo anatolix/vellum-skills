@@ -29,7 +29,7 @@ Run setup commands from this skill's directory. Use live `/v1/models`, not a har
 - Reject missing `prompt_cache_key` / `X-Conversation-Id` with HTTP **400** before inference. No silent derived session key in normal operation. `SHIM_ALLOW_KEYLESS=1` exists for manual debugging only.
 - Feed only unseen user/tool blocks; assistant history is not re-fed. Log and stream a replay warning only for **more than 8 unseen blocks** by default (`SHIM_MAX_FEED`). Previously seen history and retry replay do not count.
 - Show start (fresh/from file), replacement, large-context (>8 fed, fresh AND existing threads), app-server exit, lost tool calls and errors as short red in-chat notices via `scripts/notice-transport.js` (fake failed `__shim_notice__` call; copy it beside `server-v2.js`). Read [references/shim-notices.md](references/shim-notices.md) before changing texts. A thread is not a newly spawned CLI: one app-server process can own many threads.
-- Keep the JSON-RPC reader nonblocking. Park dynamic calls, save their RPC IDs immediately, install the next HTTP handler before answering them, and do not resume a thread already live in app-server. RPC ID **0 is valid**.
+- Keep the JSON-RPC reader nonblocking. The **thread**, not an HTTP response, owns the dynamic-call queue: native exec can yield and issue more calls after the response closes. Persist RPC IDs + arguments + delivery state immediately; deliver undelivered calls on the next HTTP request; install its handler before answering real tool results. Never return `{}` for a detached call. Unknown/completed/replaced owners receive a valid `success:false` response. Do not resume a thread already live in app-server. RPC ID **0 is valid**. `/chats` reports live handlers, running threads and queued calls.
 - Keep invisible Codex-native shell/unified-exec/multi-agent features off by default. Tools supplied by Vellum remain dynamic caller-owned tools. This package does **not** include a Codex MCP adapter; Claude's bridge is untouched.
 - Request `summary: "detailed"` and the caller's effort on **each turn**; an effort the model does not advertise is a 400 `unsupported_effort` before inference (no guessing, no snapping). Forward real readable reasoning; otherwise emit the positive, valid `tokenUsage.last.reasoningOutputTokens` count as `reasoning_content` at the HTTP response boundary. Do not decode encrypted content, use lifetime totals, fabricate reasoning, duplicate a summary, or claim the counter is live.
 
@@ -40,6 +40,8 @@ Read [references/architecture.md](references/architecture.md) when changing code
 ```bash
 python3 tests/test-reasoning.py
 python3 tests/test-patch.py
+python3 tests/test-late-tools.py
+bun test scripts/
 bash -n scripts/run.sh scripts/patch-vellum-retry.sh
 ```
 

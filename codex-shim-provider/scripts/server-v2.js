@@ -25,6 +25,7 @@ import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from ".
 import { promptForSession, foreignReplyText } from "./history-rehydration.js";
 import { codexThreadConfig, codexResumeParams } from "./thread-config.js";
 import { createSseWriter } from "./sse-writer.js";
+import { pendingToolCalls, parkToolCall, markToolsDelivered, toolFailure } from "./parked-tools.js";
 import { prepareNativeSafeModelCatalog, failClosedApprovalResponse } from "./native-tool-policy.js";
 import { attachSourceIds, replyIdOf, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, assistantBlocksOf, idCoverage, describeMissing, describeReconcile } from "./source-id-map.js";
 const noticeTransport = new NoticeTransport({source: "codex-shim"});
@@ -153,6 +154,10 @@ srv.onExit = code => {
 srv.onNotification = (method, p) => {
   const h = p.threadId && threadHandlers.get(p.threadId);
   if (h) h.notif(method, p);
+  else if (method === "turn/completed") {
+    const owner = threadOwners.get(p.threadId);
+    if (owner) owner.running = false;
+  }
 };
 srv.onServerRequest = async m => {
   const h = m.params?.threadId && threadHandlers.get(m.params.threadId);
@@ -160,13 +165,28 @@ srv.onServerRequest = async m => {
   if (m.method === "currentTime/read") return { currentTimeAt: Math.floor(Date.now() / 1000) };
   if (m.method === "item/tool/call") {
     const owner = threadOwners.get(m.params?.threadId);
-    const warning = noticeText("codex-shim", "Вызов инструмента потерян", `${m.params?.tool || "?"}; обработчик запроса уже завершён`);
+    if (owner?.state && owner.running && !owner.retired) return parkDynamicCall(owner, m);
+    const warning = noticeText("codex-shim", "Вызов инструмента отклонён", `${m.params?.tool || "?"}; нет живого владельца треда`);
     if (owner?.key) noticeTransport.queue(owner.key, warning);
-    log(`[guard] ⚠ tool call for thread with NO live handler (thread=${m.params?.threadId}) — answering EMPTY, model will see nothing`);
+    log(`[guard] ⚠ tool call for thread with NO live owner (thread=${m.params?.threadId}) — refused`);
+    return toolFailure("The upstream turn no longer has a live caller. This tool was not executed.");
   }
   else dbg("[unhandled server request]", m.method);
   return {};
 };
+
+function parkDynamicCall(owner, m) {
+  if (!owner.running || owner.retired) return toolFailure("The upstream turn is completed or replaced. This tool was not executed.");
+  if (isVolatileTool(m.params.tool) && !owner.allToolNames.includes(m.params.tool)) {
+    log(`[tool] ${m.params.tool} unavailable for the current client — not queued`);
+    return toolFailure(`Tool ${m.params.tool} is not available on the current device. Continue without it.`);
+  }
+  const callId = parkToolCall(owner.state, m, "call_" + Math.random().toString(36).slice(2));
+  persistState(owner.key, owner.state);
+  log(`[tool] queued ${m.params.tool} call=${callId} detached=${!threadHandlers.has(owner.state.threadId)}`);
+  // The original RPC stays pending until Vellum returns a real result.
+  return new Promise(() => {});
+}
 
 function models() {
   if (process.env.SHIM_MODELS) return process.env.SHIM_MODELS.split(",").map(s => s.trim()).filter(Boolean);
@@ -180,7 +200,6 @@ function saveState(key, st) { writeFileSync(sessPath(key), JSON.stringify(st)); 
 // Vellum row id <-> block hash per chat: one SQLite file next to the session JSON, kept open
 // for the process lifetime. A failure to open degrades that chat to hash-only matching.
 const idMaps = new Map();
-let loggedToolCallShape = false; // patch 9: log item/tool/call param keys once per process
 function openIdMap(key) {
   let m = idMaps.get(key);
   if (!m) {
@@ -208,6 +227,7 @@ function destroyOneUseState(key, st, reason) {
   if (!st?.threadId) return;
   liveThreads.delete(st.threadId);
   threadHandlers.delete(st.threadId);
+  threadOwners.delete(st.threadId);
   // The app-server process is shared by all chats, so it cannot be killed per request.
   // thread/delete is the protocol-level equivalent: the one-use thread is actually
   // released upstream instead of merely disappearing from our maps.
@@ -495,7 +515,7 @@ async function handleCompaction({ req, key, model, blocks, lastUserBlock, effort
 }
 
 // ---------- HTTP ----------
-function sse(res, obj) { res.write(`data: ${JSON.stringify(obj)}\n\n`); }
+function sse(res, obj) { return res.write(`data: ${JSON.stringify(obj)}\n\n`); }
 const cid = () => "chatcmpl-" + Math.random().toString(36).slice(2);
 function jsonResp(obj, status = 200) {
   return new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
@@ -565,6 +585,10 @@ async function handleChat(req) {
   const idMap = oneUse ? NULL_SOURCE_ID_MAP : openIdMap(key);
   blocks = blocksOf(messages, idMap); // + another model's assistant rows, rendered as text
   let state = oneUse ? (oneUseStates.get(key) ?? null) : key ? loadState(key) : null;
+  // Reuse the canonical live state: detached tool calls can arrive during an
+  // asynchronous thread/resume or request setup. Never overwrite them with a stale disk copy.
+  const liveOwner = state && threadOwners.get(state.threadId);
+  if (liveOwner?.state && !liveOwner.retired) state = liveOwner.state;
   // One-time migration: sessions fingerprinted before volatile tools were excluded. Match on the
   // legacy hash and re-key silently instead of invalidating every live chat after this deploy.
   if (state && state.model === model && state.fingerprint !== fingerprint && state.fingerprint === legacyFingerprint) {
@@ -673,7 +697,7 @@ async function handleChat(req) {
   let toolResults = toFeed.filter(b => b.kind === "tool");
   const isPromptBlock = b => b.kind === "user" || b.kind === "assistant"; // assistant here == foreign (blocksOf)
   let userBlocks = toFeed.filter(isPromptBlock);
-  if (!userBlocks.length && !toolResults.length) {
+  if (!userBlocks.length && !toolResults.length && !pendingToolCalls(state).length) {
     // Everything was already fed but the caller asks again: the previous answer
     // was lost (shim/app-server restart mid-turn, client retry, dropped stream).
     // Replay the trailing unanswered block(s) as a new turn instead of 400-ing.
@@ -720,6 +744,10 @@ async function handleChat(req) {
           log(`[guard] NEW THREAD key=${key.slice(0, 12)} reason=${invalidReason ? "state invalidated: " + invalidReason : "no prior state"} feed=${feedCount} blocks (~${feedChars} chars) sys=${sys.length} chars tools=${tools ? tools.length : 0}`);
           if (prevState) log(`[guard] DIFF prev: thread=${prevState.threadId} model=${prevState.model} sent=${(prevState.sent || []).length} blocks fp=${String(prevState.fingerprint).slice(0, 8)}`);
           if (prevState) notice("Сессия заменена", [prevState.model !== model ? `${prevState.model} → ${model}` : null, prevState.fingerprint !== fingerprint ? fpDiff(prevState, sys, toolNames, key) : null].filter(Boolean).join("; "));
+          if (prevState) {
+            const retired = threadOwners.get(prevState.threadId);
+            if (retired) retired.retired = true;
+          }
           const toDyn = t => ({ type: "function", name: t.function.name,
             description: t.function.description || "", inputSchema: t.function.parameters || { type: "object" } });
           // offer every volatile tool ever seen, not just this request's — the thread can't gain tools later
@@ -767,7 +795,8 @@ async function handleChat(req) {
           }
         }
 
-        if (!oneUse) threadOwners.set(state.threadId, {key, model});
+        const owner = { key, model, state, allToolNames, running: true, retired: false };
+        threadOwners.set(state.threadId, owner);
         if (compactLocks.has(state.threadId)) { await awaitCompactLock(state.threadId, key.slice(0, 12)); const fresh = loadState(key); if (fresh?.pendingCompactNotice) state.pendingCompactNotice = fresh.pendingCompactNotice; }
         if (state.pendingCompactNotice) { notice("Компакция", state.pendingCompactNotice); delete state.pendingCompactNotice; persistState(key, state); }
         else if (skipped.length) notice("Не отправлено", `${model}; ${skipped.length} старых блоков (~${Math.round(skipped.reduce((n, b) => n + b.text.length, 0) / 1000)}K симв.): история переписана, тред видел исходники`);
@@ -777,7 +806,7 @@ async function handleChat(req) {
         }
         if (feedCount > MAX_FEED) notice("Большой контекст", `${model}; +${feedCount} блоков; видено=${blocks.length-feedCount}/${blocks.length}`);
         // --- run turn (handlers FIRST — answering a parked call resumes the turn immediately) ---
-        const parkedCalls = [];
+        let parkedCalls = []; // snapshots from the session queue, not a request-local inbox
         const usage = { input: 0, output: 0, cached: 0, reasoning: null };
         let agentBuf = "";
         let done = false, turnError = null;
@@ -840,6 +869,7 @@ async function handleChat(req) {
               usage.reasoning = Number.isSafeInteger(reasoning) && reasoning >= 0 ? reasoning : null;
             } else if (method === "turn/completed") {
               done = true;
+              owner.running = false;
               // no userMessage item seen this turn: at least pin the user blocks to the turn id
               if (!userItemRecorded && userBlocks.length && p.turn?.id) { userItemRecorded = true; try { idMap.recordUserFed(userBlocks, `turn:${p.turn.id}`, state.threadId); } catch (e) { log(`[ids] record user failed: ${e.message}`); } }
               log(`[turn] ${elapsed()} completed status=${p.turn?.status || "?"} reasoning=${reasoningChars}ch reasoningTokens=${usage.reasoning ?? "?"} text=${agentBuf.length}ch`);
@@ -848,27 +878,7 @@ async function handleChat(req) {
           },
           request: async m => {
             if (m.method === "item/tool/call") {
-              if (isVolatileTool(m.params.tool) && !allToolNames.includes(m.params.tool)) {
-                // tool exists in the thread but not for the client currently connected — don't park
-                // (Vellum would reject an unknown tool call); tell the model and let the turn continue
-                log(`[tool] ${m.params.tool} unavailable for the current client — error returned, not parked`);
-                return { contentItems: [{ type: "inputText", text: `Tool ${m.params.tool} is not available right now: the user's current device/client does not support it. Continue without it (for example, ask the user in plain text).` }], success: false };
-              }
-              // park: ends this HTTP response as tool_calls; answered by a later request
-              const callId = "call_" + Math.random().toString(36).slice(2);
-              // patch 9: the call's full Vellum id is known now (reply row/<call id>); the Codex-side
-              // id is whatever the app-server exposes for the item (logged once so the shape is on record).
-              let toolCliId = null;
-              if (replyId) {
-                const cliId = toolCliId = m.params.callId || m.params.itemId || m.params.id || `rpc:${m.id}`;
-                if (!loggedToolCallShape) { loggedToolCallShape = true; log(`[ids] item/tool/call params keys: ${Object.keys(m.params || {}).join(",")}`); }
-                try { idMap.recordCli(`${replyId}/${callId}`, cliId, "tool_use", { part: callId, session: state.threadId }); } catch (e) { log(`[ids] record tool call failed: ${e.message}`); }
-              }
-              state.parked[callId] = { rpcId: m.id, name: m.params.tool, cliId: toolCliId || m.params.callId || m.params.itemId || null };
-              parkedCalls.push({ callId, name: m.params.tool, arguments: m.params.arguments });
-              log(`[tool] parked ${m.params.tool}`);
-              persistState(key, state);
-              return new Promise(() => {}); // never resolved here; answered via srv.respond later
+              return parkDynamicCall(owner, m);
             }
             if (m.method === "currentTime/read") return { currentTimeAt: Math.floor(Date.now() / 1000) };
             const deniedApproval = failClosedApprovalResponse(m.method);
@@ -879,6 +889,16 @@ async function handleChat(req) {
             return {};
           },
         });
+
+        // Client-dependent tools may have been queued while the old device was
+        // connected. Fail them explicitly if this request cannot execute them.
+        for (const call of pendingToolCalls(state)) {
+          if (!isVolatileTool(call.name) || allToolNames.includes(call.name)) continue;
+          const parked = state.parked[call.callId];
+          srv.respond(parked.rpcId, toolFailure(`Tool ${call.name} is unavailable on the current device; it was not executed.`));
+          delete state.parked[call.callId];
+          persistState(key, state);
+        }
 
         // --- answer parked tool calls, if any (resumes the paused turn) ---
         if (Object.keys(state.parked || {}).length && toolResults.length) {
@@ -917,8 +937,8 @@ async function handleChat(req) {
         const deadline = Date.now() + 180000;
         let lastBeat = Date.now();
         while (!done && Date.now() < deadline) {
-          if (parkedCalls.length) {
-            await new Promise(r => setTimeout(r, 300)); // let chained calls park too
+          if (pendingToolCalls(state).length) {
+            await new Promise(r => setTimeout(r, 300)); // batch only; correctness does not depend on this grace period
             break;
           }
           if (Date.now() - lastBeat > 15000) {
@@ -927,6 +947,7 @@ async function handleChat(req) {
           }
           await new Promise(r => setTimeout(r, 120));
         }
+        parkedCalls = pendingToolCalls(state);
         if (!done && !parkedCalls.length) log(`[turn] ${elapsed()} TIMEOUT waiting for turn completion`);
 
         // Wait until the response boundary to choose the fallback: a real summary
@@ -944,7 +965,19 @@ async function handleChat(req) {
           const tc = parkedCalls.map((c, i) => ({ index: i, id: c.callId, type: "function",
             function: { name: c.name, arguments: typeof c.arguments === "string" ? c.arguments : JSON.stringify(c.arguments ?? {}) } }));
           if (tools && agentBuf) sse(res, { ...base, choices: [{ index: 0, delta: { content: agentBuf } }] });
-          sse(res, { ...base, choices: [{ index: 0, delta: { tool_calls: tc } }] });
+          if (sse(res, { ...base, choices: [{ index: 0, delta: { tool_calls: tc } }] })) {
+            // The late call belongs to THIS Vellum reply, not the earlier HTTP
+            // response that happened to start the still-running upstream turn.
+            for (const call of parkedCalls) {
+              const parked = state.parked[call.callId];
+              if (replyId && parked) {
+                try { idMap.recordCli(`${replyId}/${call.callId}`, parked.cliId, "tool_use", { part: call.callId, session: state.threadId }); }
+                catch (e) { log(`[ids] record tool call failed: ${e.message}`); }
+              }
+            }
+            markToolsDelivered(state, parkedCalls);
+            persistState(key, state);
+          }
           finish("tool_calls");
           log(`[res] tool_calls=${parkedCalls.map(c => c.name).join(",")} ${Date.now() - t0}ms`);
         } else if (turnError) {
@@ -966,7 +999,7 @@ async function handleChat(req) {
         res.close();
         threadHandlers.delete(state.threadId);
         if (oneUse) {
-          if (parkedCalls.length) {
+          if (Object.keys(state.parked || {}).length) {
             persistState(key, state); // tool round trip pending: keep state in memory until it lands
           } else {
             destroyOneUseState(key, state, "turn done");
@@ -1007,7 +1040,10 @@ async function handleRequest(req) {
         return { file: f, model: st.model, threadId: st.threadId, parked: Object.keys(st.parked || {}).length,
           ageMin: Math.round((Date.now() - statSync(join(SESS_DIR, f)).mtimeMs) / 60000) };
       });
-      return jsonResp({ chats });
+      return jsonResp({ chats, activeHttpHandlers: threadHandlers.size,
+        runningThreads: [...threadOwners.values()].filter(owner => owner.running && !owner.retired).length,
+        queuedToolCount: [...threadOwners.values()].filter(owner => !owner.retired)
+          .reduce((n, owner) => n + pendingToolCalls(owner.state).length, 0) });
     }
     return jsonResp({ error: "not found" }, 404);
 }
