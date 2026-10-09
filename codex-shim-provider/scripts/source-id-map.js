@@ -24,6 +24,10 @@ import { Database } from "bun:sqlite";
 // an empty assistant row exports its id too. Both read the same way here: opaque strings.
 // v3 (Vellum patch 9): adds `reply_id` — the row Vellum reserved for the reply to this very request
 // (see replyIdOf), so the shim can key what it generates before Vellum ever echoes it back.
+// An existing cli_ids pair does not repair a missing wire tag: without the
+// upstream row id there is no exact lookup key. Vellum must preserve block
+// provenance before joining text. Restored ids reuse the existing map; never
+// infer an owner from the joined text or reset the CLI session to repair this.
 export function attachSourceIds(messages, vellum) {
   if (!Array.isArray(messages) || !vellum || !(vellum.version >= 1 && vellum.version <= 3) || !Array.isArray(vellum.messages)) return 0;
   let n = 0;

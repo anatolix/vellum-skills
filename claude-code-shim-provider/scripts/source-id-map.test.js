@@ -254,3 +254,39 @@ describe("foreign assistant rows (model switch, Oct 5)", () => {
     m.close();
   });
 });
+
+describe("Vellum text-only reload provenance regression", () => {
+  test("restored wire ids reuse exact CLI links without resetting the map", () => {
+    const map = new SourceIdMap(":memory:");
+    try {
+      // Each neutral text block can belong to a different persisted row.
+      // Vellum must join only the wire text and export every contributing id.
+      const text = "<turn_context>old</turn_context>\n\nисчерпали";
+      const known = blk(text, "row-A", "row-B");
+      map.markFed([known], [h(known)]);
+      map.recordUserFed([known], "original-cli-user", "original-session");
+
+      // The historical bug collapsed neutral blocks and omitted _vellum ids.
+      // A saved CLI pair does NOT prove the current wire request is covered.
+      const broken = [{ role: "system", content: "sys" }, { role: "user", content: text }];
+      expect(idCoverage(broken).missing).toBe(1);
+      expect(map.classify(blk(text), h(known))).toBe("unknown");
+
+      const restored = [{ role: "system", content: "sys" }, { role: "user", content: text }];
+      expect(attachSourceIds(restored, {
+        version: 3,
+        messages: [{ index: 1, source_ids: ["row-A", "row-B"] }],
+      })).toBe(1);
+      expect(idCoverage(restored).missing).toBe(0);
+      const recovered = blk(restored[1].content, ...restored[1]._sourceIds);
+      expect(map.classify(recovered, h(recovered))).toBe("seen");
+      expect(map.classify(blk(text + " (new rendering)", ...restored[1]._sourceIds), "new-hash")).toBe("rewritten");
+      expect(map.db.query("SELECT vellum_id, cli_id, fed, session FROM cli_ids ORDER BY vellum_id").all()).toEqual([
+        { vellum_id: "row-A", cli_id: "original-cli-user", fed: 1, session: "original-session" },
+        { vellum_id: "row-B", cli_id: "original-cli-user", fed: 1, session: "original-session" },
+      ]);
+    } finally {
+      map.close();
+    }
+  });
+});
