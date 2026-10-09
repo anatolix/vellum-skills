@@ -25,6 +25,7 @@ import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from ".
 import { promptForSession, foreignReplyText } from "./history-rehydration.js";
 import { codexThreadConfig, codexResumeParams } from "./thread-config.js";
 import { createSseWriter } from "./sse-writer.js";
+import { recordCodexUsage, pendingCodexUsage, codexUsageChunk, acknowledgeCodexUsage } from "./usage-accounting.js";
 import { pendingToolCalls, parkToolCall, markToolsDelivered, toolFailure } from "./parked-tools.js";
 import { prepareNativeSafeModelCatalog, failClosedApprovalResponse } from "./native-tool-policy.js";
 import { attachSourceIds, replyIdOf, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, assistantBlocksOf, idCoverage, describeMissing, describeReconcile } from "./source-id-map.js";
@@ -152,6 +153,10 @@ srv.onExit = code => {
   liveThreads.clear(); threadOwners.clear();
 };
 srv.onNotification = (method, p) => {
+  if (method === "thread/tokenUsage/updated") {
+    const owner = threadOwners.get(p.threadId);
+    if (owner?.state && !owner.retired && recordCodexUsage(owner.state, p.tokenUsage, p.turnId)) persistState(owner.key, owner.state);
+  }
   const h = p.threadId && threadHandlers.get(p.threadId);
   if (h) h.notif(method, p);
   else if (method === "turn/completed") {
@@ -435,7 +440,7 @@ async function handleCompaction({ req, key, model, blocks, lastUserBlock, effort
   const stream = new ReadableStream({ async start(controller) {
     res = createSseWriter(controller);
     const ka = setInterval(() => res.write(": keepalive\n\n"), 15000);
-    const usage = { input: 0, output: 0, cached: 0 };
+    const usageState = {};
     const timeFn = async m => (m.method === "currentTime/read" ? { currentTimeAt: Math.floor(Date.now() / 1000) } : {});
     try {
       // 1) side summary in a fork
@@ -445,7 +450,7 @@ async function handleCompaction({ req, key, model, blocks, lastUserBlock, effort
       threadHandlers.set(fid, {
         notif: (method, p) => {
           if (method === "item/agentMessage/delta") text += p.delta || "";
-          else if (method === "thread/tokenUsage/updated") { const u = p.tokenUsage?.last || {}; usage.input = u.inputTokens || 0; usage.output = u.outputTokens || 0; usage.cached = u.cachedInputTokens || 0; }
+          else if (method === "thread/tokenUsage/updated") recordCodexUsage(usageState, p.tokenUsage, p.turnId);
           else if (method === "turn/completed") { done = true; if (p.turn?.status === "failed" || p.turn?.error) turnError = p.turn?.error?.message || JSON.stringify(p.turn?.error || "turn failed"); }
         },
         request: async m => {
@@ -467,10 +472,12 @@ async function handleCompaction({ req, key, model, blocks, lastUserBlock, effort
         const fx = fixTailStart(text, blocks); if (fx.fixed) { log(`[compact] ${tag} tail_start did not resolve (${fx.was}) — substituted second-to-last user turn`); text = fx.text; }
         dumpCompaction(tag, text);
       }
+      const usage = pendingCodexUsage(usageState);
       log(`[compact] ${tag} fork summary ${text.length} chars in ${Date.now() - f0}ms valid=${ok} in=${usage.input} cached=${usage.cached} out=${usage.output}`);
       sse(res, { ...base, choices: [{ index: 0, delta: { role: "assistant", content: text } }] });
       sse(res, { ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
-      sse(res, { ...base, choices: [], usage: { prompt_tokens: usage.input, completion_tokens: usage.output, total_tokens: usage.input + usage.output, prompt_tokens_details: { cached_tokens: usage.cached } } });
+      const chunk = codexUsageChunk(usage);
+      if (chunk) sse(res, { ...base, choices: [], usage: chunk });
       res.write("data: [DONE]\n\n");
       res.close();
       // 2) native compaction of the live thread — detached from Vellum's stream (it already has the
@@ -773,6 +780,13 @@ async function handleChat(req) {
           const restoredMessages = messages.filter(m => ["user", "assistant", "tool"].includes(m.role));
           if (restoredMessages.length > 1) notice("История загружена", `${model}; ${restoredMessages.length} сообщений`);
           state = { threadId, sent: [], model, fingerprint, parked: {}, sys, toolNames };
+          if (prevState?.usageAccounting) {
+            const previousUsage = prevState.usageAccounting;
+            // Carry only undelivered usage; the old thread's total is NOT the
+            // baseline of the new thread. Retired notifications cannot overwrite it.
+            state.usageAccounting = { total: null, pending: { ...previousUsage.pending },
+              reasoningKnown: previousUsage.reasoningKnown, fallback: null };
+          }
           idMap.reset(); // fresh thread: nothing has been fed to it yet
           persistState(key, state);
           log("[guard] thread started:", threadId, "model:", model);
@@ -807,7 +821,7 @@ async function handleChat(req) {
         if (feedCount > MAX_FEED) notice("Большой контекст", `${model}; +${feedCount} блоков; видено=${blocks.length-feedCount}/${blocks.length}`);
         // --- run turn (handlers FIRST — answering a parked call resumes the turn immediately) ---
         let parkedCalls = []; // snapshots from the session queue, not a request-local inbox
-        const usage = { input: 0, output: 0, cached: 0, reasoning: null };
+        let usage = pendingCodexUsage(state);
         let agentBuf = "";
         let done = false, turnError = null;
         let userItemRecorded = false; // patch 9b: user rows paired once per turn
@@ -860,13 +874,10 @@ async function handleChat(req) {
                 const summary = textOf(p.item.summary);
                 emitReasoning(summary.trim() ? summary : textOf(p.item.content), p.item.id);
               }
-            } else if (method === "thread/tokenUsage/updated" && p.tokenUsage?.last) {
-              usage.input = p.tokenUsage.last.inputTokens ?? usage.input;
-              usage.output = p.tokenUsage.last.outputTokens ?? usage.output;
-              usage.cached = p.tokenUsage.last.cachedInputTokens ?? usage.cached;
-              // last is this model step; total is the entire thread, not this response.
-              const reasoning = p.tokenUsage.last.reasoningOutputTokens;
-              usage.reasoning = Number.isSafeInteger(reasoning) && reasoning >= 0 ? reasoning : null;
+            } else if (method === "thread/tokenUsage/updated") {
+              // The global observer has already persisted this notification,
+              // including any steps that arrived between HTTP handlers.
+              usage = pendingCodexUsage(state);
             } else if (method === "turn/completed") {
               done = true;
               owner.running = false;
@@ -954,6 +965,7 @@ async function handleChat(req) {
         // may arrive after usage. Emit once, before finish/tool_calls, including on
         // tool pauses and failed turns. A blank summary separator isn't real thinking.
         // Usage is reported after a model step, not continuously while it is thinking.
+        usage = pendingCodexUsage(state);
         if (!hasReadableReasoning && usage.reasoning > 0) {
           notice("Reasoning недоступен", `${model}; ${usage.reasoning} токенов без summary`);
           log(`[turn] ${elapsed()} reasoning summary unavailable tokens=${usage.reasoning}`);
@@ -987,13 +999,10 @@ async function handleChat(req) {
           if (tools && agentBuf) sse(res, { ...base, choices: [{ index: 0, delta: { content: agentBuf } }] });
           finish("stop");
         }
-        if (usage.input || usage.output || usage.reasoning !== null) {
-          sse(res, { ...base, choices: [], usage: {
-            prompt_tokens: usage.input, completion_tokens: usage.output,
-            total_tokens: usage.input + usage.output,
-            prompt_tokens_details: { cached_tokens: usage.cached },
-            ...(usage.reasoning !== null ? { completion_tokens_details: { reasoning_tokens: usage.reasoning } } : {}),
-          }});
+        const usageChunk = codexUsageChunk(usage);
+        if (usageChunk && sse(res, { ...base, choices: [], usage: usageChunk })) {
+          acknowledgeCodexUsage(state, usage);
+          persistState(key, state);
         }
         res.write("data: [DONE]\n\n");
         res.close();

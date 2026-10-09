@@ -18,6 +18,7 @@ import { z } from "zod";
 import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from "./notice-transport.js";
 import { promptForSession, foreignReplyText } from "./history-rehydration.js";
 import { isOutputOnlyBatch, closeOneUseSession } from './oneuse-cleanup.js';
+import { ClaudeUsageAccounting } from "./usage-accounting.js";
 import { attachSourceIds, replyIdOf, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, idCoverage, describeMissing, describeReconcile } from "./source-id-map.js";
 const noticeTransport = new NoticeTransport({ source: "claude-shim" });
 const TOOL_MODE = process.env.SHIM_TOOL_MODE || "mcp"; // mcp | text
@@ -96,6 +97,7 @@ class Cli {
     this.effort = effort ?? null;
     this.actualModel = null;
     this.extra = extra;
+    this.usageAccounting = extra.usageAccounting || new ClaudeUsageAccounting();
     this.toolNames = mcp?.names ?? [];
     this.toolSig = mcp?.sig ?? null;
     this.label = label;
@@ -164,6 +166,9 @@ class Cli {
         if (msg.type === "result" && msg.session_id) this.sessionId = msg.session_id;
         if (msg.type === "assistant" && msg.message?.model && msg.message.model !== this.actualModel) { this.actualModel = msg.message.model; console.log(`[cli${this.id} ${this.label}] serving model=${this.actualModel}`); }
         if (msg.type === "rate_limit_event") manager.noteRateLimit(msg.rate_limit_info);
+        if (this.usageAccounting.observe(msg)) this.extra.onUsage?.();
+        // Local metadata only; never sent to the SDK or included in model text.
+        msg.shim_usage_accounting = this.usageAccounting;
         if (this.onMsg) this.onMsg(msg);
         if (msg.type === "result" && this.done) {
           const d = this.done; this.done = null; this.onMsg = null;
@@ -214,6 +219,7 @@ class Cli {
   send(content, onMsg) {
     return new Promise((resolve, reject) => {
       if (!this.alive) return reject(new Error("cli closed"));
+      this.usageAccounting.startRun();
       this.done = { resolve, reject };
       this.onMsg = onMsg;
       this.inbox.push(content);
@@ -257,6 +263,7 @@ class Chat {
   constructor(key, saved = null) {
     this.key = key;
     this.sessionId = saved?.sessionId ?? null;
+    this.usageAccounting = new ClaudeUsageAccounting(saved?.usageAccounting);
     this.sent = saved?.sent ?? [];        // sha1 of every input block already fed to the session
     this.meta = saved?.meta ?? {};        // hash -> {len, head, tail} of fed blocks, for history-edit forensics
     this.pendingCompactNotice = saved?.pendingCompactNotice ?? null;
@@ -286,7 +293,7 @@ class Chat {
   save() {
     if (this.oneUse) return; // one-use chats are never persisted
     try {
-      writeFileSync(this.file(), JSON.stringify({ key: this.key, sessionId: this.sessionId, model: this.model, sent: this.sent, meta: this.meta, pendingCompactNotice: this.pendingCompactNotice, sysHash: this.sysHash, effort: this.effort, lastUsed: this.lastUsed, served: this.served, savedAt: Date.now(), pendingNotices: this.pendingNotices, parkedWhy: this.parkedWhy }));
+      writeFileSync(this.file(), JSON.stringify({ key: this.key, sessionId: this.sessionId, model: this.model, sent: this.sent, meta: this.meta, pendingCompactNotice: this.pendingCompactNotice, sysHash: this.sysHash, effort: this.effort, lastUsed: this.lastUsed, served: this.served, savedAt: Date.now(), usageAccounting: this.usageAccounting.snapshot(), pendingNotices: this.pendingNotices, parkedWhy: this.parkedWhy }));
     } catch (e) { console.error(`[sess] save failed ${short(this.key)}: ${e.message}`); }
   }
   // Vellum compaction for this chat: the CLI compacts itself. The live process (started with
@@ -482,7 +489,7 @@ class Chat {
       try {
         if (!this.live) {
           startedCli = true;
-          this.cli = await manager.spawn(short(this.key), model, this.sessionId, sys, effort, mcp, { maxBudgetUsd: extra.maxBudgetUsd });
+          this.cli = await manager.spawn(short(this.key), model, this.sessionId, sys, effort, mcp, { maxBudgetUsd: extra.maxBudgetUsd, usageAccounting: this.usageAccounting, onUsage: () => this.save() });
           why += this.sessionId ? " resume" : " spawn";
           this.sysHash = sysHash;
         }
@@ -1204,21 +1211,6 @@ function parseToolCalls(text, tools = [], warn = console.log) {
 }
 
 
-// Map Claude CLI result.usage -> OpenAI usage chunk. Vellum's openai-compatible
-// provider treats prompt_tokens as the TOTAL (cached is a subset), so sum all
-// three input buckets and expose cache read/write under prompt_tokens_details.
-// Convert Anthropic per-message usage into the OpenAI inclusive prompt convention.
-function usageFromStep(u) {
-  if (!u || !Number.isFinite(u.input_tokens) || !Number.isFinite(u.output_tokens)) return null;
-  const input = u.input_tokens;
-  const read = Number.isFinite(u.cache_read_input_tokens) ? u.cache_read_input_tokens : 0;
-  const write = Number.isFinite(u.cache_creation_input_tokens) ? u.cache_creation_input_tokens : 0;
-  const out = u.output_tokens;
-  return { prompt_tokens: input + read + write, completion_tokens: out, total_tokens: input + read + write + out,
-    prompt_tokens_details: { cached_tokens: read, cache_write_tokens: write } };
-}
-function usageFromResult(res) { return usageFromStep(res?.usage); }
-
 // Build Vellum's <compaction_result> from the CLI's own summary. The verbatim tail starts at
 // the second-to-last real user turn (so the active exchange survives); Vellum resolves it by the
 // turn_context timestamp, falling back to the message preview.
@@ -1384,20 +1376,21 @@ async function handleRequest(req) {
         let closed = false;
         const ka = setInterval(() => send(": keepalive\n\n"), 15000); // no idle gaps while the model thinks or writes tool args
         ac.abort = () => { if (ac.aborted || closed) return; ac.aborted = true; closed = true; console.log(`[req] client went away key=${cacheKey ? cacheKey.slice(0, 12) : "-"}; releasing chat`); ac.rel?.(); ac.onGone?.(); };
-        const send = (s) => { if (closed) return; try { controller.enqueue(enc.encode(s)); } catch { closed = true; } };
+        const send = (s) => { if (closed) return false; try { controller.enqueue(enc.encode(s)); return true; } catch { closed = true; return false; } };
         try {
           send(sseChunk(id, model, { role: "assistant" }));
           let buffer = "";
           let sawDelta = false;
-          // HTTP request-local usage. A message_start marks a model step; tool loops may
-          // produce several. Never use the aggregate result when a previous step exists.
-          let stepCount = 0, stepUsage = null, stepOutput = null, assistantUsage = null;
-          const finalStepUsage = () => {
-            if (stepUsage && Number.isFinite(stepOutput)) return usageFromStep({ ...stepUsage, output_tokens: stepOutput });
-            if (assistantUsage) return usageFromStep(assistantUsage);
-            return null;
+          // The Cli ledger survives MCP pauses and observes events even when an
+          // HTTP stream is closed. Send only its undelivered delta: Vellum/UI sum
+          // response chunks, so re-sending a run aggregate would double count.
+          let usageAccounting = null;
+          const sendUsage = (u = usageAccounting?.peek()) => {
+            if (u && send(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [], usage: u })}\n\n`)) {
+              usageAccounting.acknowledge(u);
+              if (cacheKey) (manager.oneuse.get(cacheKey) || manager.chats.get(cacheKey))?.save();
+            }
           };
-          const sendUsage = (u) => { if (u) send(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [], usage: u })}\n\n`); };
           const mcpMode = TOOL_MODE === "mcp";
           const toolUses = [];      // native tool_use blocks seen this turn
           let turnDone = null;      // resolves when the assistant message carrying tool_use(s) is complete
@@ -1409,6 +1402,7 @@ async function handleRequest(req) {
           const kickBatchTimer = () => { if (!toolUses.length || batchWhy) return; clearTimeout(batchTimer); batchTimer = setTimeout(() => closeBatch("idle"), BATCH_IDLE_MS); };
           let recordedCli = 0;
           const runPromise = manager.run(sdkModel, cacheKey, blocks, (msg) => {
+            if (msg.shim_usage_accounting) usageAccounting = msg.shim_usage_accounting;
             if (msg.type === "shim_notice") { send(noticeFrame(msg.text)); return; }
             if (ac.aborted) return; // dead request: tool batches stay in cli.unobserved for the next one
             // patch 9: everything the CLI generates for this reply gets its full Vellum id now —
@@ -1426,11 +1420,6 @@ async function handleRequest(req) {
                 if (msgStopped && toolUses.length >= expectedTus) closeBatch("late-block");
               }
             }
-            if (msg.type === "stream_event" && msg.event?.type === "message_start") {
-              stepCount++; stepUsage = msg.event.message?.usage || null; stepOutput = null; assistantUsage = null;
-            }
-            if (msg.type === "stream_event" && msg.event?.type === "message_delta" && Number.isFinite(msg.event.usage?.output_tokens)) stepOutput = msg.event.usage.output_tokens;
-            if (msg.type === "assistant" && msg.message?.usage) assistantUsage = msg.message.usage;
             if (mcpMode && msg.type === "stream_event") kickBatchTimer();
             if (mcpMode && msg.type === "stream_event" && msg.event?.type === "content_block_start" && msg.event.content_block?.type === "tool_use") expectedTus++;
             if (mcpMode && msg.type === "stream_event" && msg.event?.type === "message_stop") {
@@ -1475,7 +1464,7 @@ async function handleRequest(req) {
               if (cacheKey) (manager.oneuse.get(cacheKey) || manager.chats.get(cacheKey))?.cli?.markObserved();
               send(sseChunk(id, model, { tool_calls }));
               send(sseChunk(id, model, {}, "tool_calls"));
-              sendUsage(finalStepUsage());
+              sendUsage();
               console.log(`[res] tool_calls(mcp)=${toolUses.map((t) => t.name).join(",")} pending=${pendingToolUses.size}${replyId ? ` reply=${replyId.slice(0, 13)} cli_ids+${recordedCli}` : " reply=none"}`);
               // the CLI run continues in the background until Vellum's next request resolves the handler;
               // release the per-chat lock now so that request can enter (it only resolves handlers + feeds nothing new)
@@ -1518,17 +1507,14 @@ async function handleRequest(req) {
             if (result?.structured_output !== undefined && !sawDelta) send(sseChunk(id, model, { content: typeof result.structured_output === "string" ? result.structured_output : JSON.stringify(result.structured_output) }));
             send(sseChunk(id, model, {}, "stop"));
           }
-          // Prefer the final Claude message only. The SDK result usage can aggregate all
-          // tool-loop model calls; use it only for a genuinely single-step request with
-          // no usable per-step stream data.
-          const usage = finalStepUsage() || (stepCount <= 1 ? usageFromResult(result) : null);
+          const usage = usageAccounting?.peek();
           if (usage) {
             const ctx = result?.shim_context_usage ?? await manager.contextUsage(cacheKey);
             if (ctx) usage.context_usage = ctx;
             if (manager.rateLimits) usage.rate_limits = manager.rateLimits.info;
             if (result?.shim_actual_model) usage.actual_model = result.shim_actual_model;
             if (typeof result?.total_cost_usd === "number") usage.cost_usd = result.total_cost_usd;
-            send(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [], usage })}\n\n`);
+            sendUsage(usage);
             if (ctx) console.log(`[ctx] ${JSON.stringify(ctx).slice(0, 300)}`);
             const d = usage.prompt_tokens_details;
             const uncached = usage.prompt_tokens - d.cached_tokens - d.cache_write_tokens;
