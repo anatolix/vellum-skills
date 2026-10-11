@@ -50,6 +50,6 @@ test('detached old-thread compact cannot mark a replacement thread compacted',()
 test('foreign reply text: frame, trimmed text, recorded tool calls; empty parts dropped',()=>{
   const t=foreignReplyText('  hello  ',[{id:'call_1',function:{name:'bash',arguments:'{"command":"ls"}'}},{id:'call_2',function:{name:'file_read',arguments:{path:'/x'}}}]);
   expect(t.split('\n')).toEqual([FOREIGN_REPLY_FRAME,'hello','[Recorded tool call bash id=call_1] {"command":"ls"}','[Recorded tool call file_read id=call_2] {"path":"/x"}']);
-  expect(foreignReplyText('',[])).toBe(FOREIGN_REPLY_FRAME);
+  expect(foreignReplyText('',[])).toBe('');
   expect(recordedCallLine({})).toBe('[Recorded tool call tool id=] {}');
 });

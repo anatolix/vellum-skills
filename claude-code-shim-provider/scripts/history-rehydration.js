@@ -2,6 +2,19 @@
 // Rehydrate every non-system message, including Vellum's assistant-role
 // <context_summary>, in chronological order. Tool calls are recorded text,
 // never executed or answered as live RPCs from an old thread.
+// Match Vellum's placeholder-sentinels.ts exactly: only edge bytes U+0000..U+0020.
+// Apply only to assistant text; user text, tool results and tool calls are data.
+export function isPlaceholderSentinelText(text) {
+  const bare = text.replace(/^[\x00-\x20]+|[\x00-\x20]+$/g, "");
+  return bare === "__PLACEHOLDER__[empty assistant turn]" ||
+    bare === "__PLACEHOLDER__[internal blocks omitted]";
+}
+export function assistantContent(content) {
+  if (typeof content === "string") return isPlaceholderSentinelText(content) ? "" : content;
+  if (!Array.isArray(content)) return content;
+  return content.filter(p => !(["text", "input_text", "output_text"].includes(p?.type) &&
+    typeof p.text === "string" && isPlaceholderSentinelText(p.text)));
+}
 export function messageText(content) {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -22,13 +35,14 @@ export function recordedCallLine(call) {
 // results follow as ordinary tool-result blocks and match by id.
 export const FOREIGN_REPLY_FRAME = "[Earlier assistant reply by another model in this conversation — saved history, not your output]";
 export function foreignReplyText(text, toolCalls) {
-  return [FOREIGN_REPLY_FRAME, (text || "").trim(), ...(toolCalls || []).map(recordedCallLine)].filter(Boolean).join("\n");
+  const body = [assistantContent(text || "").trim(), ...(toolCalls || []).map(recordedCallLine)].filter(Boolean);
+  return body.length ? [FOREIGN_REPLY_FRAME, ...body].join("\n") : "";
 }
 export function historyToPrompt(messages) {
   const records = [];
   for (const m of messages || []) {
     if (["system", "developer"].includes(m.role)) continue;
-    const lines = [messageText(m.content)];
+    const lines = [messageText(m.role === "assistant" ? assistantContent(m.content) : m.content)];
     for (const call of m.tool_calls || []) lines.push(recordedCallLine(call));
     const text = lines.filter(Boolean).join("\n");
     if (!text.trim()) continue;

@@ -16,7 +16,7 @@ import { createHash } from "node:crypto";
 
 import { z } from "zod";
 import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from "./notice-transport.js";
-import { promptForSession, foreignReplyText } from "./history-rehydration.js";
+import { promptForSession, foreignReplyText, assistantContent } from "./history-rehydration.js";
 import { isOutputOnlyBatch, closeOneUseSession } from './oneuse-cleanup.js';
 import { ClaudeUsageAccounting } from "./usage-accounting.js";
 import { attachSourceIds, replyIdOf, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, idCoverage, describeMissing, describeReconcile } from "./source-id-map.js";
@@ -399,7 +399,7 @@ class Chat {
       if (!plain && !(b.calls || []).length) continue;
       if (/^<context_summary>/.test(plain)) continue;
       if (!this.idMap().isForeignAssistant(b, sha(b.text))) continue;
-      b.text = `Assistant: ${foreignReplyText(plain, b.calls)}`;
+      b.text = `Assistant: ${foreignReplyText(b.plain, b.calls)}`;
       b.foreign = true; n++;
     }
     return n;
@@ -945,7 +945,7 @@ function messagesToBlocks(messages, tools, idMap = null) {
   }
   for (const m of messages) {
     const role = m.role;
-    const text = contentToText(m.content);
+    const text = contentToText(role === "assistant" ? assistantContent(m.content) : m.content);
     if (role === "system") {
       blocks.push({ role, text });
     } else if (role === "user") {

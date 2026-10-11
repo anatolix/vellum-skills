@@ -22,7 +22,7 @@ import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { join } from "path";
 import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from "./notice-transport.js";
-import { promptForSession, foreignReplyText } from "./history-rehydration.js";
+import { promptForSession, foreignReplyText, assistantContent } from "./history-rehydration.js";
 import { codexThreadConfig, codexResumeParams } from "./thread-config.js";
 import { createSseWriter } from "./sse-writer.js";
 import { recordCodexUsage, pendingCodexUsage, codexUsageChunk, acknowledgeCodexUsage } from "./usage-accounting.js";
@@ -262,7 +262,8 @@ function blocksOf(messages, idMap = null) {
   const out = [];
   for (const m of messages || []) {
     if (m.role === "assistant" && idMap) {
-      const text = typeof m.content === "string" ? m.content : (m.content || []).map(p => (p && p.type === "text" ? p.text : "")).join("\n");
+      const content = assistantContent(m.content);
+      const text = typeof content === "string" ? content : (content || []).map(p => (p && p.type === "text" ? p.text : "")).join("\n");
       const calls = m.tool_calls || [];
       if (!text.trim() && !calls.length) continue;
       if (/^\s*<context_summary>/.test(text)) continue;
