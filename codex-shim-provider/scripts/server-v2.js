@@ -657,13 +657,13 @@ async function handleChat(req) {
     // capabilities>/... from the kept tail on compaction) — count it as seen wherever it sits.
     const tailIndex = new Map();
     for (const [h, m] of Object.entries(state.meta || {})) if (m && m.len >= 300 && m.tail) tailIndex.set(m.tail, h);
-    const seenNow = blocks.map((b, i) => seen.has(hashes[i]) || (b.text.length >= 300 && tailIndex.has(b.text.slice(-200))));
+    const seenNow = blocks.map((b, i) => idCls?.[i] !== "new" && (seen.has(hashes[i]) || ((!idCls || idCls[i] === "unknown") && b.text.length >= 300 && tailIndex.has(b.text.slice(-200)))));
     lastSeen = -1; for (let i = 0; i < blocks.length; i++) if (seenNow[i]) lastSeen = i;
     toFeed = []; const skippedIdx = []; let tailMatched = 0;
     blocks.forEach((b, i) => {
-      if (seen.has(hashes[i])) return;
+      if (idCls?.[i] !== "new" && seen.has(hashes[i])) return;
       const parkedTool = b.kind === "tool" && state.parked && state.parked[b.id];
-      if (parkedTool) { toFeed.push(b); return; }
+      if (parkedTool || idCls?.[i] === "new") { toFeed.push(b); return; }
       if (seenNow[i]) { tailMatched++; skipped.push(b); skippedIdx.push(i); return; }
       if (i < lastSeen) { skipped.push(b); skippedIdx.push(i); } else toFeed.push(b);
     });
