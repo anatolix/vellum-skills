@@ -1,3 +1,7 @@
+## 1.3.1 — 2026-11-07
+
+Fix Vellum 0.12.8 compatibility: replace the 0.12.6-only gate and pinned CRUD path with verified runtime resolution based on the active workspace and version. Check required persistence exports at startup. Compatibility and OpenAI/Anthropic UI-filtering tests cover both 0.12.6 and 0.12.8. No changes to token arithmetic or card roll-up. Plugin-only hot reload.
+
 # Shims UI 1.0.0 — 2026-10-05
 
 - Server-only native UI sidechannel shared by Claude v3 and Codex v2.
