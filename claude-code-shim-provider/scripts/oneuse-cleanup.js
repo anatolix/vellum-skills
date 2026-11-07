@@ -13,6 +13,23 @@ export function isOutputOnlyBatch(key, tools, batch) {
   const advertised = new Set(names);
   return batch.every(t => advertised.has(toolName(t.name)));
 }
+// Lifecycle cleanup must not mistake an externally parked tool round for an idle chat.
+// The request lock is deliberately released while Vellum executes the tool, so busy=false
+// is not sufficient protection. Keep this predicate shared by one-use reaping and the
+// regular-chat idle/LRU paths.
+export function hasPendingToolUse(pending, key) {
+  if (!key || !pending?.values) return false;
+  for (const entry of pending.values()) if (entry?.chatKey === key) return true;
+  return false;
+}
+export function isIdleCleanupEligible({chat, pending, now = Date.now(), idleMs}) {
+  return Boolean(chat && !chat.busy && Number.isFinite(chat.lastUsed) &&
+    now - chat.lastUsed > idleMs && !hasPendingToolUse(pending, chat.key));
+}
+export function isLiveEvictionCandidate({chat, pending}) {
+  return Boolean(chat?.live && !chat.busy && !hasPendingToolUse(pending, chat.key));
+}
+
 // Shut down inference BEFORE releasing MCP promises, so acknowledging an output
 // cannot accidentally start another paid inference. Cleanup is key-scoped.
 export function closeOneUseSession({key, sessions, pending, early, emitted, consumed, waiters, reason = 'done'}) {

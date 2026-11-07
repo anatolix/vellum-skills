@@ -17,7 +17,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { NoticeTransport, noticeText, noticeFrame, isCompactionRequest } from "./notice-transport.js";
 import { promptForSession, foreignReplyText, assistantContent } from "./history-rehydration.js";
-import { isOutputOnlyBatch, closeOneUseSession } from './oneuse-cleanup.js';
+import { isOutputOnlyBatch, closeOneUseSession, isIdleCleanupEligible, isLiveEvictionCandidate } from './oneuse-cleanup.js';
 import { ClaudeUsageAccounting } from "./usage-accounting.js";
 import { attachSourceIds, replyIdOf, SourceIdMap, NULL_SOURCE_ID_MAP, describeClasses, idCoverage, describeMissing, describeReconcile } from "./source-id-map.js";
 const noticeTransport = new NoticeTransport({ source: "claude-shim" });
@@ -613,7 +613,7 @@ const manager = {
   // Wait for a free slot (parking the LRU idle chat if needed), then spawn.
   async spawn(label, model, resume, systemPrompt = null, effort = null, mcp = null, extra = {}) {
     while (this.liveCount() >= MAX_LIVE) {
-      const idle = [...this.chats.values()].filter((c) => c.live && !c.busy).sort((a, b) => a.lastUsed - b.lastUsed);
+      const idle = [...this.chats.values()].filter((c) => isLiveEvictionCandidate({ chat: c, pending: pendingToolUses })).sort((a, b) => a.lastUsed - b.lastUsed);
       if (idle.length) { idle[0].park("evict"); continue; }
       await new Promise((r) => this.waiters.push(r));
     }
@@ -624,12 +624,12 @@ const manager = {
   reap() {
     const now = Date.now();
     for (const c of this.oneuse.values()) {
-      if (!c.busy && now - c.lastUsed > ONEUSE_IDLE_MS) {
+      if (isIdleCleanupEligible({ chat: c, pending: pendingToolUses, now, idleMs: ONEUSE_IDLE_MS })) {
         this.destroyOneUse(c.key, "idle reaped");
       }
     }
     for (const c of this.chats.values()) {
-      if (c.live && !c.busy && now - c.lastUsed > IDLE_TTL_MS) c.park("idle");
+      if (c.live && isIdleCleanupEligible({ chat: c, pending: pendingToolUses, now, idleMs: IDLE_TTL_MS })) c.park("idle");
       else if (!c.live && !c.busy && now - c.lastUsed > 24 * 3600e3) this.chats.delete(c.key); // disk copy stays
     }
   },

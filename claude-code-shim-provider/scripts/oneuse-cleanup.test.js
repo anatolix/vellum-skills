@@ -1,9 +1,18 @@
 import {test, expect} from 'bun:test';
 import {readFileSync} from 'node:fs';
-import {isOutputOnlyBatch,closeOneUseSession} from './oneuse-cleanup.js';
+import {isOutputOnlyBatch,closeOneUseSession,isIdleCleanupEligible,isLiveEvictionCandidate} from './oneuse-cleanup.js';
 const key='router-oneuse-test';
 const tools=(...names)=>names.map(name=>({type:'function',function:{name}}));
 const batch=(...names)=>names.map(name=>({name:'mcp__vellum__'+name}));
+const staleNow=100 * 60e3;
+const staleChat=(key,busy=false)=>({key,busy,lastUsed:0,live:true});
+const pendingFor=(...keys)=>new Map(keys.map((chatKey,i)=>[String(i),{chatKey}]));
+test('idle cleanup refuses a busy chat even when stale',()=>expect(isIdleCleanupEligible({chat:staleChat('busy',true),pending:new Map(),now:staleNow,idleMs:15*60e3})).toBe(false));
+test('idle cleanup protects the stale chat that owns a pending tool',()=>expect(isIdleCleanupEligible({chat:staleChat(key),pending:pendingFor(key),now:staleNow,idleMs:15*60e3})).toBe(false));
+test('idle cleanup ignores pending tools belonging to another chat',()=>expect(isIdleCleanupEligible({chat:staleChat(key),pending:pendingFor('other'),now:staleNow,idleMs:15*60e3})).toBe(true));
+test('idle cleanup admits a stale chat with no pending tools',()=>expect(isIdleCleanupEligible({chat:staleChat(key),pending:new Map(),now:staleNow,idleMs:15*60e3})).toBe(true));
+test('regular LRU eviction also protects a live chat waiting on its own tool',()=>expect(isLiveEvictionCandidate({chat:staleChat(key),pending:pendingFor(key)})).toBe(false));
+test('regular LRU eviction ignores another chat pending a tool',()=>expect(isLiveEvictionCandidate({chat:staleChat(key),pending:pendingFor('other')})).toBe(true));
 for(const name of ['record_conversation_title','select_pages','select_pages_to_inject','search_sources','inspect_workspace_paths','finish_recall'])
  test('output protocol '+name,()=>expect(isOutputOnlyBatch(key,tools(name),batch(name))).toBe(true));
 test('recall round with multiple independent searches',()=>expect(isOutputOnlyBatch(key,tools('search_sources','inspect_workspace_paths','finish_recall'),batch('search_sources','search_sources'))).toBe(true));
@@ -35,6 +44,8 @@ test('idle close does not mark output complete',()=>{const c={cli:{close(){}}};c
 test('handler wires terminal detection AFTER response snapshot and before exit',()=>{
  const s=readFileSync(new URL('./server-v3.js',import.meta.url),'utf8');
  expect(s).toContain("from './oneuse-cleanup.js'");
+ expect(s).toContain('isIdleCleanupEligible({ chat: c, pending: pendingToolUses');
+ expect(s).toContain('isLiveEvictionCandidate({ chat: c, pending: pendingToolUses');
  expect(s).toContain('isOutputOnlyBatch(cacheKey, tools, toolUses)');
  expect(s).toContain('(manager.oneuse.get(cacheKey) || manager.chats.get(cacheKey))?.cli?.markObserved()');
  expect(s).toContain('if (this.outputComplete) throw e;');
